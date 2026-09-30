@@ -235,6 +235,11 @@ cargo run --example s41_visual_closure
 > 订阅（All/精确名/前缀）—— 未命中不进处理器、不耗上限、不级联，
 > `signals_filtered` 记账；NoObserver 缺省 NONE（文档见
 > `NES2.0_S6订阅过滤_v1.md`）；新增 T-Sig-09..12，scene 基线升至 118。
+> **v1.24 注记（S6.17 订阅册）**：`connect_signal`/`disconnect_signal`
+> 路由层 ——（名字+可选源 -> 目标节点），命中连接给观察者带 dst 上下文
+> 的额外交付（注册序、同守上限）；节点销毁自动清理（tick 阶段 1 修剪）；
+> 方法级分发仍归脚本 VM（文档见 `NES2.0_S6订阅册_v1.md`）；新增
+> T-Sig-13..16，scene 基线升至 122。
 
 | 事项 | 状态 |
 |---|---|

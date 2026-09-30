@@ -523,14 +523,21 @@ pub struct Signal {
 }
 
 /// 信号处理器看到的句柄：**只读树 + 命令缓冲 + 再发射**（与 [`NodeCtx`]
-/// 同一形状，但信号没有"当前节点"）。
+/// 同一形状）。广播交付没有目标节点（`dst = None`）；订阅册路由交付以
+/// 连接的目标节点为上下文（`dst = Some`）。
 pub struct SignalCtx<'a> {
+    dst: Option<NodeId>,
     tree: &'a SceneTree,
     cmds: &'a mut Vec<Cmd>,
     signals: &'a mut Vec<Signal>,
 }
 
 impl<'a> SignalCtx<'a> {
+    /// 路由交付的目标节点（订阅册连接命中时 `Some`；广播交付 `None`）。
+    pub fn dst(&self) -> Option<NodeId> {
+        self.dst
+    }
+
     /// 只读树。
     pub fn tree(&self) -> &'a SceneTree {
         self.tree
@@ -627,6 +634,29 @@ impl SignalFilter {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NoObserver;
 
+/// 订阅册连接句柄（`connect_signal` 返回；计数器分配，不复用）。
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SignalConnectionId(pub u64);
+
+/// 一条订阅册连接（草案 §12 `connect` 的路由层形态）：名字（精确）+
+/// 可选源节点（只订阅来自它的发射）-> 目标节点。
+///
+/// 命中时观察者收到一次**路由交付**（`SignalCtx::dst() == Some(dst)`，
+/// 在广播交付之后按注册序）；方法级分发仍归脚本 VM（`Script` 节点挂载点）。
+/// 源或目标节点销毁时连接**自动清理**（tick 阶段 1 修剪 —— 草案
+/// "连接表只存 NodeId，节点销毁时自动清理悬挂连接"）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignalConnection {
+    /// 连接句柄。
+    pub id: SignalConnectionId,
+    /// 订阅的信号名（精确匹配）。
+    pub name: String,
+    /// 只订阅来自该节点的发射（`None` = 任意源，含桥信号的引擎源）。
+    pub src: Option<NodeId>,
+    /// 路由交付的目标节点（交付上下文）。
+    pub dst: NodeId,
+}
+
 impl SceneObserver for NoObserver {
     /// 无行为代码 = 对任何信号都不感兴趣（泵跳过全部回调，只记账）。
     fn signal_filter(&self) -> SignalFilter {
@@ -661,6 +691,9 @@ pub struct TickStats {
     pub signals_delivered: usize,
     /// 未命中订阅被过滤的信号数（不进处理器、不耗上限）。
     pub signals_filtered: usize,
+    /// 其中经订阅册**路由交付**的次数（一条信号可路由多次：每条命中
+    /// 连接一次；计入 `signals_delivered` 并单独在此可观测）。
+    pub signals_routed: usize,
     /// 超出交付上限被丢弃的信号数（ runaway 级联的如实计数）。
     pub signals_dropped: usize,
 }
@@ -677,6 +710,10 @@ pub struct SceneTree {
     /// [`NodeCtx::emit`]/[`SignalCtx::emit`] 收集到 tick 本地缓冲）。
     /// 帧末泵清空 —— 信号生命周期 = 单帧，跨帧留存请宿主自行存状态。
     signal_queue: Vec<Signal>,
+    /// 订阅册（S6.17）：连接按注册序；节点销毁自动清理（阶段 1 修剪）。
+    signal_connections: Vec<SignalConnection>,
+    /// 连接句柄计数器（只增不减，不复用）。
+    next_connection_id: u64,
     /// 全局暂停位（草案 §9）。影响 [`ProcessMode::Pausable`]（含 `Inherit`
     /// 解析结果）的 `process` 派发；生命周期与结构变更**不受影响**。
     paused: bool,
@@ -718,6 +755,8 @@ impl SceneTree {
             frame: 0,
             groups: HashMap::new(),
             signal_queue: Vec::new(),
+            signal_connections: Vec::new(),
+            next_connection_id: 0,
             paused: false,
             time_scale: 1.0,
         }
@@ -873,6 +912,52 @@ impl SceneTree {
     /// 尚未交付的宿主预发信号（泵在每次 tick 帧末清空队列）。
     pub fn pending_signals(&self) -> &[Signal] {
         &self.signal_queue
+    }
+
+    // ---------- 订阅册（草案 §12 connect/disconnect，S6.17） ----------
+
+    /// 注册一条订阅连接。`src = None` 订阅任意源（含桥信号的引擎源）。
+    /// 名字为空或目标节点不存在时返回 `None`（如实拒绝，不注册哑连接）。
+    pub fn connect_signal(
+        &mut self,
+        name: &str,
+        src: Option<NodeId>,
+        dst: NodeId,
+    ) -> Option<SignalConnectionId> {
+        if name.is_empty() || self.nodes.get(dst).is_none() {
+            return None;
+        }
+        let id = SignalConnectionId(self.next_connection_id);
+        self.next_connection_id += 1;
+        self.signal_connections.push(SignalConnection {
+            id,
+            name: name.to_string(),
+            src,
+            dst,
+        });
+        Some(id)
+    }
+
+    /// 注销一条连接：存在并移除返回 `true`，未知句柄返回 `false`。
+    pub fn disconnect_signal(&mut self, id: SignalConnectionId) -> bool {
+        let before = self.signal_connections.len();
+        self.signal_connections.retain(|c| c.id != id);
+        self.signal_connections.len() != before
+    }
+
+    /// 订阅册只读视图（注册序；宿主/编辑器检视用）。
+    pub fn signal_connections(&self) -> &[SignalConnection] {
+        &self.signal_connections
+    }
+
+    /// 修剪死连接：源或目标节点已销毁（arena 查无，代际即身份）的连接
+    /// 移除。tick 阶段 1 调用 —— 节点销毁自动清理（草案 §12）。
+    fn prune_dead_connections(&mut self) {
+        self.signal_connections.retain(|c| {
+            let src_alive = c.src.map_or(true, |n| self.nodes.get(n).is_some());
+            let dst_alive = self.nodes.get(c.dst).is_some();
+            src_alive && dst_alive
+        });
     }
 
     // ---------- 暂停与时间缩放（草案 §9） ----------
@@ -1287,6 +1372,8 @@ impl SceneTree {
         // 1. 结构变更落地 + 信号桥（S6.15）
         let events = self.apply_pending();
         stats.events = events.len();
+        // 订阅册修剪：本帧结构落地销毁的节点，其连接随之清理（草案 §12）。
+        self.prune_dead_connections();
         for ev in &events {
             obs.on_tree_event(&*self, ev);
             // 双通道不互斥：`on_tree_event` 即时回调照旧；同一事件以
@@ -1435,10 +1522,12 @@ impl SceneTree {
                 stats.signals_filtered += 1;
                 continue;
             }
+            // 广播交付（无目标上下文）。
             let mut cmds: Vec<Cmd> = Vec::new();
             let mut re_emitted: Vec<Signal> = Vec::new();
             {
                 let mut ctx = SignalCtx {
+                    dst: None,
                     tree: &*self,
                     cmds: &mut cmds,
                     signals: &mut re_emitted,
@@ -1450,6 +1539,38 @@ impl SceneTree {
             }
             inflight.append(&mut re_emitted);
             stats.signals_delivered += 1;
+
+            // 路由交付（订阅册，S6.17）：广播后按注册序，每条命中连接一次，
+            // 目标节点作交付上下文；与广播同守 CAP（每次调用都是真实处理器）。
+            let routed_dsts: Vec<NodeId> = self
+                .signal_connections
+                .iter()
+                .filter(|c| c.name == sig.name && c.src.map_or(true, |s| Some(s) == sig.src))
+                .map(|c| c.dst)
+                .collect();
+            for dst in routed_dsts {
+                if stats.signals_delivered >= SIGNAL_DELIVERY_CAP {
+                    stats.signals_dropped += 1; // 该信号剩余路由被截断
+                    continue;
+                }
+                let mut cmds: Vec<Cmd> = Vec::new();
+                let mut re_emitted: Vec<Signal> = Vec::new();
+                {
+                    let mut ctx = SignalCtx {
+                        dst: Some(dst),
+                        tree: &*self,
+                        cmds: &mut cmds,
+                        signals: &mut re_emitted,
+                    };
+                    obs.on_signal(&mut ctx, &sig);
+                }
+                for c in cmds {
+                    self.apply_cmd(c);
+                }
+                inflight.append(&mut re_emitted);
+                stats.signals_delivered += 1;
+                stats.signals_routed += 1;
+            }
         }
 
         // 6. 变换冲洗

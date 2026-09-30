@@ -96,6 +96,7 @@ pub use schema::{EditorHint, NodeSchema, PropDesc};
 pub use transform::{Affine, Transform2D, Vec2};
 pub use tree::{
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, ProcessMode, SceneObserver, SceneTree, Signal,
-    SignalCtx, SignalFilter, TickStats, TreeEvent, TreeOp, SIGNAL_DELIVERY_CAP,
+    SignalConnection, SignalConnectionId, SignalCtx, SignalFilter, TickStats, TreeEvent, TreeOp,
+    SIGNAL_DELIVERY_CAP,
 };
 pub use value::{Value, ValueType};

@@ -439,3 +439,149 @@ fn t_sig_12_no_observer_default_is_none() {
     assert_eq!(stats.signals_delivered, 0, "无回调");
     assert_eq!(stats.signals_filtered, 2, "tree/added + boot 全部过滤记账");
 }
+
+// ---------------------------------------------------------------- 订阅册
+// S6.17：connect/disconnect 路由层（草案 §12）—— 名字+可选源 -> 目标节点，
+// 命中给观察者一次带 dst 上下文的路由交付（广播之后、注册序）。
+
+/// 记录交付（名字, dst）。
+struct Router {
+    got: Vec<(String, Option<NodeId>)>,
+    a: NodeId,
+    #[allow(dead_code)] // 册语义见证：连接目标（断言里经 dst 间接核对）
+    b: NodeId,
+}
+
+impl SceneObserver for Router {
+    fn on_process(&mut self, ctx: &mut NodeCtx<'_>, _delta: f32) {
+        if ctx.this() == self.a {
+            ctx.emit("hit", Value::I64(1));
+        }
+    }
+    fn on_signal(&mut self, _ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        self.got.push((sig.name.clone(), _ctx.dst()));
+    }
+}
+
+/// T-Sig-13：路由交付 —— 广播（dst=None）在前，命中连接路由（dst=Some）
+/// 在后按注册序；signals_routed 计数；级联照常入队。
+#[test]
+fn t_sig_13_routed_delivery_with_dst_context() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+
+    // 两条命中连接（同名同目标 -> 双路由；另一条连别的名字不命中）。
+    let _c1 = t.connect_signal("hit", Some(a), b).expect("连接 1");
+    let _c2 = t.connect_signal("hit", Some(a), b).expect("连接 2");
+    let _c3 = t.connect_signal("miss", None, b).expect("连接 3（不命中）");
+
+    let mut obs = Router { got: Vec::new(), a, b };
+    let stats = t.tick(0.016, &mut obs);
+    // 节点已预先落地（无桥）：hit 广播一次 + 路由两次（c1/c2）。
+    let hits: Vec<(String, Option<NodeId>)> = obs
+        .got
+        .into_iter()
+        .filter(|(n, _)| n == "hit")
+        .collect();
+    assert_eq!(
+        hits,
+        vec![
+            ("hit".to_string(), None),
+            ("hit".to_string(), Some(b)),
+            ("hit".to_string(), Some(b)),
+        ],
+        "广播在前、路由按注册序"
+    );
+    assert_eq!(stats.signals_routed, 2, "两次路由命中");
+    assert_eq!(stats.signals_delivered, 3, "1 hit 广播 + 2 路由");
+}
+
+/// T-Sig-14：源过滤 —— 连接声明 src=Some(a)，只有 a 发的命中（b 发同名
+/// 不命中、宿主源不命中）；src=None 连接匹配任意源含桥。
+#[test]
+fn t_sig_14_source_filtering() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+
+    // ① 源过滤：连接 src=Some(a)；宿主预发（src=None）不命中。
+    //    （Router 在 a 的 process 里发的是 "hit" —— 名字与连接一致）
+    let _src_conn = t.connect_signal("hit", Some(a), b).expect("源连接");
+    t.emit_signal("hit", Value::I64(9)); // 宿主源 None
+    let mut quiet = Quiet::default(); // 不发射的观察者：只有宿主那条
+    let stats = t.tick(0.016, &mut quiet);
+    assert_eq!(stats.signals_routed, 0, "宿主源不命中 src=Some(a)");
+    assert_eq!(stats.signals_delivered, 1, "广播照常一次");
+
+    // ② 精确源命中：a 的 process 发 ping -> 路由到 b。
+    let mut obs2 = Router { got: Vec::new(), a, b };
+    let stats2 = t.tick(0.016, &mut obs2);
+    assert_eq!(stats2.signals_routed, 1, "a 发射命中 src=Some(a)");
+    let routed: Vec<_> = obs2.got.iter().filter(|(_, d)| d.is_some()).collect();
+    assert_eq!(routed.len(), 1);
+    assert_eq!(routed[0].0, "hit");
+
+    // ③ src=None 连接匹配桥信号（引擎源 None）：挂一个新节点让 tick 落地。
+    let _any_conn = t.connect_signal("tree/added", None, a).expect("任意源连接");
+    let _c = t.add_node(t.root(), "c", NodeKind::Node2D); // 挂起，等 tick 落地
+    let mut obs3 = Router { got: Vec::new(), a, b };
+    let stats3 = t.tick(0.016, &mut obs3);
+    // 两条路由：桥经 any_conn 到 a；Router 每帧发的 hit 经 src_conn 到 b。
+    assert_eq!(stats3.signals_routed, 2);
+    assert_eq!(stats3.events, 1, "桥事件恰一条");
+}
+
+/// T-Sig-15：disconnect —— 移除后不再路由；未知句柄返回 false。
+#[test]
+fn t_sig_15_disconnect_stops_routing() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+    let c1 = t.connect_signal("hit", Some(a), b).expect("连接");
+
+    let mut obs = Router { got: Vec::new(), a, b };
+    let s1 = t.tick(0.016, &mut obs); // a 的 process 尚未发射（Router 只在 a 发）
+    let _ = s1;
+    // Router 在 a 的 process 里发 hit —— 第一帧已含（见 13）。此处断言断开：
+    assert!(t.disconnect_signal(c1), "移除存在的连接");
+    assert!(!t.disconnect_signal(c1), "再断返回 false");
+    let mut obs2 = Router { got: Vec::new(), a, b };
+    let s2 = t.tick(0.016, &mut obs2);
+    assert_eq!(s2.signals_routed, 0, "断开后无路由");
+    let routed: Vec<_> = obs2.got.iter().filter(|(_, d)| d.is_some()).collect();
+    assert!(routed.is_empty());
+}
+
+/// T-Sig-16：节点销毁自动清理 —— 目标或源节点被删后连接修剪（册可见），
+/// 再发射不路由、不崩溃。
+#[test]
+fn t_sig_16_dead_nodes_pruned_automatically() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+    let _conn_dst = t.connect_signal("hit", Some(a), b).expect("目标连接");
+    let _conn_src = t.connect_signal("hit", Some(a), a).expect("源目标同节点");
+    assert_eq!(t.signal_connections().len(), 2);
+
+    // 删 a（挂起）与 b：下一帧阶段 1 落地 + 修剪。
+    t.queue(nes_scene::TreeOp::Remove { node: a, keep_children: false });
+    t.queue(nes_scene::TreeOp::Remove { node: b, keep_children: false });
+    let stats = t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(stats.events, 2, "两次删除落地");
+    assert!(
+        t.signal_connections().is_empty(),
+        "源/目标销毁 -> 连接自动清理：{:?}",
+        t.signal_connections()
+    );
+
+    // 再发射同名：无路由（册已空），不崩溃。
+    t.emit_signal("hit", Value::I64(0));
+    let mut obs = Router { got: Vec::new(), a, b };
+    let s2 = t.tick(0.016, &mut obs);
+    assert_eq!(s2.signals_routed, 0);
+}
