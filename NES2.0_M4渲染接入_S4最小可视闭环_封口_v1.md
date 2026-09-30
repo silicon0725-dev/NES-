@@ -231,6 +231,10 @@ cargo run --example s41_visual_closure
 > 事件自动入信号管道（双通道不互斥、事件原文随 `Signal.event`、泵序最前；
 > 文档见 `NES2.0_S6信号桥_v1.md`）；新增 T-Sig-06..08（含跨帧回流闭环），
 > scene 基线升至 114。
+> **v1.23 注记（S6.16 订阅过滤）**：`SceneObserver::signal_filter` 声明式
+> 订阅（All/精确名/前缀）—— 未命中不进处理器、不耗上限、不级联，
+> `signals_filtered` 记账；NoObserver 缺省 NONE（文档见
+> `NES2.0_S6订阅过滤_v1.md`）；新增 T-Sig-09..12，scene 基线升至 118。
 
 | 事项 | 状态 |
 |---|---|

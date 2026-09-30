@@ -79,7 +79,7 @@ nes-runtime 零改动。
 | 事项 | 状态 |
 |---|---|
 | tick 外 `apply_pending` 的事件入泵口径（无帧可交付，当前不桥） | 文档口径（§1.3） |
-| 桥信号订阅过滤（按 `tree/*` 前缀注册，省去全量 on_signal 调用） | 随订阅册（脚本 VM） |
+| 订阅过滤 | ✅ S6.16（声明式 SignalFilter，见 `NES2.0_S6订阅过滤_v1.md`） |
 | 编辑器事件监视器（桥信号 + `signals_dropped` 面板） | 未启动 |
 | WM_SIZE / DPI / headless Linux | 沿各文档遗留表 |
 

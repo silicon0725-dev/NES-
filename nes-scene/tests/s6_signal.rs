@@ -313,3 +313,129 @@ fn t_sig_08_handler_struct_change_reflows_next_frame() {
     let stats3 = t.tick(0.016, &mut spy); // 帧 3：无新事件，无新信号
     assert_eq!(stats3.signals_delivered, 0, "不 runaway");
 }
+
+// ---------------------------------------------------------------- 订阅过滤
+// S6.16：观察者声明订阅，泵只交付命中项（未命中不进处理器、不耗上限）。
+
+use nes_scene::{SignalFilter, SIGNAL_DELIVERY_CAP as CAP};
+
+/// 只订阅指定名字，记录实际收到的。
+struct NameOnly {
+    filter: SignalFilter,
+    got: Vec<String>,
+    node: Option<NodeId>,
+}
+
+impl SceneObserver for NameOnly {
+    fn signal_filter(&self) -> SignalFilter {
+        self.filter.clone()
+    }
+    fn on_process(&mut self, ctx: &mut NodeCtx<'_>, _delta: f32) {
+        if ctx.this() == self.node.unwrap() {
+            ctx.emit("go", Value::I64(1));
+            ctx.emit("ui/tick", Value::I64(2));
+        }
+    }
+    fn on_signal(&mut self, _ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        self.got.push(sig.name.clone());
+    }
+}
+
+/// T-Sig-09：精确名订阅 —— 只有 "go" 进处理器；桥信号与未订阅用户信号
+/// 被过滤计数（对账：delivered + filtered == 总发射）。
+#[test]
+fn t_sig_09_name_subscription_filters_rest() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D); // 挂起 -> 首帧 tree/added
+    let mut obs = NameOnly {
+        filter: SignalFilter::names(&["go"]),
+        got: Vec::new(),
+        node: Some(a),
+    };
+    let stats = t.tick(0.016, &mut obs);
+    assert_eq!(obs.got, vec!["go"], "只收到订阅项");
+    assert_eq!(stats.signals_delivered, 1);
+    assert_eq!(stats.signals_filtered, 2, "tree/added + ui/tick 被滤");
+    assert_eq!(stats.signals_dropped, 0);
+    // 对账恒等式：交付 + 过滤 == 总发射（3 条：1 桥 + 2 用户）。
+    assert_eq!(stats.signals_delivered + stats.signals_filtered, 3);
+}
+
+/// T-Sig-10：前缀订阅 —— `tree/` 只收桥信号；用户信号被滤。
+struct TreeOnly {
+    got: Vec<String>,
+    node: Option<NodeId>,
+}
+
+impl SceneObserver for TreeOnly {
+    fn signal_filter(&self) -> SignalFilter {
+        SignalFilter::prefixes(&["tree/"])
+    }
+    fn on_process(&mut self, ctx: &mut NodeCtx<'_>, _delta: f32) {
+        if ctx.this() == self.node.unwrap() {
+            ctx.emit("user", Value::I64(0));
+        }
+    }
+    fn on_signal(&mut self, _ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        self.got.push(sig.name.clone());
+    }
+}
+
+#[test]
+fn t_sig_10_prefix_subscription_gets_bridge_only() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let mut obs = TreeOnly { got: Vec::new(), node: Some(a) };
+    let stats = t.tick(0.016, &mut obs);
+    assert_eq!(obs.got, vec!["tree/added"], "前缀命中桥信号");
+    assert_eq!(stats.signals_filtered, 1, "user 被滤");
+    assert_eq!(stats.signals_delivered, 1);
+}
+
+/// T-Sig-11：过滤切断级联 —— handler 只订阅 "x"，收 x 后发射 "y"（未订阅）
+/// -> y 不进任何处理器、不再引发发射：交付停在 1，无 runaway；被滤信号
+/// 也不消耗上限（对照 CAP）。
+struct ChainCut {
+    got: Vec<String>,
+    node: Option<NodeId>,
+}
+
+impl SceneObserver for ChainCut {
+    fn signal_filter(&self) -> SignalFilter {
+        SignalFilter::names(&["x"])
+    }
+    fn on_process(&mut self, ctx: &mut NodeCtx<'_>, _delta: f32) {
+        if ctx.this() == self.node.unwrap() {
+            ctx.emit("x", Value::I64(0));
+        }
+    }
+    fn on_signal(&mut self, ctx: &mut SignalCtx<'_>, _sig: &Signal) {
+        self.got.push("x".to_string());
+        ctx.emit("y", Value::I64(0)); // 未订阅：到此为止
+    }
+}
+
+#[test]
+fn t_sig_11_filtered_signals_never_cascade_or_burn_cap() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let mut obs = ChainCut { got: Vec::new(), node: Some(a) };
+    let stats = t.tick(0.016, &mut obs);
+    // 首帧：tree/added 滤 + x 交付 -> 发 y -> y 滤（不再级联）。
+    assert_eq!(obs.got.len(), 1, "x 恰好交付一次");
+    assert_eq!(stats.signals_delivered, 1);
+    assert_eq!(stats.signals_filtered, 2, "tree/added + y 被滤");
+    assert!(stats.signals_delivered < CAP, "过滤不消耗上限");
+    assert_eq!(stats.signals_dropped, 0);
+}
+
+/// NoObserver 的缺省订阅 = NONE：泵只记账不进回调。
+#[test]
+fn t_sig_12_no_observer_default_is_none() {
+    let mut t = SceneTree::new("root");
+    let _a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    t.emit_signal("boot", Value::Bool(true));
+    let stats = t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(stats.signals_delivered, 0, "无回调");
+    assert_eq!(stats.signals_filtered, 2, "tree/added + boot 全部过滤记账");
+}

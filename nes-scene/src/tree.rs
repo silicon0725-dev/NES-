@@ -498,6 +498,11 @@ pub trait SceneObserver {
     /// 信号交付（帧末泵，按发射序）。行为代码据此解耦通信：发射方不认识
     /// 接收方，接收方按名字过滤（订阅册属脚本 VM 里程碑，见 S6.14 文档）。
     fn on_signal(&mut self, _ctx: &mut SignalCtx<'_>, _sig: &Signal) {}
+    /// 声明订阅（S6.16）：泵只把命中的信号送进 [`Self::on_signal`]。
+    /// 缺省全收；每帧取一次（不是每信号一次）。
+    fn signal_filter(&self) -> SignalFilter {
+        SignalFilter::All
+    }
 }
 
 /// 一条信号：名字键 + 值载荷 + 发射源（`None` = 宿主/无名源）。
@@ -565,11 +570,69 @@ impl<'a> SignalCtx<'a> {
 /// 空观察者：宿主没有行为代码时的缺省。
 ///
 /// 生命周期仍照常推进（标志位照置、命令缓冲照走），只是没人监听 ——
+/// 信号订阅过滤（S6.16）：观察者声明感兴趣的名字，泵只交付命中项。
+///
+/// 这是"订阅"在本引擎的诚实形态 —— 声明式、随观察者走、无注册表状态可
+/// 悬挂（S6.14"无连接表"的延续）；节点-方法级的 `connect/disconnect`
+/// 订阅册仍归脚本 VM 里程碑。未命中的信号**不进处理器**：不消耗交付上限、
+/// 不触发级联，计入 [`TickStats::signals_filtered`]。
+#[derive(Clone, Debug, PartialEq)]
+pub enum SignalFilter {
+    /// 全收（[`SceneObserver`] 缺省 —— 既有行为不变）。
+    All,
+    /// 只收列出的名字（精确）与前缀（如 `tree/`）。
+    Select {
+        /// 精确名集。
+        names: Vec<String>,
+        /// 前缀集。
+        prefixes: Vec<String>,
+    },
+}
+
+impl SignalFilter {
+    /// 全不收（[`crate::NoObserver`] 用：泵只记账不进回调）。
+    pub const NONE: SignalFilter = SignalFilter::Select {
+        names: Vec::new(),
+        prefixes: Vec::new(),
+    };
+
+    /// 精确名订阅。
+    pub fn names(names: &[&str]) -> Self {
+        SignalFilter::Select {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            prefixes: Vec::new(),
+        }
+    }
+
+    /// 前缀订阅（如 `["tree/"]` 收全部桥信号）。
+    pub fn prefixes(prefixes: &[&str]) -> Self {
+        SignalFilter::Select {
+            names: Vec::new(),
+            prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// 名字是否命中订阅。
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            SignalFilter::All => true,
+            SignalFilter::Select { names, prefixes } => {
+                names.iter().any(|n| n == name) || prefixes.iter().any(|p| name.starts_with(p.as_str()))
+            }
+        }
+    }
+}
+
 /// 运行时的无观察者帧循环用它，保证"不接行为"与"接了行为"走同一条 tick 路径。
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NoObserver;
 
-impl SceneObserver for NoObserver {}
+impl SceneObserver for NoObserver {
+    /// 无行为代码 = 对任何信号都不感兴趣（泵跳过全部回调，只记账）。
+    fn signal_filter(&self) -> SignalFilter {
+        SignalFilter::NONE
+    }
+}
 
 /// 信号泵单帧交付上限（含级联）。超出即丢弃并计入
 /// [`TickStats::signals_dropped`] —— runaway 级联是编程错误，引擎的
@@ -596,6 +659,8 @@ pub struct TickStats {
     pub dirty_flushed: usize,
     /// 信号泵交付的信号数（含级联）。
     pub signals_delivered: usize,
+    /// 未命中订阅被过滤的信号数（不进处理器、不耗上限）。
+    pub signals_filtered: usize,
     /// 超出交付上限被丢弃的信号数（ runaway 级联的如实计数）。
     pub signals_dropped: usize,
 }
@@ -1352,8 +1417,11 @@ impl SceneTree {
         //    交付集 = 宿主预发 + 本帧各回调阶段发射；处理器可再发射（入队，
         //    同泵继续交付 —— 迭代级联，非同步递归）；处理器的 Cmd 立即落地，
         //    紧随其后的变换冲洗看得见 —— **信号触发的变更同帧生效**。
+        //    订阅过滤（S6.16）：未命中 [`SceneObserver::signal_filter`] 的信号
+        //    不进处理器 —— 不耗上限、不触发级联，计入 signals_filtered。
         //    级联上限 [`SIGNAL_DELIVERY_CAP`]：runaway 时丢弃并如实计数，
         //    不挂起帧循环。
+        let filter = obs.signal_filter();
         let mut inflight: Vec<Signal> = std::mem::take(&mut self.signal_queue);
         inflight.append(&mut emitted);
         while !inflight.is_empty() {
@@ -1363,6 +1431,10 @@ impl SceneTree {
                 break;
             }
             let sig = inflight.remove(0);
+            if !filter.matches(&sig.name) {
+                stats.signals_filtered += 1;
+                continue;
+            }
             let mut cmds: Vec<Cmd> = Vec::new();
             let mut re_emitted: Vec<Signal> = Vec::new();
             {
