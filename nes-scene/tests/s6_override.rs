@@ -397,3 +397,208 @@ fn t_ovr_09_structural_roundtrip() {
     assert!(tree2.find_by_name("extra").is_some(), "extra 复现");
     assert!(tree2.find_by_name("sprite").is_none(), "sprite 仍被移除");
 }
+
+// ---------------------------------------------------------------- 重命名覆盖
+// S6.11：rename 记录 —— 保留跟踪（节点仍属子场景），不像 remove+add 冻结副本。
+
+/// T-Ovr-10：rename 应用 —— 节点按记录改名（旧名寻址失效、新名可查）；
+/// rename 与字段覆盖可同记录；与 remove 互斥由解析层保证。
+#[test]
+fn t_ovr_10_rename_applies_and_keeps_fields() {
+    let parent = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                props: { "sub_scene": Resource(1), },
+                overrides: [
+                    Override(path: "holder/sprite", rename: "hero", local: (x: 16.0, y: 0.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0)),
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    let parent = parse_ron(parent).expect("父文档");
+    let expanded = expand_subscenes(&parent, &mut |_| parse_ron(CHILD).map_err(|e| e.to_string()))
+        .expect("展开");
+    let (tree, _table, report) = instantiate_doc_with_resources(&expanded).expect("实例化");
+    assert!(report.is_clean());
+
+    let hero = tree.find_by_name("hero").expect("新名可查");
+    assert!(tree.find_by_name("sprite").is_none(), "旧名寻址失效");
+    assert_eq!(tree.local(hero).expect("local").pos.x, 16.0, "同记录字段覆盖生效");
+    assert_eq!(
+        tree.get(hero).expect("节点").props.get("texture"),
+        Some(&Value::Resource(2)),
+        "节点仍属子场景（纹理经合并槽位流入）"
+    );
+
+    // 互斥：rename + remove 同时声明 -> 解析层拒绝并指名。
+    let err = parse_ron(&parent_src_with_rename_and_remove())
+        .expect_err("rename+remove 必须被解析层拒绝");
+    assert!(err.to_string().contains("互斥"), "指名问题：{err}");
+}
+
+/// 构造 rename+remove 同记录的非法父文档（供互斥校验断言）。
+fn parent_src_with_rename_and_remove() -> String {
+    r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                props: { "sub_scene": Resource(1), },
+                overrides: [
+                    Override(path: "holder/sprite", rename: "hero", remove: true),
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)
+"#
+    .to_string()
+}
+
+/// T-Ovr-11：diff 识别 rename —— 同种类未配对 -> 单条 rename 记录（不是
+/// remove+add），字段差异并入；不同种类 -> 仍走 remove+add。
+#[test]
+fn t_ovr_11_diff_detects_rename() {
+    // 干净父场景加载。
+    let parent_clean = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                props: { "sub_scene": Resource(1), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    let parent = parse_ron(parent_clean).expect("父文档");
+    let expanded = expand_subscenes(&parent, &mut |_| parse_ron(CHILD).map_err(|e| e.to_string()))
+        .expect("展开");
+    let (mut tree, table, _report) = instantiate_doc_with_resources(&expanded).expect("实例化");
+    let (ref_tree, ref_table) = reference_of(CHILD);
+
+    // 运行时重命名 sprite -> hero（并挪到 (16,0)）。
+    let sprite = find(&tree, "sprite");
+    tree.queue(nes_scene::TreeOp::Rename { node: sprite, name: "hero".to_string() });
+    tree.set_local(sprite, Transform2D::from_pos(16.0, 0.0));
+    tree.apply_pending();
+
+    let records = diff_instance_overrides(&tree, find(&tree, "instance"), &table, &ref_tree, &ref_table);
+    let ren = records
+        .iter()
+        .find(|r| r.rename.is_some())
+        .expect("rename 记录（不是 remove+add）");
+    assert_eq!(ren.path, "holder/sprite", "路径按子场景原名");
+    assert_eq!(ren.rename.as_deref(), Some("hero"));
+    assert_eq!(ren.local.expect("字段并入").pos.x, 16.0);
+    assert!(!ren.remove && ren.add.is_empty(), "不是 remove+add");
+    assert!(records.iter().all(|r| !r.remove), "无 remove 记录");
+
+    // 对照：删 Sprite2D + 加 Node2D（不同种类）仍走 remove+add。
+    let (mut tree2, table2, _r2) = instantiate_doc_with_resources(&expanded2()).expect("实例化2");
+    let _ = table2;
+    let sp2 = find(&tree2, "sprite");
+    tree2.queue(nes_scene::TreeOp::Remove { node: sp2, keep_children: false });
+    let holder2 = find(&tree2, "holder");
+    tree2.add_node(holder2, "badge", NodeKind::Node2D);
+    tree2.apply_pending();
+    let rec2 = diff_instance_overrides(&tree2, find(&tree2, "instance"), &table, &ref_tree, &ref_table);
+    assert!(rec2.iter().any(|r| r.remove), "不同种类 -> remove");
+    assert!(rec2.iter().any(|r| !r.add.is_empty()), "不同种类 -> add");
+}
+
+fn expanded2() -> nes_scene::SceneDoc {
+    let parent = parse_ron(r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                props: { "sub_scene": Resource(1), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#).expect("父文档");
+    expand_subscenes(&parent, &mut |_| parse_ron(CHILD).map_err(|e| e.to_string())).expect("展开")
+}
+
+/// T-Ovr-12：rename 往返 + **保留跟踪** —— 子场景更新后，被改名节点的
+/// 未覆盖字段跟随新内容（这是 rename 相对 remove+add 的核心收益）。
+#[test]
+fn t_ovr_12_rename_keeps_tracking_across_updates() {
+    // 子场景 v2：sprite 挪到 (48,0)（子场景作者的更新）。
+    let child_v2 = CHILD.replace(
+        "name: \"sprite\",\n                        kind: \"Sprite2D\",\n                        props:",
+        "name: \"sprite\",\n                        kind: \"Sprite2D\",\n                        local: (x: 48.0, y: 0.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),\n                        props:",
+    );
+
+    // 父场景带 rename（无字段覆盖）。
+    let parent_src = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                props: { "sub_scene": Resource(1), },
+                overrides: [
+                    Override(path: "holder/sprite", rename: "hero"),
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    let parent = parse_ron(parent_src).expect("父文档");
+    let expanded = expand_subscenes(&parent, &mut |_| parse_ron(&child_v2).map_err(|e| e.to_string()))
+        .expect("展开（新子场景）");
+    let (tree, _table, _report) = instantiate_doc_with_resources(&expanded).expect("实例化");
+
+    let hero = tree.find_by_name("hero").expect("改名生效");
+    assert_eq!(
+        tree.local(hero).expect("local").pos.x, 48.0,
+        "保留跟踪：未覆盖字段跟随子场景新值（rename 不是冻结副本）"
+    );
+}

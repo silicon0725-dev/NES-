@@ -531,3 +531,110 @@ fn t_scene_07_structural_override_end_to_end() {
     assert_eq!(after.image.pixel(10, 26), Some(V1[0]), "late 复现在 (8,24)");
     assert_eq!(after.image.pixel(10, 10), Some(CLEAR_RGBA), "sprite 仍被移除");
 }
+
+/// T-Scene-08：rename 端到端 —— 磁盘 rename 记录加载（改名 + 纹理从子场景
+/// 流入改名节点）；运行时改名 -> 烘焙存盘（文件含 rename 记录而非
+/// remove+add）-> 子场景更新触发热重载后，**改名节点跟随子场景新位置**
+///（保留跟踪的核心收益）。
+#[test]
+fn t_scene_08_rename_keeps_tracking_end_to_end() {
+    let root = make_root("s8");
+    let child = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "child_root",
+        kind: "Node2D",
+        children: [
+            Node(
+                name: "sprite",
+                kind: "Sprite2D",
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    let parent = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                local: (x: 8.0, y: 8.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "sub_scene": Resource(1), },
+                overrides: [
+                    Override(path: "sprite", rename: "hero"),
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root.join("Scenes").join("child.ron"), child).expect("写子场景");
+    std::fs::write(root.join("Scenes").join("parent.ron"), parent).expect("写父场景");
+
+    let Ok(mut rt) = NesRuntime::open_with_root(&root, 64, 64) else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+    rt.load_scene("Scenes/parent.ron").expect("加载");
+    let _ = rt.bind_assets();
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 1);
+    let first = rt.frame(&frame(0)).expect("首帧");
+    assert_eq!(first.image.pixel(10, 10), Some(V1[0]), "hero（原 sprite）在 (8,8)，纹理从子场景流入");
+
+    // 子场景更新：sprite 挪到 (16,0)（世界 (24,8)）。
+    let child_v2 = child.replace(
+        "name: \"sprite\",\n                kind: \"Sprite2D\",\n                props:",
+        "name: \"sprite\",\n                kind: \"Sprite2D\",\n                local: (x: 16.0, y: 0.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),\n                props:",
+    );
+    std::fs::write(root.join("Scenes").join("child.ron"), child_v2).expect("改子场景");
+    assert!(rt.poll_scene_reload().expect("热重载").is_some(), "触发整树重载");
+    let _ = rt.upload_pending_textures();
+    let second = rt.frame(&frame(1)).expect("重载帧");
+    assert_eq!(second.stats.drawn, 1);
+    assert_eq!(
+        second.image.pixel(26, 10), Some(V1[0]),
+        "改名节点跟随子场景新位置 (24,8) —— 保留跟踪"
+    );
+    assert_eq!(second.image.pixel(10, 10), Some(CLEAR_RGBA), "旧位置已空");
+
+    // 运行时再改名 hero->player -> 烘焙存盘：文件记录是 rename（不是 remove+add）。
+    let hero = rt.tree_mut().find_by_name("hero").expect("hero");
+    rt.tree_mut().queue(nes_scene::TreeOp::Rename { node: hero, name: "player".to_string() });
+    rt.tree_mut().apply_pending();
+    assert_eq!(rt.sync_overrides().expect("烘焙"), 1);
+    rt.save_scene("Scenes/baked_rename.ron").expect("存");
+    let baked = std::fs::read_to_string(root.join("Scenes").join("baked_rename.ron")).unwrap();
+    assert!(baked.contains("rename: \"player\""), "rename 记录写出：\n{baked}");
+    assert!(!baked.contains("remove: true"), "不是 remove+add：\n{baked}");
+    assert!(!baked.contains("add: ["), "无冻结副本：\n{baked}");
+
+    // 全新运行时加载烘焙文件：改名链保持（sprite -> hero -> player），
+    // 且子场景位置更新仍在（(24,8)，因为烘焙前已重载）。
+    let mut rt2 = NesRuntime::open_with_root(&root, 64, 64).expect("运行时 2");
+    rt2.load_scene("Scenes/baked_rename.ron").expect("加载");
+    let _ = rt2.bind_assets();
+    assert_eq!(rt2.upload_pending_textures().expect("上传"), 1);
+    let after = rt2.frame(&frame(0)).expect("复现帧");
+    assert_eq!(after.stats.drawn, 1);
+    assert_eq!(after.image.pixel(26, 10), Some(V1[0]), "player 在 (24,8)");
+    assert!(rt2.tree_mut().find_by_name("player").is_some(), "最终名可查");
+}

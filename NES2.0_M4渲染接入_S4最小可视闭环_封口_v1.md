@@ -209,6 +209,10 @@ cargo run --example s41_visual_closure
 >（参照独有 -> remove、当前独有 -> add 子树全量导出；文档见
 > `NES2.0_S6结构性覆盖_v1.md`）；新增 T-Ovr-07..09 与 T-Scene-07，
 > scene 基线升至 100、runtime 升至 22。项目自此入 Git 仓库。
+> **v1.18 注记（S6.11 重命名覆盖）**：`rename` 记录落地 —— 改名**保留
+> 跟踪**（节点仍属子场景，字段覆盖与热更新继续作用），diff 以同种类
+> 贪心配对识别 rename（文档见 `NES2.0_S6重命名覆盖_v1.md`）；新增
+> T-Ovr-10..12 与 T-Scene-08，scene 基线升至 103、runtime 升至 23。
 
 | 事项 | 状态 |
 |---|---|

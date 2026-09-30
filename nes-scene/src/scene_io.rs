@@ -234,8 +234,13 @@ pub struct InstanceOverride {
     /// 结构性覆盖：在该节点下**追加**的子树（父场景文件拥有的节点，
     /// 含其属性/变换/后代）。与 `remove` 互斥（同一记录不得同时出现）。
     pub add: Vec<NodeDoc>,
-    /// 结构性覆盖：从实例中**移除**该节点（整棵子树）。
+    /// 结构性覆盖：从实例中**移除**该节点（整棵子树）。与 `rename` 互斥。
     pub remove: bool,
+    /// 结构性覆盖：把该节点改名（**保留跟踪** —— 节点仍属子场景，字段覆盖
+    /// 与子场景热更新继续作用于它；不像 remove+add 会冻成父文件副本）。
+    /// 记录路径一律按子场景**原名**解析（rename 延迟落地，同批后续记录
+    /// 按旧名寻址）；目标名与兄弟相撞时按既有规则自动加后缀。
+    pub rename: Option<String>,
 }
 
 impl NodeDoc {
@@ -426,6 +431,9 @@ fn write_node(out: &mut String, doc: &NodeDoc, opts: &PackOptions, level: usize)
                 rec.push('}');
             }
             out.push_str(&rec);
+            if let Some(name) = &ov.rename {
+                out.push_str(&format!(", rename: {}", quote(name)));
+            }
             if ov.remove {
                 out.push_str(", remove: true");
             }
@@ -785,12 +793,20 @@ fn apply_overrides(
         }
         if ov.remove {
             // 结构性覆盖：移除整棵子树（延迟落地 —— 路径解析基于当前结构）。
-            // 移除后字段覆盖无意义，跳过；同一记录的 add 由解析层保证互斥。
+            // 移除后字段覆盖无意义，跳过；同一记录的 add/rename 由解析层保证互斥。
             tree.queue(crate::tree::TreeOp::Remove {
                 node: target,
                 keep_children: false,
             });
             continue;
+        }
+        if let Some(new_name) = &ov.rename {
+            // 结构性覆盖：改名（延迟落地 —— 同批后续记录的路径仍按原名解析，
+            // 无歧义）。改名保留跟踪：节点仍属子场景。
+            tree.queue(crate::tree::TreeOp::Rename {
+                node: target,
+                name: new_name.clone(),
+            });
         }
         if let Some(t) = ov.local {
             tree.set_local(target, t);
@@ -865,7 +881,134 @@ fn diff_override_node(
     path: String,
     out: &mut Vec<InstanceOverride>,
 ) {
-    // 1) 三类字段差异。
+    // 1) 字段差异。
+    let (local, process_mode, props) = field_diff(current, cur, reference, r#ref);
+    if local.is_some() || process_mode.is_some() || !props.is_empty() {
+        out.push(InstanceOverride {
+            path: path.clone(),
+            local,
+            process_mode,
+            props,
+            add: Vec::new(),
+            remove: false,
+            rename: None,
+        });
+    }
+
+    // 2) 按名配对下钻；**结构性差异生成为覆盖记录**（S6.10/S6.11）：
+    //    - 参照独有（实例中被删）-> `remove` 记录；
+    //    - 当前独有（实例中新增）-> 该父路径下一条 `add` 记录
+    //      （子树用 node_to_doc 全量导出）；
+    //    - 双侧未配对且**种类相同** -> `rename` 记录（同种类贪心配对：
+    //      重命名表现为 rename 并保留跟踪，节点仍属子场景；
+    //      "删 A 加同种类 B"也会被识别为 rename —— 后果是 B 保持跟踪
+    //      子场景，这是可接受的歧义消解，见 S6.11 文档）。
+    let cur_children: Vec<NodeId> = current.tree.children(cur).to_vec();
+    let ref_children: Vec<NodeId> = reference.tree.children(r#ref).to_vec();
+
+    // 未配对的两侧子节点（按各自顺序）。
+    let ref_unmatched: Vec<NodeId> = ref_children
+        .iter()
+        .copied()
+        .filter(|rc| {
+            let name = reference.tree.name(*rc).unwrap_or("");
+            !cur_children
+                .iter()
+                .any(|c| current.tree.name(*c) == Some(name))
+        })
+        .collect();
+    let mut cur_unmatched: Vec<NodeId> = cur_children
+        .iter()
+        .copied()
+        .filter(|cc| {
+            let name = current.tree.name(*cc).unwrap_or("");
+            !ref_children
+                .iter()
+                .any(|r| reference.tree.name(*r) == Some(name))
+        })
+        .collect();
+
+    let mut added: Vec<NodeDoc> = Vec::new();
+    for rc in ref_unmatched {
+        let Some(ref_name) = reference.tree.name(rc) else { continue };
+        let child_path = if path.is_empty() {
+            ref_name.to_string()
+        } else {
+            format!("{path}/{ref_name}")
+        };
+        // 同种类贪心配对 -> rename（字段差异并入同一条记录）。
+        let paired = cur_unmatched
+            .iter()
+            .position(|cc| {
+                current.tree.kind_tag(*cc).is_some()
+                    && current.tree.kind_tag(*cc) == reference.tree.kind_tag(rc)
+            })
+            .map(|i| cur_unmatched.remove(i));
+        if let Some(cc) = paired {
+            let (local, process_mode, props) = field_diff(current, cc, reference, rc);
+            out.push(InstanceOverride {
+                path: child_path.clone(),
+                local,
+                process_mode,
+                props,
+                add: Vec::new(),
+                remove: false,
+                rename: current.tree.name(cc).map(str::to_string),
+            });
+            diff_override_node(current, cc, reference, rc, child_path, out);
+        } else {
+            out.push(InstanceOverride {
+                path: child_path,
+                local: None,
+                process_mode: None,
+                props: Vec::new(),
+                add: Vec::new(),
+                remove: true,
+                rename: None,
+            });
+        }
+    }
+    // 剩余未配对的当前子节点 -> add（子树全量导出）。
+    for cc in cur_unmatched {
+        added.push(node_to_doc(current.tree, cc, false));
+    }
+    if !added.is_empty() {
+        out.push(InstanceOverride {
+            path: path.clone(),
+            local: None,
+            process_mode: None,
+            props: Vec::new(),
+            add: added,
+            remove: false,
+            rename: None,
+        });
+    }
+
+    // 3) 按名配对的子节点递归下钻。
+    for rc in ref_children {
+        let Some(name) = reference.tree.name(rc) else { continue };
+        let child_path = if path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{path}/{name}")
+        };
+        if let Some(cc) = cur_children
+            .iter()
+            .copied()
+            .find(|&c| current.tree.name(c) == Some(name))
+        {
+            diff_override_node(current, cc, reference, rc, child_path, out);
+        }
+    }
+}
+
+/// 一对节点的字段差异（local / process_mode / props；资源按所指路径比较）。
+fn field_diff(
+    current: &DiffSide<'_>,
+    cur: NodeId,
+    reference: &DiffSide<'_>,
+    r#ref: NodeId,
+) -> (Option<Transform2D>, Option<ProcessMode>, Vec<(String, Value)>) {
     let local = if current.tree.local(cur) != reference.tree.local(r#ref) {
         current.tree.local(cur)
     } else {
@@ -894,69 +1037,7 @@ fn diff_override_node(
             props.push((k.to_string(), v.clone()));
         }
     }
-    if local.is_some() || process_mode.is_some() || !props.is_empty() {
-        out.push(InstanceOverride {
-            path: path.clone(),
-            local,
-            process_mode,
-            props,
-            add: Vec::new(),
-            remove: false,
-        });
-    }
-
-    // 2) 按名配对下钻；**结构性差异生成为覆盖记录**（S6.10）：
-    //    参照独有（实例中被删）-> `remove` 记录；当前独有（实例中新增）
-    //    -> 该父路径下一条 `add` 记录（子树用 node_to_doc 全量导出）。
-    //    重命名表现为 remove + add（节点身份不保留，语义无损）。
-    let mut added: Vec<NodeDoc> = Vec::new();
-    for rc in reference.tree.children(r#ref) {
-        let Some(name) = reference.tree.name(*rc) else { continue };
-        let child_path = if path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{path}/{name}")
-        };
-        let Some(cc) = current
-            .tree
-            .children(cur)
-            .iter()
-            .copied()
-            .find(|&c| current.tree.name(c) == Some(name))
-        else {
-            out.push(InstanceOverride {
-                path: child_path,
-                local: None,
-                process_mode: None,
-                props: Vec::new(),
-                add: Vec::new(),
-                remove: true,
-            });
-            continue;
-        };
-        diff_override_node(current, cc, reference, *rc, child_path, out);
-    }
-    for cc in current.tree.children(cur) {
-        let Some(name) = current.tree.name(*cc) else { continue };
-        let in_reference = reference
-            .tree
-            .children(r#ref)
-            .iter()
-            .any(|r| reference.tree.name(*r) == Some(name));
-        if !in_reference {
-            added.push(node_to_doc(current.tree, *cc, false));
-        }
-    }
-    if !added.is_empty() {
-        out.push(InstanceOverride {
-            path: path.clone(),
-            local: None,
-            process_mode: None,
-            props: Vec::new(),
-            add: added,
-            remove: false,
-        });
-    }
+    (local, process_mode, props)
 }
 
 /// 两个资源槽位是否指向同一路径（解析失败 = 悬垂，悬垂对悬垂视为相等 ——
@@ -1537,6 +1618,7 @@ impl Parser {
         let mut props: Vec<(String, Value)> = Vec::new();
         let mut add: Vec<NodeDoc> = Vec::new();
         let mut remove = false;
+        let mut rename: Option<String> = None;
 
         loop {
             self.skip_trivia();
@@ -1575,6 +1657,9 @@ impl Parser {
                 "add" => {
                     add = self.node_list()?;
                 }
+                "rename" => {
+                    rename = Some(self.string()?);
+                }
                 "remove" => {
                     self.skip_trivia();
                     let text = self.ident()?;
@@ -1610,6 +1695,18 @@ impl Parser {
                 "覆盖记录 `{path}` 同时声明 remove 与 add —— 互斥"
             )));
         }
+        if let Some(name) = &rename {
+            if remove {
+                return Err(ParseError::semantic(format!(
+                    "覆盖记录 `{path}` 同时声明 rename 与 remove —— 互斥"
+                )));
+            }
+            if name.is_empty() {
+                return Err(ParseError::semantic(format!(
+                    "覆盖记录 `{path}` 的 rename 目标名为空"
+                )));
+            }
+        }
         Ok(InstanceOverride {
             path,
             local,
@@ -1617,6 +1714,7 @@ impl Parser {
             props,
             add,
             remove,
+            rename,
         })
     }
 
