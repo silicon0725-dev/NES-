@@ -337,6 +337,7 @@ pub struct NodeCtx<'a> {
     this: NodeId,
     tree: &'a SceneTree,
     cmds: &'a mut Vec<Cmd>,
+    signals: &'a mut Vec<Signal>,
 }
 
 impl<'a> NodeCtx<'a> {
@@ -451,6 +452,15 @@ impl<'a> NodeCtx<'a> {
     pub fn process_mode(&self) -> ProcessMode {
         self.tree.effective_process_mode(self.this)
     }
+
+    /// 发射一条信号（源自动填当前节点）。入队，帧末泵统一交付。
+    pub fn emit(&mut self, name: &str, payload: Value) {
+        self.signals.push(Signal {
+            src: Some(self.this),
+            name: name.to_string(),
+            payload,
+        });
+    }
 }
 
 /// 遍历钩子。引擎与测试都通过它观察树。
@@ -467,6 +477,67 @@ pub trait SceneObserver {
     fn on_process(&mut self, _ctx: &mut NodeCtx<'_>, _delta: f32) {}
     /// 节点出树。
     fn on_exit_tree(&mut self, _tree: &SceneTree, _node: NodeId) {}
+    /// 信号交付（帧末泵，按发射序）。行为代码据此解耦通信：发射方不认识
+    /// 接收方，接收方按名字过滤（订阅册属脚本 VM 里程碑，见 S6.14 文档）。
+    fn on_signal(&mut self, _ctx: &mut SignalCtx<'_>, _sig: &Signal) {}
+}
+
+/// 一条信号：名字键 + 值载荷 + 发射源（`None` = 宿主/无名源）。
+///
+/// 载荷是 [`Value`]（值语义，交付即拷贝）。草案 §12：入队、帧末统一 flush、
+/// 禁止 emit 中同步递归 —— 泵以工作队列迭代级联（带上限），不违反。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signal {
+    /// 发射源节点（`NodeCtx::emit` 自动填当前节点）。
+    pub src: Option<NodeId>,
+    /// 信号名（接收方按名过滤）。
+    pub name: String,
+    /// 载荷。
+    pub payload: Value,
+}
+
+/// 信号处理器看到的句柄：**只读树 + 命令缓冲 + 再发射**（与 [`NodeCtx`]
+/// 同一形状，但信号没有"当前节点"）。
+pub struct SignalCtx<'a> {
+    tree: &'a SceneTree,
+    cmds: &'a mut Vec<Cmd>,
+    signals: &'a mut Vec<Signal>,
+}
+
+impl<'a> SignalCtx<'a> {
+    /// 只读树。
+    pub fn tree(&self) -> &'a SceneTree {
+        self.tree
+    }
+
+    /// 再发射一条信号（入队，本帧泵内继续交付 —— 迭代级联，非同步递归）。
+    pub fn emit(&mut self, name: &str, payload: Value) {
+        self.signals.push(Signal {
+            src: None,
+            name: name.to_string(),
+            payload,
+        });
+    }
+
+    /// 排队一项结构变更（延迟落地，与 [`NodeCtx::queue`] 同口径）。
+    pub fn queue(&mut self, op: TreeOp) {
+        self.cmds.push(Cmd::Tree(op));
+    }
+
+    /// 写任意节点的本地变换（立即生效）。
+    pub fn set_local(&mut self, node: NodeId, t: Transform2D) {
+        self.cmds.push(Cmd::SetLocal { node, t });
+    }
+
+    /// 写任意节点的属性（立即生效；类型不符/未知键静默忽略 —— 与
+    /// [`NodeCtx::set_prop`] 同口径：回调路径没有事件通道，写错不该崩帧）。
+    pub fn set_prop(&mut self, node: NodeId, name: &str, value: Value) {
+        self.cmds.push(Cmd::SetProp {
+            node,
+            name: name.to_string(),
+            value,
+        });
+    }
 }
 
 /// 空观察者：宿主没有行为代码时的缺省。
@@ -477,6 +548,11 @@ pub trait SceneObserver {
 pub struct NoObserver;
 
 impl SceneObserver for NoObserver {}
+
+/// 信号泵单帧交付上限（含级联）。超出即丢弃并计入
+/// [`TickStats::signals_dropped`] —— runaway 级联是编程错误，引擎的
+/// 责任是不挂起帧循环并如实计数。
+pub const SIGNAL_DELIVERY_CAP: usize = 1024;
 
 /// 一次 `tick` 的统计。用于性能观测与测试断言。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -496,6 +572,10 @@ pub struct TickStats {
     pub process_skipped: usize,
     /// 重算世界矩阵的节点数。
     pub dirty_flushed: usize,
+    /// 信号泵交付的信号数（含级联）。
+    pub signals_delivered: usize,
+    /// 超出交付上限被丢弃的信号数（ runaway 级联的如实计数）。
+    pub signals_dropped: usize,
 }
 
 /// 场景树。
@@ -506,6 +586,10 @@ pub struct SceneTree {
     order_seq: u64,
     frame: u64,
     groups: HashMap<String, Vec<NodeId>>,
+    /// 待交付信号队列（宿主经 [`SceneTree::emit_signal`] 预发；回调经
+    /// [`NodeCtx::emit`]/[`SignalCtx::emit`] 收集到 tick 本地缓冲）。
+    /// 帧末泵清空 —— 信号生命周期 = 单帧，跨帧留存请宿主自行存状态。
+    signal_queue: Vec<Signal>,
     /// 全局暂停位（草案 §9）。影响 [`ProcessMode::Pausable`]（含 `Inherit`
     /// 解析结果）的 `process` 派发；生命周期与结构变更**不受影响**。
     paused: bool,
@@ -546,6 +630,7 @@ impl SceneTree {
             order_seq: 0,
             frame: 0,
             groups: HashMap::new(),
+            signal_queue: Vec::new(),
             paused: false,
             time_scale: 1.0,
         }
@@ -684,6 +769,22 @@ impl SceneTree {
             cur = self.parent(p);
         }
         out
+    }
+
+    // ---------- 信号（草案 §12，S6.14） ----------
+
+    /// 宿主预发一条信号（`src = None`）：本帧 tick 的信号泵统一交付。
+    pub fn emit_signal(&mut self, name: &str, payload: Value) {
+        self.signal_queue.push(Signal {
+            src: None,
+            name: name.to_string(),
+            payload,
+        });
+    }
+
+    /// 尚未交付的宿主预发信号（泵在每次 tick 帧末清空队列）。
+    pub fn pending_signals(&self) -> &[Signal] {
+        &self.signal_queue
     }
 
     // ---------- 暂停与时间缩放（草案 §9） ----------
@@ -1092,6 +1193,8 @@ impl SceneTree {
             frame: self.frame,
             ..TickStats::default()
         };
+        // 本帧各回调阶段发射的信号（帧末泵统一交付）。
+        let mut emitted: Vec<Signal> = Vec::new();
 
         // 1. 结构变更落地
         let events = self.apply_pending();
@@ -1119,6 +1222,7 @@ impl SceneTree {
                     this: id,
                     tree: &*self,
                     cmds: &mut cmds,
+                    signals: &mut emitted,
                 };
                 obs.on_enter_tree(&mut ctx);
             }
@@ -1149,6 +1253,7 @@ impl SceneTree {
                     this: id,
                     tree: &*self,
                     cmds: &mut cmds,
+                    signals: &mut emitted,
                 };
                 obs.on_ready(&mut ctx);
             }
@@ -1201,6 +1306,7 @@ impl SceneTree {
                     this: id,
                     tree: &*self,
                     cmds: &mut cmds,
+                    signals: &mut emitted,
                 };
                 obs.on_process(&mut ctx, delta);
             }
@@ -1210,7 +1316,39 @@ impl SceneTree {
             stats.processed += 1;
         }
 
-        // 5. 变换冲洗
+        // 5. 信号泵（草案 §12：入队、帧末统一 flush、禁同步递归）。
+        //    交付集 = 宿主预发 + 本帧各回调阶段发射；处理器可再发射（入队，
+        //    同泵继续交付 —— 迭代级联，非同步递归）；处理器的 Cmd 立即落地，
+        //    紧随其后的变换冲洗看得见 —— **信号触发的变更同帧生效**。
+        //    级联上限 [`SIGNAL_DELIVERY_CAP`]：runaway 时丢弃并如实计数，
+        //    不挂起帧循环。
+        let mut inflight: Vec<Signal> = std::mem::take(&mut self.signal_queue);
+        inflight.append(&mut emitted);
+        while !inflight.is_empty() {
+            if stats.signals_delivered >= SIGNAL_DELIVERY_CAP {
+                stats.signals_dropped += inflight.len();
+                inflight.clear();
+                break;
+            }
+            let sig = inflight.remove(0);
+            let mut cmds: Vec<Cmd> = Vec::new();
+            let mut re_emitted: Vec<Signal> = Vec::new();
+            {
+                let mut ctx = SignalCtx {
+                    tree: &*self,
+                    cmds: &mut cmds,
+                    signals: &mut re_emitted,
+                };
+                obs.on_signal(&mut ctx, &sig);
+            }
+            for c in cmds {
+                self.apply_cmd(c);
+            }
+            inflight.append(&mut re_emitted);
+            stats.signals_delivered += 1;
+        }
+
+        // 6. 变换冲洗
         stats.dirty_flushed = self.refresh_transforms();
 
         self.frame += 1;

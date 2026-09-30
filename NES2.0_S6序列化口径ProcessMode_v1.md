@@ -84,7 +84,7 @@
 | 事项 | 状态 |
 |---|---|
 | 编辑器面板为一等字段（local / process_mode）的展示通道 | 未启动（编辑器侧） |
-| 信号总线（SignalBus） | 未启动 |
+| 信号总线（SignalBus） | ✅ S6.14（见 `NES2.0_S6信号总线_v1.md`） |
 | 子场景嵌套 / WM_SIZE / DPI / headless Linux | 沿各文档遗留表 |
 
 ## 5. 记账

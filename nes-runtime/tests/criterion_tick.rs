@@ -257,3 +257,45 @@ fn t_tick_04_callback_spawn_lands_next_frame() {
     assert_eq!(third.stats.drawn, 2, "两个精灵都在画");
     assert_eq!(third.image.pixel(34, 42), Some(V1[0]), "新精灵像素到位");
 }
+
+/// T-Tick-05：信号端到端 —— on_process 发射 "go"，on_signal 处理器把精灵
+/// 平移 16px：**同一帧**像素已在新位置（泵先于变换冲洗、Cmd 立即落地、
+/// 提取在 tick 之后 —— 全链同帧）。
+#[test]
+fn t_tick_05_signal_moves_sprite_same_frame() {
+    use nes_scene::{Signal, SignalCtx};
+
+    struct SignalMover {
+        sprite: NodeId,
+        handled: Vec<String>,
+    }
+    impl nes_scene::SceneObserver for SignalMover {
+        fn on_process(&mut self, ctx: &mut nes_scene::NodeCtx<'_>, _delta: f32) {
+            if ctx.this() == self.sprite {
+                ctx.emit("go", nes_scene::Value::I64(1));
+            }
+        }
+        fn on_signal(&mut self, ctx: &mut SignalCtx<'_>, sig: &Signal) {
+            self.handled.push(sig.name.clone());
+            if sig.name == "go" {
+                // 信号处理器面向任意节点（没有"当前节点"）。
+                ctx.set_local(self.sprite, nes_scene::Transform2D::from_pos(26.0, 10.0));
+            }
+        }
+    }
+
+    let Some((mut rt, sprite, _res)) = assemble_in("s5") else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+    let mut mover = SignalMover {
+        sprite,
+        handled: Vec::new(),
+    };
+    let outcome = rt.frame_with(&frame(0), &mut mover).expect("首帧");
+    assert_eq!(mover.handled, vec!["go"], "信号同帧交付");
+    assert_eq!(outcome.stats.drawn, 1);
+    // 精灵 (10,10) -> (26,10)：信号触发的移动当帧入画。
+    assert_eq!(outcome.image.pixel(28, 12), Some(V1[0]), "同帧新位置");
+    assert_eq!(outcome.image.pixel(12, 12), Some(CLEAR_RGBA), "旧位置已空");
+}

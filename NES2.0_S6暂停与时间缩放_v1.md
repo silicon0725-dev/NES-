@@ -109,7 +109,7 @@ enum 进 `Value` 只有 Str 松校验 / I64 不可读两难。详见 S6.5 文档
 | 事项 | 状态 |
 |---|---|
 | `process_mode` 序列化口径（NodeDoc 一等字段 vs 属性表） | ✅ S6.5 裁决落地：NodeDoc 一等字段（见 `NES2.0_S6序列化口径ProcessMode_v1.md`） |
-| 信号总线（SignalBus，草案 §9 同节提及） | 未启动 |
+| 信号总线（SignalBus，草案 §9 同节提及） | ✅ S6.14（见 `NES2.0_S6信号总线_v1.md`） |
 | `time_scale` 对提取层动画时间（FrameInfo.time）的口径 | 宿主侧自算，树内只管 delta（现状够用，文档化） |
 | 子场景嵌套 / WM_SIZE / DPI / headless Linux | 沿各文档遗留表 |
 
