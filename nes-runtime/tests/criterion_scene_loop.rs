@@ -730,7 +730,7 @@ fn t_scene_09_reorder_flips_z_layering() {
     assert_eq!(rt.sync_overrides().expect("烘焙"), 1);
     rt.save_scene("Scenes/baked_reorder.ron").expect("存");
     let baked = std::fs::read_to_string(root.join("Scenes").join("baked_reorder.ron")).unwrap();
-    assert!(baked.contains("move_to"), "move 记录写出：\n{baked}");
+    assert!(baked.contains("after:"), "after 记录写出（S6.13 相对链）：\n{baked}");
 
     let mut rt2 = NesRuntime::open_with_root(&root, 64, 64).expect("运行时 2");
     rt2.load_scene("Scenes/baked_reorder.ron").expect("加载");
@@ -738,4 +738,107 @@ fn t_scene_09_reorder_flips_z_layering() {
     assert_eq!(rt2.upload_pending_textures().expect("上传"), 2);
     let after = rt2.frame(&frame(0)).expect("复现帧");
     assert_eq!(after.image.pixel(10, 10), Some(V1[0]), "烘焙后黄仍在上");
+}
+
+/// T-Scene-10：相对位置混合端到端 —— add 新精灵（追加落地本应**盖在最上**），
+/// 用 after 链把参照精灵逐一压到它后面 -> 新精灵反而垫底（像素证据：
+/// 重叠区显示参照的红色而非新增的绿色）。这是 S6.12"混合不可表达"缺口的
+/// 解法证明，随后烘焙往返复现。
+#[test]
+fn t_scene_10_relative_position_mixed_end_to_end() {
+    let root = make_root("s10");
+    write_bmp_rgba(&root.join("Textures").join("green.bmp"), 16, 16, &[40, 200, 90, 255].repeat(16 * 16))
+        .expect("写绿纹理");
+    // 子场景：under(黄) / over(红) 完全重叠，over 在上。
+    let child = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/red.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "child_root",
+        kind: "Node2D",
+        children: [
+            Node(name: "under", kind: "Sprite2D", props: { "texture": Resource(1), }, children: []),
+            Node(name: "over", kind: "Sprite2D", props: { "texture": Resource(2), }, children: []),
+        ],
+    ),
+)
+"#;
+    // 父场景：新增 bottom（绿，追加落地会在最上）；after 链把 under/over
+    // 逐一压到 bottom 之后 -> bottom 垫底，红仍在最上。
+    write_bmp_rgba(&root.join("Textures").join("red.bmp"), 16, 16, &[200, 40, 40, 255].repeat(16 * 16))
+        .expect("写红纹理");
+    let parent = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+        Res(id: 2, path: "Textures/green.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                local: (x: 8.0, y: 8.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "sub_scene": Resource(1), },
+                overrides: [
+                    Override(path: "", add: [
+                        Node(
+                            name: "bottom",
+                            kind: "Sprite2D",
+                            props: { "texture": Resource(2), },
+                            children: [],
+                        ),
+                    ]),
+                    Override(path: "under", after: "bottom"),
+                    Override(path: "over", after: "under"),
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root.join("Scenes").join("child.ron"), child).expect("写子场景");
+    std::fs::write(root.join("Scenes").join("parent.ron"), parent).expect("写父场景");
+
+    let Ok(mut rt) = NesRuntime::open_with_root(&root, 64, 64) else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+    rt.load_scene("Scenes/parent.ron").expect("加载");
+    let _ = rt.bind_assets();
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 3, "黄/红/绿三张纹理");
+    let first = rt.frame(&frame(0)).expect("首帧");
+    assert_eq!(first.stats.drawn, 3, "三个精灵");
+    assert_eq!(
+        first.image.pixel(10, 10),
+        Some([200, 40, 40, 255]),
+        "after 链把新增 bottom 压到垫底：最上仍是红（非追加序的绿）"
+    );
+
+    // 烘焙往返：运行时把 under 再压到 over 之后（绿上红下黄顶？——
+    // 直接验证 bake 后文件含 after 且新运行时像素不变）。
+    assert_eq!(rt.sync_overrides().expect("烘焙"), 1);
+    rt.save_scene("Scenes/baked_rel.ron").expect("存");
+    let baked = std::fs::read_to_string(root.join("Scenes").join("baked_rel.ron")).unwrap();
+    assert!(baked.contains("after:"), "after 链写出：\n{baked}");
+
+    let mut rt2 = NesRuntime::open_with_root(&root, 64, 64).expect("运行时 2");
+    rt2.load_scene("Scenes/baked_rel.ron").expect("加载");
+    let _ = rt2.bind_assets();
+    assert_eq!(rt2.upload_pending_textures().expect("上传"), 3);
+    let after = rt2.frame(&frame(0)).expect("复现帧");
+    assert_eq!(after.stats.drawn, 3);
+    assert_eq!(after.image.pixel(10, 10), Some([200, 40, 40, 255]), "复现：红仍最上");
 }

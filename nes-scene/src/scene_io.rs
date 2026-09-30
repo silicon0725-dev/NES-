@@ -242,9 +242,16 @@ pub struct InstanceOverride {
     /// 按旧名寻址）；目标名与兄弟相撞时按既有规则自动加后缀。
     pub rename: Option<String>,
     /// 结构性覆盖：把该节点移到同父兄弟的**绝对下标**（`TreeOp::Move`
-    /// 语义，越界夹到末尾）。下标按应用时的兄弟序（adds 已落地、removes
-    /// 已生效）。与 `remove` 互斥。
+    /// 语义，越界夹到末尾）。下标按应用时（结构落地后）的兄弟序。
+    /// 与 `remove` / `before` / `after` 互斥。
     pub move_to: Option<usize>,
+    /// 结构性覆盖：把该节点移到**名为此的兄弟紧后**（相对位置，S6.13）。
+    /// 锚点在结构落地后解析（新增节点可作锚点）；与 `before` / `move_to` /
+    /// `remove` 互斥。相对位置对子场景更新健壮（插入兄弟不改变"紧跟 X"
+    /// 的含义）。
+    pub after: Option<String>,
+    /// 结构性覆盖：把该节点移到**名为此的兄弟紧前**。同 [`Self::after`]。
+    pub before: Option<String>,
 }
 
 impl NodeDoc {
@@ -440,6 +447,12 @@ fn write_node(out: &mut String, doc: &NodeDoc, opts: &PackOptions, level: usize)
             }
             if let Some(idx) = ov.move_to {
                 out.push_str(&format!(", move_to: {idx}"));
+            }
+            if let Some(name) = &ov.after {
+                out.push_str(&format!(", after: {}", quote(name)));
+            }
+            if let Some(name) = &ov.before {
+                out.push_str(&format!(", before: {}", quote(name)));
             }
             if ov.remove {
                 out.push_str(", remove: true");
@@ -770,6 +783,17 @@ fn apply_all_overrides(tree: &mut SceneTree) -> Result<(), ParseError> {
 /// 路径相对**子场景根**（包装节点的第一个子节点）；悬垂路径（子场景更新后
 /// 节点被改名/删除）如实报语义错误并指名 —— 热重载路径上引擎保持上一棵
 /// 好树（`load_scene` 失败不替换），文件作者修复后下一轮轮询恢复。
+/// 一次位置意图：**结构落地后**才解析（新增节点可作锚点、绝对下标与
+/// diff 所见一致）。
+enum PositionSpec {
+    /// 绝对下标（`move_to`）。
+    Index(usize),
+    /// 紧随名为此的兄弟（`after`，S6.13）。
+    After(String),
+    /// 紧排在名为此的兄弟之前（`before`）。
+    Before(String),
+}
+
 fn apply_overrides(
     tree: &mut SceneTree,
     wrapper: NodeId,
@@ -783,6 +807,9 @@ fn apply_overrides(
         .ok_or_else(|| ParseError::semantic(format!(
             "节点 `{wrapper_name}` 声明了覆盖，但没有展开子树（sub_scene 未绑定或未展开）"
         )))?;
+
+    // 阶段 1：字段（即时）+ 结构（remove/rename/add 入队）；位置意图先收集。
+    let mut positions: Vec<(NodeId, PositionSpec, String)> = Vec::new();
     for ov in overrides {
         let mut target = child_root;
         if !ov.path.is_empty() {
@@ -800,7 +827,7 @@ fn apply_overrides(
         }
         if ov.remove {
             // 结构性覆盖：移除整棵子树（延迟落地 —— 路径解析基于当前结构）。
-            // 移除后字段覆盖无意义，跳过；同一记录的 add/rename 由解析层保证互斥。
+            // 移除后字段/位置覆盖无意义，跳过；互斥由解析层保证。
             tree.queue(crate::tree::TreeOp::Remove {
                 node: target,
                 keep_children: false,
@@ -816,12 +843,13 @@ fn apply_overrides(
             });
         }
         if let Some(idx) = ov.move_to {
-            // 结构性覆盖：兄弟重排（延迟落地；下标按应用时序 —— adds 已在
-            // 更早记录入队、removes 已生效）。与 remove 互斥由解析层保证。
-            tree.queue(crate::tree::TreeOp::Move {
-                node: target,
-                new_index: idx,
-            });
+            positions.push((target, PositionSpec::Index(idx), ov.path.clone()));
+        }
+        if let Some(name) = &ov.after {
+            positions.push((target, PositionSpec::After(name.clone()), ov.path.clone()));
+        }
+        if let Some(name) = &ov.before {
+            positions.push((target, PositionSpec::Before(name.clone()), ov.path.clone()));
         }
         if let Some(t) = ov.local {
             tree.set_local(target, t);
@@ -835,6 +863,55 @@ fn apply_overrides(
         for added in &ov.add {
             // 结构性覆盖：追加父场景拥有的子树（延迟挂接，字段即时写入占位节点）。
             build_child(tree, target, added)?;
+        }
+    }
+
+    // 阶段 2：结构落地 —— 锚点与绝对下标**在此之后**解析（新增节点已入列）。
+    tree.apply_pending();
+
+    // 阶段 3：解析位置意图 -> Move 入队（由调用方收尾的 apply_pending 落地）。
+    // **影子序**：多个意图依次解析时，前序 Move 虽已入队但未落地 —— 若每个
+    // 意图都对着"移动前"的快照取下标，会连环走样（S6.12 的潜在缺陷，混合
+    // 场景实证）。这里用本地影子序列同步模拟落序：解析 → 入队 → 按同一
+    // remove+insert 语义更新影子，后续意图对"已落定"的序解析。
+    let mut intents_by_parent: std::collections::BTreeMap<NodeId, Vec<NodeId>> =
+        std::collections::BTreeMap::new();
+    for (target, spec, path) in positions {
+        let Some(parent) = tree.parent(target) else {
+            continue; // 目标已不在树上（被并发结构操作移除）—— 无位置可言
+        };
+        let siblings = intents_by_parent.entry(parent).or_insert_with(|| tree.children(parent).to_vec());
+        let order = siblings.clone();
+        let anchor = |name: &str| {
+            order
+                .iter()
+                .copied()
+                .position(|s| s != target && tree.name(s) == Some(name))
+        };
+        let index = match &spec {
+            PositionSpec::Index(i) => *i,
+            PositionSpec::After(name) => anchor(name)
+                .map(|i| i + 1)
+                .ok_or_else(|| ParseError::semantic(format!(
+                    "覆盖记录 `{path}` 的 after 锚点 `{name}` 未命中"
+                )))?,
+            PositionSpec::Before(name) => anchor(name).ok_or_else(|| {
+                ParseError::semantic(format!(
+                    "覆盖记录 `{path}` 的 before 锚点 `{name}` 未命中"
+                ))
+            })?,
+        };
+        tree.queue(crate::tree::TreeOp::Move {
+            node: target,
+            new_index: index,
+        });
+        // 影子同步（与 apply_move 同语义：先按落地前长度夹取，再 remove+insert）。
+        let to = index.min(siblings.len().saturating_sub(1));
+        if let Some(from) = siblings.iter().position(|&s| s == target) {
+            if to != from {
+                let item = siblings.remove(from);
+                siblings.insert(to, item);
+            }
         }
     }
     Ok(())
@@ -908,6 +985,8 @@ fn diff_override_node(
             remove: false,
             rename: None,
             move_to: None,
+            after: None,
+            before: None,
         });
     }
 
@@ -945,8 +1024,6 @@ fn diff_override_node(
         .collect();
 
     let mut added: Vec<NodeDoc> = Vec::new();
-    // 本组是否发生了结构变化（remove/rename/add）—— 决定 2.5 段是否生成重排。
-    let mut structural_here = false;
     for rc in ref_unmatched {
         let Some(ref_name) = reference.tree.name(rc) else { continue };
         let child_path = if path.is_empty() {
@@ -973,8 +1050,9 @@ fn diff_override_node(
                 remove: false,
                 rename: current.tree.name(cc).map(str::to_string),
                 move_to: None,
+                after: None,
+                before: None,
             });
-            structural_here = true;
             diff_override_node(current, cc, reference, rc, child_path, out);
         } else {
             out.push(InstanceOverride {
@@ -986,8 +1064,9 @@ fn diff_override_node(
                 remove: true,
                 rename: None,
                 move_to: None,
+                after: None,
+                before: None,
             });
-            structural_here = true;
         }
     }
     // 剩余未配对的当前子节点 -> add（子树全量导出）。
@@ -1005,40 +1084,85 @@ fn diff_override_node(
             remove: false,
             rename: None,
             move_to: None,
+            after: None,
+            before: None,
         });
     }
 
-    // 2.5) 兄弟重排（S6.12）：**纯重排才生成** —— 本组无 remove/rename/add
-    //      记录时（路径寻址无歧义、回放可证明）。
-    //      无变化判定：当前名序 == 参照名序。变化时按**当前序**为每个子节点
-    //      生成 move_to = 当前下标；回放重建当前序的证明：被放置前缀
-    //      [0..i) 不被后续 remove/insert 扰动（被移节点此刻下标必 >= i，
-    //      否则它就在前缀里了）。
-    let structural_dirty = structural_here;
-    if !structural_dirty && added_ids.is_empty() {
-        let expected: Vec<&str> =
-            ref_children.iter().filter_map(|rc| reference.tree.name(*rc)).collect();
-        let current_names: Vec<&str> =
-            cur_children.iter().filter_map(|c| current.tree.name(*c)).collect();
-        if current_names != expected {
-            for (idx, cc) in cur_children.iter().enumerate() {
-                let name = current.tree.name(*cc).unwrap_or_default();
-                let child_path = if path.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{path}/{name}")
-                };
-                out.push(InstanceOverride {
-                    path: child_path,
-                    local: None,
-                    process_mode: None,
-                    props: Vec::new(),
-                    add: Vec::new(),
-                    remove: false,
-                    rename: None,
-                    move_to: Some(idx),
-                });
+    // 2.5) 相对位置链（S6.13）：对当前序 current[1..] 的每个**参照来源**
+    //      子节点生成 `after: 前驱名`（首节点免操作 —— 位置被蕴含；新增节点
+    //      免目标操作，**可作锚点**：锚点在结构落地后解析）。
+    //      回放归纳：每个 after 把目标插到已就位块尾之后（块 = current[0..=i]，
+    //      连续性保持）；新增节点不移动，其他节点围着它摆 —— 其落地尾序
+    //      = add 记录序 = diff 所见相对序，自洽。
+    //      无变化判定：当前名序 == 自然序（参照序去 removed、rename 原位、
+    //      新增追加）时不产生任何位置记录。
+    let mut natural: Vec<String> = ref_children
+        .iter()
+        .filter_map(|rc| {
+            let rn = reference.tree.name(*rc)?;
+            // 名匹配保持原名；rename 配对（同种类、原名未被占）用当前名；
+            // 两者皆无 = removed，跳过。
+            if cur_children.iter().any(|c| current.tree.name(*c) == Some(rn)) {
+                return Some(rn.to_string());
             }
+            let paired = cur_children.iter().find(|c| {
+                current.tree.name(**c).is_some()
+                    && current.tree.kind_tag(**c).is_some()
+                    && current.tree.kind_tag(**c) == reference.tree.kind_tag(*rc)
+            });
+            paired.and_then(|c| current.tree.name(*c)).map(str::to_string)
+        })
+        .collect();
+    natural.extend(added_ids.iter().filter_map(|c| current.tree.name(*c)).map(str::to_string));
+    let current_names: Vec<&str> =
+        cur_children.iter().filter_map(|c| current.tree.name(*c)).collect();
+    let natural_refs: Vec<&str> = natural.iter().map(String::as_str).collect();
+    if current_names != natural_refs {
+        for i in 1..cur_children.len() {
+            let cc = cur_children[i];
+            let Some(name) = current.tree.name(cc) else { continue };
+            // 参照来源判定：名匹配用名；否则与某参照子节点同种类配对（rename）
+            // 用参照名；否则是新增节点，免目标操作。
+            let ref_name = if ref_children
+                .iter()
+                .any(|rc| reference.tree.name(*rc) == Some(name))
+            {
+                Some(name.to_string())
+            } else {
+                ref_children.iter().find_map(|rc| {
+                    let rn = reference.tree.name(*rc)?;
+                    let name_matched =
+                        cur_children.iter().any(|c| current.tree.name(*c) == Some(rn));
+                    let same_kind = current.tree.kind_tag(cc).is_some()
+                        && reference.tree.kind_tag(*rc).is_some()
+                        && current.tree.kind_tag(cc) == reference.tree.kind_tag(*rc);
+                    (!name_matched && same_kind).then(|| rn.to_string())
+                })
+            };
+            let Some(rn) = ref_name else { continue };
+            let prev = current
+                .tree
+                .name(cur_children[i - 1])
+                .unwrap_or_default()
+                .to_string();
+            let child_path = if path.is_empty() {
+                rn
+            } else {
+                format!("{path}/{rn}")
+            };
+            out.push(InstanceOverride {
+                path: child_path,
+                local: None,
+                process_mode: None,
+                props: Vec::new(),
+                add: Vec::new(),
+                remove: false,
+                rename: None,
+                move_to: None,
+                after: Some(prev),
+                before: None,
+            });
         }
     }
 
@@ -1678,6 +1802,8 @@ impl Parser {
         let mut remove = false;
         let mut rename: Option<String> = None;
         let mut move_to: Option<usize> = None;
+        let mut after: Option<String> = None;
+        let mut before: Option<String> = None;
 
         loop {
             self.skip_trivia();
@@ -1724,6 +1850,12 @@ impl Parser {
                     move_to = Some(token.parse::<usize>().map_err(|_| {
                         self.error(format!("非法 move_to 下标 `{token}`"))
                     })?);
+                }
+                "after" => {
+                    after = Some(self.string()?);
+                }
+                "before" => {
+                    before = Some(self.string()?);
                 }
                 "remove" => {
                     self.skip_trivia();
@@ -1777,6 +1909,34 @@ impl Parser {
                 "覆盖记录 `{path}` 同时声明 move_to 与 remove —— 互斥"
             )));
         }
+        let position_ops = [move_to.is_some(), after.is_some(), before.is_some()]
+            .iter()
+            .filter(|b| **b)
+            .count();
+        if position_ops > 1 {
+            return Err(ParseError::semantic(format!(
+                "覆盖记录 `{path}` 的 move_to / after / before 至多声明一个 —— 互斥"
+            )));
+        }
+        if position_ops == 1 && remove {
+            return Err(ParseError::semantic(format!(
+                "覆盖记录 `{path}` 同时声明位置操作与 remove —— 互斥"
+            )));
+        }
+        if let Some(name) = &after {
+            if name.is_empty() {
+                return Err(ParseError::semantic(format!(
+                    "覆盖记录 `{path}` 的 after 锚点名为空"
+                )));
+            }
+        }
+        if let Some(name) = &before {
+            if name.is_empty() {
+                return Err(ParseError::semantic(format!(
+                    "覆盖记录 `{path}` 的 before 锚点名为空"
+                )));
+            }
+        }
         Ok(InstanceOverride {
             path,
             local,
@@ -1786,6 +1946,8 @@ impl Parser {
             remove,
             rename,
             move_to,
+            after,
+            before,
         })
     }
 

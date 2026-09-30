@@ -695,23 +695,28 @@ fn t_ovr_13_move_applies_and_diff_detects_reorder() {
     assert_eq!(sibling_names(&tree2, root2), vec!["c", "b", "a"], "运行时重排");
 
     let records = diff_instance_overrides(&tree2, wrapper2, &table2, &ref_tree, &ref_table);
-    let moves: Vec<(String, usize)> = records
+    // S6.13：diff 生成 after 链（每个节点紧跟其最终前驱；首节点 c 免操作）。
+    let chain: Vec<(String, String)> = records
         .iter()
-        .filter_map(|r| r.move_to.map(|i| (r.path.clone(), i)))
+        .filter_map(|r| r.after.as_ref().map(|a| (r.path.clone(), a.clone())))
         .collect();
     assert_eq!(
-        moves,
-        vec![("c".to_string(), 0), ("b".to_string(), 1), ("a".to_string(), 2)],
-        "按当前序回放：{moves:?}"
+        chain,
+        vec![
+            ("b".to_string(), "c".to_string()),
+            ("a".to_string(), "b".to_string())
+        ],
+        "after 链：{chain:?}"
     );
     assert!(records.iter().all(|r| !r.remove && r.add.is_empty() && r.rename.is_none()));
 
-    // ③ 幂等：把 move 集**应用**回干净实例 -> 得到同序；再 diff 结果不变。
+    // ③ 幂等：把 after 链**应用**回干净实例 -> 得到同序；再 diff 结果不变。
     let ovr: String = records
         .iter()
         .map(|r| {
             let quoted = format!("\"{}\"", r.path);
-            format!("Override(path: {}, move_to: {}),", quoted, r.move_to.unwrap_or(0))
+            let anchor = format!("\"{}\"", r.after.clone().unwrap_or_default());
+            format!("Override(path: {quoted}, after: {anchor}),")
         })
         .collect();
     let reapplied = parent_abc_src(&ovr);
@@ -721,37 +726,97 @@ fn t_ovr_13_move_applies_and_diff_detects_reorder() {
     assert_eq!(
         sibling_names(&tree3, find(&tree3, "child_root")),
         vec!["c", "b", "a"],
-        "move 集回放重建当前序"
+        "after 链回放重建当前序"
     );
     let again = diff_instance_overrides(&tree3, find(&tree3, "instance"), &table3, &ref_tree, &ref_table);
-    // 烘焙后的树重排仍在 -> diff 再生成同一 move 集（稳定，不增长）。
-    let moves_again: Vec<(String, usize)> = again
+    // 烘焙后的树重排仍在 -> diff 再生成同一 after 链（稳定，不增长）。
+    let chain_again: Vec<(String, String)> = again
         .iter()
-        .filter_map(|r| r.move_to.map(|i| (r.path.clone(), i)))
+        .filter_map(|r| r.after.as_ref().map(|a| (r.path.clone(), a.clone())))
         .collect();
-    assert_eq!(moves_again, moves, "幂等：不增长不漂移");
+    assert_eq!(chain_again, chain, "幂等：不增长不漂移");
 }
 
-/// T-Ovr-14：混合结构 + 重排 -> **不生成 move**（纯重排才回放的口径钉死）。
+/// T-Ovr-14：混合结构 + 重排 -> **完整表达**（S6.13）：remove 与 after 链
+/// 同时生成 —— 新增节点可作锚点，相对位置链解决了 S6.12 的混合缺口。
 #[test]
-fn t_ovr_14_mixed_structural_skips_moves() {
+fn t_ovr_14_mixed_structural_and_reorder_expressed() {
     let clean = parse_ron(&parent_abc_src("")).expect("干净父文档");
     let expanded =
         expand_subscenes(&clean, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string())).expect("展开");
     let (mut tree, table, _r) = instantiate_doc_with_resources(&expanded).expect("实例化");
     let (ref_tree, ref_table) = reference_of(CHILD_ABC);
 
-    // 结构变化（删 a）+ 重排（c 提前）。
+    // 结构变化（删 a）+ 重排（c 提前）：[b, c]。
     let a = find(&tree, "a");
     let c = find(&tree, "c");
     tree.queue(nes_scene::TreeOp::Remove { node: a, keep_children: false });
     tree.queue(nes_scene::TreeOp::Move { node: c, new_index: 0 });
     tree.apply_pending();
+    assert_eq!(sibling_names(&tree, find(&tree, "child_root")), vec!["c", "b"]);
 
     let records = diff_instance_overrides(&tree, find(&tree, "instance"), &table, &ref_tree, &ref_table);
     assert!(records.iter().any(|r| r.remove), "结构变化照常捕获");
     assert!(
-        records.iter().all(|r| r.move_to.is_none()),
-        "混合结构+重排不生成 move（口径）"
+        records.iter().any(|r| r.after.is_some()),
+        "混合结构+重排生成 after 链（S6.13 解除 S6.12 的缺口）"
     );
+    // 回放重建：remove a + c 免操作（首节点）+ b after c。
+    let ovr: String = records
+        .iter()
+        .map(|r| {
+            let quoted = format!("\"{}\"", r.path);
+            if let Some(anchor) = &r.after {
+                format!("Override(path: {quoted}, after: \"{}\"),", anchor)
+            } else if r.remove {
+                format!("Override(path: {quoted}, remove: true),")
+            } else {
+                String::new()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    let doc = parse_ron(&parent_abc_src(&ovr)).expect("回放父文档");
+    let exp = expand_subscenes(&doc, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string())).expect("展开");
+    let (tree3, _t3, _r3) = instantiate_doc_with_resources(&exp).expect("回放实例化");
+    assert_eq!(
+        sibling_names(&tree3, find(&tree3, "child_root")),
+        vec!["c", "b"],
+        "混合回放重建"
+    );
+}
+
+/// T-Ovr-15：手写 before/after 应用（含新增节点作锚点）+ 悬垂锚点报错。
+#[test]
+fn t_ovr_15_relative_position_semantics() {
+    // 父场景：新增 badge（追加落地在尾），再用 before 把 c 挪到 badge 前、
+    // after 把 badge... badge 是新增节点，不能作目标 —— 但可作锚点：
+    // b after badge 把 badge 顶到中间。
+    let parent = parse_ron(&parent_abc_src(
+        "Override(path: \"\", add: [\n                        Node(name: \"badge\", kind: \"Node2D\", children: []),\n                    ]),\n                    Override(path: \"b\", before: \"badge\"),\n                    Override(path: \"a\", after: \"badge\"),",
+    ))
+    .expect("父文档");
+    let expanded = expand_subscenes(&parent, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string()))
+        .expect("展开");
+    let (tree, _table, report) = instantiate_doc_with_resources(&expanded).expect("实例化");
+    assert!(report.is_clean());
+
+    // 应用推演：展开 [a, b, c]；add badge 追加 -> [a, b, c, badge]；
+    // b before badge（badge@3 -> 插 3）-> [a, c, badge, b]；
+    // a after badge（badge@2 -> 插 3）-> [c, badge, b, a]。
+    assert_eq!(
+        sibling_names(&tree, find(&tree, "child_root")),
+        vec!["c", "badge", "b", "a"],
+        "before/after 应用（badge 为新增锚点）"
+    );
+
+    // 悬垂锚点：报语义错误并指名。
+    let bad = parse_ron(&parent_abc_src("Override(path: \"a\", after: \"ghost\"),"))
+        .expect("解析");
+    let exp = expand_subscenes(&bad, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string())).expect("展开");
+    let err = instantiate_doc_with_resources(&exp)
+        .err()
+        .expect("悬垂锚点必须报错");
+    let msg = format!("{err}");
+    assert!(msg.contains("after 锚点 `ghost` 未命中"), "指名锚点：{msg}");
 }
