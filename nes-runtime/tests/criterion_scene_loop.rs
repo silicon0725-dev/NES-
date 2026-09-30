@@ -638,3 +638,104 @@ fn t_scene_08_rename_keeps_tracking_end_to_end() {
     assert_eq!(after.image.pixel(26, 10), Some(V1[0]), "player 在 (24,8)");
     assert!(rt2.tree_mut().find_by_name("player").is_some(), "最终名可查");
 }
+
+/// T-Scene-09：兄弟重排端到端 —— 重叠双精灵（黄下红上），磁盘 `move_to`
+/// 记录换序 -> **顶层翻转**（同 z 下兄弟序即绘制序）；运行时换序 -> 烘焙
+/// 存盘（文件含 move_to）-> 全新运行时加载复现翻转。
+#[test]
+fn t_scene_09_reorder_flips_z_layering() {
+    let root = make_root("s9");
+    // 第二张纹理：纯红。
+    write_bmp_rgba(&root.join("Textures").join("red.bmp"), 16, 16, &[200, 40, 40, 255].repeat(16 * 16))
+        .expect("写红纹理");
+    // 子场景：两个完全重叠的精灵 under(黄) / over(红)。
+    let child = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/red.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "child_root",
+        kind: "Node2D",
+        children: [
+            Node(
+                name: "under",
+                kind: "Sprite2D",
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "over",
+                kind: "Sprite2D",
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    // 父场景：干净无覆盖（参照序 under,over -> 红在上）。
+    let parent = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                local: (x: 8.0, y: 8.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "sub_scene": Resource(1), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root.join("Scenes").join("child.ron"), child).expect("写子场景");
+    std::fs::write(root.join("Scenes").join("parent.ron"), parent).expect("写父场景");
+
+    let Ok(mut rt) = NesRuntime::open_with_root(&root, 64, 64) else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+    rt.load_scene("Scenes/parent.ron").expect("加载");
+    let _ = rt.bind_assets();
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 2);
+    let first = rt.frame(&frame(0)).expect("首帧");
+    assert_eq!(first.stats.drawn, 2, "两个精灵都在画");
+    assert_eq!(
+        first.image.pixel(10, 10),
+        Some([200, 40, 40, 255]),
+        "参照序 under,over：over（红）在后在上 —— 兄弟序即绘制序"
+    );
+
+    // 运行时换序（under 挪到 1 -> over,under -> 黄在上）-> 烘焙存盘 -> 复现。
+    let under = rt.tree_mut().find_by_name("under").expect("under");
+    rt.tree_mut().queue(nes_scene::TreeOp::Move { node: under, new_index: 1 });
+    rt.tree_mut().apply_pending();
+    let flipped = rt.frame(&frame(1)).expect("换序帧");
+    assert_eq!(flipped.image.pixel(10, 10), Some(V1[0]), "运行时换序：黄在上");
+
+    assert_eq!(rt.sync_overrides().expect("烘焙"), 1);
+    rt.save_scene("Scenes/baked_reorder.ron").expect("存");
+    let baked = std::fs::read_to_string(root.join("Scenes").join("baked_reorder.ron")).unwrap();
+    assert!(baked.contains("move_to"), "move 记录写出：\n{baked}");
+
+    let mut rt2 = NesRuntime::open_with_root(&root, 64, 64).expect("运行时 2");
+    rt2.load_scene("Scenes/baked_reorder.ron").expect("加载");
+    let _ = rt2.bind_assets();
+    assert_eq!(rt2.upload_pending_textures().expect("上传"), 2);
+    let after = rt2.frame(&frame(0)).expect("复现帧");
+    assert_eq!(after.image.pixel(10, 10), Some(V1[0]), "烘焙后黄仍在上");
+}

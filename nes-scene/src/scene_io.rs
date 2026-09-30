@@ -241,6 +241,10 @@ pub struct InstanceOverride {
     /// 记录路径一律按子场景**原名**解析（rename 延迟落地，同批后续记录
     /// 按旧名寻址）；目标名与兄弟相撞时按既有规则自动加后缀。
     pub rename: Option<String>,
+    /// 结构性覆盖：把该节点移到同父兄弟的**绝对下标**（`TreeOp::Move`
+    /// 语义，越界夹到末尾）。下标按应用时的兄弟序（adds 已落地、removes
+    /// 已生效）。与 `remove` 互斥。
+    pub move_to: Option<usize>,
 }
 
 impl NodeDoc {
@@ -433,6 +437,9 @@ fn write_node(out: &mut String, doc: &NodeDoc, opts: &PackOptions, level: usize)
             out.push_str(&rec);
             if let Some(name) = &ov.rename {
                 out.push_str(&format!(", rename: {}", quote(name)));
+            }
+            if let Some(idx) = ov.move_to {
+                out.push_str(&format!(", move_to: {idx}"));
             }
             if ov.remove {
                 out.push_str(", remove: true");
@@ -808,6 +815,14 @@ fn apply_overrides(
                 name: new_name.clone(),
             });
         }
+        if let Some(idx) = ov.move_to {
+            // 结构性覆盖：兄弟重排（延迟落地；下标按应用时序 —— adds 已在
+            // 更早记录入队、removes 已生效）。与 remove 互斥由解析层保证。
+            tree.queue(crate::tree::TreeOp::Move {
+                node: target,
+                new_index: idx,
+            });
+        }
         if let Some(t) = ov.local {
             tree.set_local(target, t);
         }
@@ -892,6 +907,7 @@ fn diff_override_node(
             add: Vec::new(),
             remove: false,
             rename: None,
+            move_to: None,
         });
     }
 
@@ -929,6 +945,8 @@ fn diff_override_node(
         .collect();
 
     let mut added: Vec<NodeDoc> = Vec::new();
+    // 本组是否发生了结构变化（remove/rename/add）—— 决定 2.5 段是否生成重排。
+    let mut structural_here = false;
     for rc in ref_unmatched {
         let Some(ref_name) = reference.tree.name(rc) else { continue };
         let child_path = if path.is_empty() {
@@ -954,7 +972,9 @@ fn diff_override_node(
                 add: Vec::new(),
                 remove: false,
                 rename: current.tree.name(cc).map(str::to_string),
+                move_to: None,
             });
+            structural_here = true;
             diff_override_node(current, cc, reference, rc, child_path, out);
         } else {
             out.push(InstanceOverride {
@@ -965,10 +985,13 @@ fn diff_override_node(
                 add: Vec::new(),
                 remove: true,
                 rename: None,
+                move_to: None,
             });
+            structural_here = true;
         }
     }
     // 剩余未配对的当前子节点 -> add（子树全量导出）。
+    let added_ids: Vec<NodeId> = cur_unmatched.clone();
     for cc in cur_unmatched {
         added.push(node_to_doc(current.tree, cc, false));
     }
@@ -981,7 +1004,42 @@ fn diff_override_node(
             add: added,
             remove: false,
             rename: None,
+            move_to: None,
         });
+    }
+
+    // 2.5) 兄弟重排（S6.12）：**纯重排才生成** —— 本组无 remove/rename/add
+    //      记录时（路径寻址无歧义、回放可证明）。
+    //      无变化判定：当前名序 == 参照名序。变化时按**当前序**为每个子节点
+    //      生成 move_to = 当前下标；回放重建当前序的证明：被放置前缀
+    //      [0..i) 不被后续 remove/insert 扰动（被移节点此刻下标必 >= i，
+    //      否则它就在前缀里了）。
+    let structural_dirty = structural_here;
+    if !structural_dirty && added_ids.is_empty() {
+        let expected: Vec<&str> =
+            ref_children.iter().filter_map(|rc| reference.tree.name(*rc)).collect();
+        let current_names: Vec<&str> =
+            cur_children.iter().filter_map(|c| current.tree.name(*c)).collect();
+        if current_names != expected {
+            for (idx, cc) in cur_children.iter().enumerate() {
+                let name = current.tree.name(*cc).unwrap_or_default();
+                let child_path = if path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{path}/{name}")
+                };
+                out.push(InstanceOverride {
+                    path: child_path,
+                    local: None,
+                    process_mode: None,
+                    props: Vec::new(),
+                    add: Vec::new(),
+                    remove: false,
+                    rename: None,
+                    move_to: Some(idx),
+                });
+            }
+        }
     }
 
     // 3) 按名配对的子节点递归下钻。
@@ -1619,6 +1677,7 @@ impl Parser {
         let mut add: Vec<NodeDoc> = Vec::new();
         let mut remove = false;
         let mut rename: Option<String> = None;
+        let mut move_to: Option<usize> = None;
 
         loop {
             self.skip_trivia();
@@ -1659,6 +1718,12 @@ impl Parser {
                 }
                 "rename" => {
                     rename = Some(self.string()?);
+                }
+                "move_to" => {
+                    let token = self.number_token()?;
+                    move_to = Some(token.parse::<usize>().map_err(|_| {
+                        self.error(format!("非法 move_to 下标 `{token}`"))
+                    })?);
                 }
                 "remove" => {
                     self.skip_trivia();
@@ -1707,6 +1772,11 @@ impl Parser {
                 )));
             }
         }
+        if move_to.is_some() && remove {
+            return Err(ParseError::semantic(format!(
+                "覆盖记录 `{path}` 同时声明 move_to 与 remove —— 互斥"
+            )));
+        }
         Ok(InstanceOverride {
             path,
             local,
@@ -1715,6 +1785,7 @@ impl Parser {
             add,
             remove,
             rename,
+            move_to,
         })
     }
 

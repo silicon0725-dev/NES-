@@ -87,7 +87,7 @@ nes-runtime 零改动（`sync_overrides` / 热重载自动获得）。
 
 | 事项 | 状态 |
 |---|---|
-| 跨兄弟重排（order 覆盖，如 `Override(path: "a", move_to: 2)`） | 未启动 |
+| 跨兄弟重排（order 覆盖） | ✅ S6.12（见 `NES2.0_S6兄弟重排_v1.md`） |
 | 编辑器对"删 A 加同种类 B 被识别为 rename"的提示 | 未启动（歧义消解方向已固定为跟踪） |
 | SignalBus / WM_SIZE / DPI / headless Linux | 沿各文档遗留表 |
 

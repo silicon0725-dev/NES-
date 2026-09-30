@@ -602,3 +602,156 @@ fn t_ovr_12_rename_keeps_tracking_across_updates() {
         "保留跟踪：未覆盖字段跟随子场景新值（rename 不是冻结副本）"
     );
 }
+
+// ---------------------------------------------------------------- 兄弟重排
+// S6.12：move_to 记录 —— 纯重排（无结构变化）按当前序回放，可证明重建。
+
+/// 三个兄弟的子场景：a / b / c。
+const CHILD_ABC: &str = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "child_root",
+        kind: "Node2D",
+        children: [
+            Node(name: "a", kind: "Sprite2D", props: { "texture": Resource(1), }, children: []),
+            Node(name: "b", kind: "Sprite2D", props: { "texture": Resource(1), }, children: []),
+            Node(name: "c", kind: "Node2D", children: []),
+        ],
+    ),
+)
+"#;
+
+fn parent_abc_src(overrides: &str) -> String {
+    format!(
+        r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                props: {{ "sub_scene": Resource(1), }},
+                overrides: [
+{overrides}
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)
+"#
+    )
+}
+
+fn sibling_names(tree: &SceneTree, parent: nes_scene::NodeId) -> Vec<String> {
+    tree.children(parent)
+        .iter()
+        .filter_map(|&c| tree.name(c).map(str::to_string))
+        .collect()
+}
+
+/// T-Ovr-13：move 应用 + diff 识别 + 幂等。
+#[test]
+fn t_ovr_13_move_applies_and_diff_detects_reorder() {
+    // ① 应用：a 移到下标 2 -> [b, c, a]。
+    let parent = parse_ron(&parent_abc_src(
+        "Override(path: \"a\", move_to: 2),",
+    ))
+    .expect("父文档");
+    let expanded = expand_subscenes(&parent, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string()))
+        .expect("展开");
+    let (tree, _table, report) = instantiate_doc_with_resources(&expanded).expect("实例化");
+    assert!(report.is_clean());
+    let root = find(&tree, "child_root");
+    assert_eq!(sibling_names(&tree, root), vec!["b", "c", "a"], "move 应用");
+
+    // ② diff：干净实例无记录；运行时重排 [c, b, a] -> 按当前序生成 move 集。
+    let clean = parse_ron(&parent_abc_src("")).expect("干净父文档");
+    let expanded_clean =
+        expand_subscenes(&clean, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string())).expect("展开");
+    let (mut tree2, table2, _r2) = instantiate_doc_with_resources(&expanded_clean).expect("实例化2");
+    let (ref_tree, ref_table) = reference_of(CHILD_ABC);
+    let wrapper2 = find(&tree2, "instance");
+    assert!(
+        diff_instance_overrides(&tree2, wrapper2, &table2, &ref_tree, &ref_table).is_empty(),
+        "无重排无记录"
+    );
+
+    let a = find(&tree2, "a");
+    let c = find(&tree2, "c");
+    // 重排到 [c, b, a]：c 移到 0；a 移到 2。
+    tree2.queue(nes_scene::TreeOp::Move { node: a, new_index: 2 });
+    tree2.queue(nes_scene::TreeOp::Move { node: c, new_index: 0 });
+    tree2.apply_pending();
+    let root2 = find(&tree2, "child_root");
+    assert_eq!(sibling_names(&tree2, root2), vec!["c", "b", "a"], "运行时重排");
+
+    let records = diff_instance_overrides(&tree2, wrapper2, &table2, &ref_tree, &ref_table);
+    let moves: Vec<(String, usize)> = records
+        .iter()
+        .filter_map(|r| r.move_to.map(|i| (r.path.clone(), i)))
+        .collect();
+    assert_eq!(
+        moves,
+        vec![("c".to_string(), 0), ("b".to_string(), 1), ("a".to_string(), 2)],
+        "按当前序回放：{moves:?}"
+    );
+    assert!(records.iter().all(|r| !r.remove && r.add.is_empty() && r.rename.is_none()));
+
+    // ③ 幂等：把 move 集**应用**回干净实例 -> 得到同序；再 diff 结果不变。
+    let ovr: String = records
+        .iter()
+        .map(|r| {
+            let quoted = format!("\"{}\"", r.path);
+            format!("Override(path: {}, move_to: {}),", quoted, r.move_to.unwrap_or(0))
+        })
+        .collect();
+    let reapplied = parent_abc_src(&ovr);
+    let doc = parse_ron(&reapplied).expect("回放父文档");
+    let exp = expand_subscenes(&doc, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string())).expect("展开");
+    let (tree3, table3, _r3) = instantiate_doc_with_resources(&exp).expect("实例化3");
+    assert_eq!(
+        sibling_names(&tree3, find(&tree3, "child_root")),
+        vec!["c", "b", "a"],
+        "move 集回放重建当前序"
+    );
+    let again = diff_instance_overrides(&tree3, find(&tree3, "instance"), &table3, &ref_tree, &ref_table);
+    // 烘焙后的树重排仍在 -> diff 再生成同一 move 集（稳定，不增长）。
+    let moves_again: Vec<(String, usize)> = again
+        .iter()
+        .filter_map(|r| r.move_to.map(|i| (r.path.clone(), i)))
+        .collect();
+    assert_eq!(moves_again, moves, "幂等：不增长不漂移");
+}
+
+/// T-Ovr-14：混合结构 + 重排 -> **不生成 move**（纯重排才回放的口径钉死）。
+#[test]
+fn t_ovr_14_mixed_structural_skips_moves() {
+    let clean = parse_ron(&parent_abc_src("")).expect("干净父文档");
+    let expanded =
+        expand_subscenes(&clean, &mut |_| parse_ron(CHILD_ABC).map_err(|e| e.to_string())).expect("展开");
+    let (mut tree, table, _r) = instantiate_doc_with_resources(&expanded).expect("实例化");
+    let (ref_tree, ref_table) = reference_of(CHILD_ABC);
+
+    // 结构变化（删 a）+ 重排（c 提前）。
+    let a = find(&tree, "a");
+    let c = find(&tree, "c");
+    tree.queue(nes_scene::TreeOp::Remove { node: a, keep_children: false });
+    tree.queue(nes_scene::TreeOp::Move { node: c, new_index: 0 });
+    tree.apply_pending();
+
+    let records = diff_instance_overrides(&tree, find(&tree, "instance"), &table, &ref_tree, &ref_table);
+    assert!(records.iter().any(|r| r.remove), "结构变化照常捕获");
+    assert!(
+        records.iter().all(|r| r.move_to.is_none()),
+        "混合结构+重排不生成 move（口径）"
+    );
+}
