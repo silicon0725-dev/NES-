@@ -1,0 +1,109 @@
+//! [`RenderServer`]：节点树 → 渲染后端的**属性级推送契约**（S1 核心冻结物）。
+
+use crate::command::{FrameInfo, RenderCommand};
+use crate::handle::{ItemHandle, RenderAssetKey};
+use crate::item::RenderItem;
+use crate::math::Affine2;
+use crate::state::{Camera2DState, ControlState, Flip, LabelState};
+
+/// 渲染服务端。
+///
+/// # 它是什么
+///
+/// 场景层不"从渲染器里拉数据"，而是把渲染物的**属性**推给它 —— 这正是
+/// Godot `RenderingServer` / scratch-render Drawable 的做法，也是方案 D 的
+/// 服务端化落点。本 trait 不含任何 GPU / 窗口 / 表面概念，只描述"要画什么"。
+///
+/// # 实现者必须遵守的不变式（契约冻结）
+///
+/// 1. **空句柄与未知句柄不 panic**：[`ItemHandle::NIL`] 或已被销毁的句柄发起的
+///    任何操作都必须被静默忽略，且不得影响本帧其余命令的生成；
+/// 2. **句柄不复用**：`destroy_item` 之后该句柄值不得再分配给新渲染物；
+/// 3. **`submit_into` 先清空 `out`**，再写入本帧命令，末尾必定是一条
+///    [`RenderCommand::Submit`]（调用方可跨帧复用同一个缓冲，实现"每帧零分配"）；
+/// 4. **确定性**：同一份内部状态连续 `submit` 两次，输出必须逐条相同；
+///    属性流按 [`DrawKey`](crate::DrawKey)（`z` → `order` → `handle`）升序，
+///    禁止依赖哈希迭代顺序；
+/// 5. **顺序固定**：生命周期动作（按发生顺序）→ `SetCamera`（若有）→ 各渲染物
+///    的 `SetTransform` / `SetFlip` / `SetZ` / `SetVisible` →（Label 则追加
+///    `SetText`）→（Control 则追加 `SetRect`）→ `Submit`；
+/// 6. **属性流是全量快照**：不做"仅变化时推送"的增量省略，后端无需维护跨帧 diff。
+///
+/// # 对象安全
+///
+/// 全部方法都不含泛型参数与 `Self: Sized` 约束，因此 `&mut dyn RenderServer`
+/// 是合法的 —— 提取层（S2）正是按 `&mut dyn RenderServer` 持有它的。
+pub trait RenderServer {
+    /// 新建渲染物，返回其句柄。`key` 可以是未绑定键
+    /// （[`RenderAssetKey::NIL`]：先建条目、后补资源）。
+    fn create_item(&mut self, key: RenderAssetKey) -> ItemHandle;
+
+    /// 销毁渲染物。空句柄 / 未知句柄被忽略。
+    fn destroy_item(&mut self, handle: ItemHandle);
+
+    /// 设置可见性（不可见 ≠ 销毁）。
+    fn set_visible(&mut self, handle: ItemHandle, visible: bool);
+
+    /// 设置世界变换。
+    fn set_transform(&mut self, handle: ItemHandle, transform: Affine2);
+
+    /// 设置层号与同层次序。
+    fn set_z(&mut self, handle: ItemHandle, z: i32, order: u64);
+
+    /// 设置翻转（不改变变换的平移分量）。
+    fn set_flip(&mut self, handle: ItemHandle, flip: Flip);
+
+    /// 设置当前相机。契约层只保存"最后一次推送的相机"，
+    /// `enabled == false` 也照实保存，由后端决定是否应用。
+    fn set_camera(&mut self, camera: &Camera2DState);
+
+    /// 设置文本（Label 类渲染物）。
+    fn set_text(&mut self, handle: ItemHandle, text: &LabelState);
+
+    /// 设置控件布局（Control 类渲染物）。传入的是**未解析**的锚点状态，
+    /// 解析公式见 [`ControlState::resolve`]。
+    fn set_rect(&mut self, handle: ItemHandle, rect: &ControlState);
+
+    /// 生成本帧命令序列写入 `out`（**先清空** `out`）。
+    fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>);
+
+    /// [`RenderServer::submit_into`] 的便利版：返回新缓冲。
+    ///
+    /// 热路径（每帧调用）应使用 `submit_into` 复用缓冲，本方法只供测试/冷路径使用。
+    fn submit(&mut self, frame: &FrameInfo) -> Vec<RenderCommand> {
+        let mut out = Vec::new();
+        self.submit_into(frame, &mut out);
+        out
+    }
+
+    /// 按属性集合整块推送（等价于逐项调用 setter，顺序固定为
+    /// `set_transform` → `set_flip` → `set_z` → `set_visible`）。
+    ///
+    /// 默认实现即可，实现者无需覆写：它保证"整块推送"与"逐属性推送"
+    /// 在契约上不可区分（S2 提取层两种写法混用也不会产生分歧）。
+    fn apply_item(&mut self, item: &RenderItem) {
+        self.set_transform(item.handle, item.transform);
+        self.set_flip(item.handle, item.flip);
+        self.set_z(item.handle, item.z, item.order);
+        self.set_visible(item.handle, item.visible);
+    }
+}
+
+// 编译期守卫：trait 必须保持对象安全（提取层按 &mut dyn RenderServer 持有）。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::null::NullRenderServer;
+
+    fn holds_dyn(_server: &mut dyn RenderServer) {}
+
+    #[test]
+    fn trait_is_object_safe() {
+        let mut server = NullRenderServer::new();
+        holds_dyn(&mut server);
+        let key = RenderAssetKey::from_parts(7, 1);
+        let handle = server.create_item(key);
+        server.apply_item(&RenderItem::new(handle, key, Affine2::translation(1.0, 2.0)));
+        assert_eq!(server.len(), 1);
+    }
+}

@@ -1,0 +1,37 @@
+[package]
+name = "nes-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 engine assembly layer: scene tree + assets + extraction + render commands + wgpu backend, wired into one frame loop"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_runtime"
+path = "src/lib.rs"
+
+[[example]]
+name = "engine_frame"
+path = "examples/engine_frame.rs"
+
+# 依赖方向（组装层是全链的**顶端叶子**，位于所有 crate 之上）：
+#
+#     nes-asset ──▶ nes-scene ──▶ nes-render-extract ──▶ nes-render-api ──▶ nes-render-wgpu
+#                          └──────────────────┴──────────────┴────────────────┘
+#                                      全部被本 crate 消费（G11：只许向下，谁也不许依赖本 crate）
+#
+# 本 crate 是"引擎"的雏形：把五个 crate 装配成「场景树 -> 资源 -> 每帧提取 ->
+# 命令流 -> GPU -> 像素」的一条帧循环。它不实现任何渲染/场景语义 —— 语义在
+# 各 crate 里已冻结，这里只做组合。
+#
+# 零第三方依赖（全部 path 依赖）；空 [workspace] 表钉成独立工作区根，
+# 与 GPU 侧 crate 同一纪律。
+[dependencies]
+nes-asset = { path = "../nes-asset" }
+nes-scene = { path = "../nes-scene" }
+nes-render-api = { path = "../nes-render-api" }
+nes-render-extract = { path = "../nes-render-extract" }
+nes-render-wgpu = { path = "../nes-render-wgpu" }
+
+[workspace]

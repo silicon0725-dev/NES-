@@ -1,0 +1,24 @@
+[package]
+name = "nes-scene"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 scene tree core (M1 skeleton): stable identity, arena storage, deferred tree ops, deterministic traversal, transform propagation"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_scene"
+path = "src/lib.rs"
+
+# 刻意零**第三方**依赖，两条理由：
+# 1) 本机工具链不完整（无 MSVC 链接器 / 无 gcc / 无 cmake）。任何需要构建脚本、
+#    本地 C 编译或 proc-macro 的依赖都会把"能不能编译"变成不确定事件。
+# 2) 与 twn-backend-contracts 的纪律一致：核心层不被第三方 crate 绑架，
+#    将来要换序列化库或 arena 实现时，替换面收敛在本 crate 内部。
+#
+# 唯一的依赖是同项目的 nes-asset（本地 path 依赖，M3 起）：场景属性里的资源引用
+# 必须解析到全局注册表，这是设计上的单向下游依赖 —— nes-scene → nes-asset，
+# 注册表不认识场景，因此不构成循环，也不引入任何外部构建面。
+[dependencies]
+nes-asset = { path = "../nes-asset" }

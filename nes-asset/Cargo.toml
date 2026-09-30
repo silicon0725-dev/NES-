@@ -1,0 +1,17 @@
+[package]
+name = "nes-asset"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 global asset registry (M3): stable asset identity, load state machine, dependency graph, hot reload broadcast"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_asset"
+path = "src/lib.rs"
+
+# 零外部依赖，与 nes-scene 同纪律（见 nes-scene/Cargo.toml 的两条理由）：
+# 本机没有可用链接器/本地 C 工具链，任何 proc-macro、build.rs、FFI 依赖都会把
+# "能不能编译"变成不确定事件；且核心层不被第三方 crate 绑架。
+[dependencies]

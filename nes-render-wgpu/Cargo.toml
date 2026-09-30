@@ -1,0 +1,36 @@
+[package]
+name = "nes-render-wgpu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 wgpu-native render backend (M4/S4.1): RenderServer impl + RenderCommand consumer + clear/sprite frame + PNG readback"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_render_wgpu"
+path = "src/lib.rs"
+
+[[example]]
+name = "s41_visual_closure"
+path = "examples/s41_visual_closure.rs"
+
+# 依赖方向（S4.1 硬约束，由 check_dependency_direction.py 的 G8 / G9 / G10 校验）：
+#
+#     nes-asset ──▶ nes-scene ──▶ nes-render-extract ──▶ nes-render-api ──▶ 本 crate
+#
+# 本 crate 是依赖树的**叶子**：直接依赖只有契约层 nes-render-api（path 依赖）。
+#   * 不得依赖 nes-scene / nes-asset / nes-render-extract（G8 正向钉住、G9 反向围堵）——
+#     后端一旦看见场景层，"渲染器不认识场景树"这条纪律就作废，方案 D 的单向依赖变网状；
+#   * 不得引入任何第三方 crate（registry 依赖一律越界）：本机工具链不完整，且
+#     wgpu-native 的 ABI 绑定由本 crate 手写 `#[repr(C)]` + 运行时符号解析完成，
+#     不需要 bindgen / wgpu-rs / 任何 build.rs；
+#   * 场景层 / 资源层 / 契约层 / 提取层一律不得反向依赖本 crate（G9 后半段）。
+#
+# 本 crate 刻意**不并入**上层任何工作区：一旦合并，cargo 会把 GPU 侧的依赖面
+# （以及将来必然出现的原生 DLL 加载）带进场景层的构建图，"叶子"就不再干净。
+# 空 `[workspace]` 表把它显式钉成自己的工作区根，保证 `cargo test` 只构建本 crate。
+[dependencies]
+nes-render-api = { path = "../nes-render-api" }
+
+[workspace]

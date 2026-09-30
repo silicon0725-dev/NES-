@@ -1,0 +1,27 @@
+[package]
+name = "nes-render-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 render contract layer (M4/S1, frozen): backend-neutral RenderServer trait, RenderItem / RenderCommand / FrameInfo, and the four gap contracts (Camera2D / Label / Control / flip)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_render_api"
+path = "src/lib.rs"
+
+# 契约层是**绝对零依赖**的，连同项目 crate 也不行，理由三条：
+#
+# 1) 方向纪律（方案 D 的立身之本）：契约层必须能被 scene 侧（提取层）与 backend 侧
+#    同时依赖，而双方互不依赖。只要它沾上 nes-scene，backend 就会被间接拖进场景层，
+#    只要它沾上 backend，scene 侧就被拖进 GPU 侧 —— 任一条都会把"单向依赖"变成
+#    "一张网"。
+# 2) 本机工具链不完整（无 MSVC 链接器 / 无 gcc / 无 cmake）。任何带构建脚本、
+#    本地 C 编译或 proc-macro 的依赖都会把"能不能编译"变成不确定事件。
+# 3) 后端可替换性：将来 wgpu-native / 自研后端（S4）只要实现本契约即可替换，
+#    替换面收敛在 trait 上，不牵动场景层。
+#
+# 因此本 crate 不允许出现任何 dependencies / dev-dependencies 条目；
+# 由 check_dependency_direction.py 与 NES2.0_M4渲染接入_S1契约冻结_v1.md 双重看守。
+[dependencies]

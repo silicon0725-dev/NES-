@@ -1,0 +1,28 @@
+[package]
+name = "nes-render-extract"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 render extraction layer (M4/S2): per-frame traversal of the scene tree into property-level RenderServer pushes plus NodeId<->ItemHandle lifecycle bookkeeping"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_render_extract"
+path = "src/lib.rs"
+
+# 依赖方向（S2 硬约束，由 check_dependency_direction.py 的 G6/G7 校验）：
+#
+#     nes-asset ──▶ nes-scene ──▶ nes-render-extract ──▶ nes-render-api
+#
+# 本 crate 的上游只有场景层、下游只有契约层：
+#   * 场景层 / 资源层不得反向依赖本 crate（G7），否则"场景不认识渲染"这条纪律作废；
+#   * 契约层不得反向依赖本 crate（它必须保持零依赖，G3）；
+#   * 除这两条 path 依赖外不引入任何第三方 crate（G6）——本机工具链不完整，
+#     任何带构建脚本 / 本地 C 编译 / proc-macro 的依赖都会把"能不能编译"变成不确定事件。
+#
+# 注意：`nes-asset` 会作为 `nes-scene` 的传递依赖出现在本 crate 的依赖树里，
+# 但那是场景层的既有单向依赖（M3 起），本 crate 不直接依赖它。
+[dependencies]
+nes-scene = { path = "../nes-scene" }
+nes-render-api = { path = "../nes-render-api" }

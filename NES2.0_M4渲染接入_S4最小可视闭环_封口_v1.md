@@ -1,0 +1,237 @@
+# NES 2.0 · M4 渲染接入 S4 最小可视闭环 封口 v1
+
+> 封口日期：2026-09-30　｜　状态：**S4.1 封口（最小可视闭环已打通并实机验证）**
+> 前置：S1 契约冻结、S2 提取层封口、S3 四项缺口封口（各文档见本目录）。
+> 本文档记录 S4.1 的出口准则对照、源码改动、运行时实证修正、架构裁决与实测基线，
+> 供后续里程碑（多纹理、Label/Control 光栅化、headless Linux 认证）直接引用。
+
+---
+
+## 0. 一句话结论
+
+`nes-render-wgpu` 后端在本机（Intel Iris Xe / Vulkan / wgpu-native v29.0.1.1）**实机跑通了
+「契约命令流 → 清屏 + 精灵 → 离屏读回 → PNG」的最小可视闭环**：五 crate 全绿
+（测试 75 / 34 / 40 / 42 / 15），clippy 零警告，依赖方向守卫扩至 **G1~G10 全过**，
+示例 `s41_visual_closure` 逐像素断言 PASS 且经外部解码器交叉验证。
+
+---
+
+## 1. 出口准则对照
+
+| 出口准则（S4.1 立项口径） | 实测 | 判定 |
+|---|---|---|
+| lib 构建通过（原 2 错误：E0583 缺 renderer.rs、E0164 MapFailed 分支形状） | `cargo build --lib` EXIT 0 | ✅ |
+| Rust 侧消费 `RenderCommand`，经 wgpu-native 画出清屏 + 精灵 | `CommandConsumer::consume` 全链路实机出图 | ✅ |
+| 离屏纹理 → 读回 → PNG 落盘 | `output/s41_visual_closure.png`（64x64，16,516 字节） | ✅ |
+| 与原型 `s41_probe3.log` 锚点比对 | `px(10,10)`=红、`px(13,13)`=近白、背景=深藏青，逐项一致 | ✅ |
+| 外部解码器交叉验证（PNG 编码器自证不自洽） | System.Drawing 回读四锚点一致 | ✅ |
+| 失败路径如实报告（不伪造截图、不谎报跑通） | `LibraryNotFound` / `MissingSymbol` / `ConfigMismatch` / `MalformedCommandStream` / `driver_errors` 均有测试或证据覆盖 | ✅ |
+| 变更验收三联（test 全绿 + clippy 零警告 + 守卫全过） | 五 crate 满足（见 §4 基线） | ✅ |
+
+---
+
+## 2. 源码改动清单（相对归档说明 v1 的快照）
+
+| 文件 | 改动 |
+|---|---|
+| `nes-render-wgpu/src/renderer.rs` | **新增**（约 900 行）：`WgpuRenderServer`（契约簿记）、`CommandConsumer`（GPU 执行器）、`FrameStats` / `FrameOutcome`（统计与像素结果 + `write_png`）、`SpritePipeline`（WGSL 着色器 + 实例管线）+ 4 条单测 |
+| `nes-render-wgpu/src/error.rs` | `MapFailed` 显示分支改结构体模式并输出 `message`；**补上 Display 整条缺失的 `ConfigMismatch` 分支**（既有潜伏 E0004，被 E0583 掩盖） |
+| `nes-render-wgpu/src/gpu.rs` | 图集缓冲用法位 `VERTEX` → `UNIFORM\|COPY_DST`（原绑定不合法且不可写）+ 标签更正；`ATLAS_PX` 256 → **64**（原值使 `CELL_PX=64`，与"16px 格"注释自相矛盾）；采样器 `max_anisotropy` 0 → 1；`FrameImage` 通道语义翻正（字段 `bgra` → `rgba`，`pixel()` 去掉交换，`storage_format` = RGBA8Unorm）+ 摘要式 `Debug`；新增 `view_uniform()` / `sampler()` 访问器；3 处 `field_reassign_with_default` clippy 修正 |
+| `nes-render-wgpu/src/ffi.rs` | 新增常量 `WGPU_BUFFER_USAGE_UNIFORM`、`WGPU_FRONT_FACE_CCW`（=1）、`WGPU_DEPTH_SLICE_UNDEFINED`（=u32::MAX） |
+| `nes-render-wgpu/src/lib.rs` | 更正"本机没有 MSVC 链接器"的过期口径（归档说明 §4.11 记账项） |
+| `nes-render-wgpu/examples/s41_visual_closure.rs` | **新增**：最小可视闭环示例（装配报告 + 统计 + 逐像素断言 + PNG + 外部交叉验证指引） |
+| `nes-render-wgpu/tests/criterion_backend.rs` | **新增**：7 条出口准则测试（失败路径 ×2 无 GPU 依赖 + GPU 用例 ×5） |
+| `check_dependency_direction.py` | 扩展 **G8 / G9 / G10**：后端 crate 依赖边正向钉住、反向围堵、零第三方依赖 + 无 build.rs + 独立工作区根 |
+| `wgpu-win/`（本目录内） | 解压 wgpu-native v29.0.1.1 release 资产（`include/` + `lib/wgpu_native.dll` + `wgpu-native-meta/`），来源 `F:\All NGVGE\WGPU\wgpu-windows-x86_64-gnu-release.zip`，落在 `locate_library` 候选 2 的约定路径 |
+
+**未触碰**：`nes-scene` / `nes-asset` / `nes-render-api` / `nes-render-extract` 四个已封口 crate 零改动（冻结面完好，S1 §10 变更纪律无需触发修订小节）。
+
+---
+
+## 3. 运行时实证修正记录（每条：症状 → 证据 → 修法）
+
+前两条是编码期预判，其余均在实机运行中由驱动校验、崩溃或像素证据暴露：
+
+| # | 症状 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | uniform 里放 `mat3x2<f32>` | WGSL uniform 地址空间要求矩阵列跨度 16 字节对齐 | 拆三列 `vec2` 存储、着色器内拼回矩阵 |
+| 2 | 图集把 `VERTEX` 用法缓冲绑成 uniform | wgpu 校验：绑定组要求 `UNIFORM` 位；且无 `COPY_DST` 不可写 | 缓冲改 `UNIFORM\|COPY_DST`，成为名实相符的视图 uniform 源 |
+| 3 | 管线创建崩溃 | DLL 内 panic：`invalid front face for primitive state` | `WGPU_FRONT_FACE_CCW` = **1**（原猜 3；对照解出的 webgpu.h 核实，其余常量全部复核无误） |
+| 4 | 装配期 3 条未捕获错误 | `max_anisotropy=0`（须 ≥1）→ 采样器无效 → 绑定组级联失败 | 采样器 `max_anisotropy = 1` |
+| 5 | 管线布局校验失败 | 顶点着色器查 `textureDimensions`，但图集布局只给片段阶段纹理可见性 | 纹理查询全部移入片段阶段；四边形边长改 WGSL 常量（构建期 `debug_assert` 钉住） |
+| 6 | 提交崩溃 | `Depth slice was provided but the color attachment's view is not 3D` | 2D 视图的颜色附件 `depth_slice` 用 `WGPU_DEPTH_SLICE_UNDEFINED`（u32::MAX） |
+| 7 | 精灵 64x64、断言失败 | `CELL_PX = 256/4 = 64`，与自身"16px 格、同原型精灵"注释矛盾 | `ATLAS_PX` = **64**（4x4 格 x 16px，所有既有文档声明成立） |
+| 8 | 首帧出图红蓝互换 | 红精灵读成蓝 `(0,0,255)`、藏青背景读成暗红 `(25,13,13)` —— R/B 系统性互换 | **裁决：RGBA8Unorm 读回就是 RGBA 字节，`FrameImage` 的 BGRA 假设是错的**；字段更名 `rgba`、`pixel()` 去交换、`write_png` 透传 |
+| 9 | PNG 落盘后进程 AV 崩溃 | `CommandConsumer` 字段序使 `ctx` 先析构 → `lib` 字段 `FreeLibrary` 卸载 DLL → 后续子件 `Drop` 经函数指针调用已卸载内存 | 字段声明序倒置（管线 → 图集 → 目标 → 上下文），结构体注释钉住该纪律 |
+| 10 | 第二帧 `drawn=0`、锚点全丢 | 契约 I4：`Create`/`Destroy` **一次性**落缓冲，属性流才每帧全量；消费器却每帧重建条目表 → 第二帧属性命令全部命中"未知句柄"被 I1 静默忽略 | 条目表改为**跨帧持有**（`Create` 建、`Destroy` 删）；由 `criterion_backend_sprite_frame_and_png_roundtrip` 的稳态第二帧断言钉住 |
+| 11 | 逐用例开/关 GPU 上下文的测试序列稳定崩溃（0xC000041D），并行时序下偶发（139/127） | `NativeLib::drop` 的 `FreeLibrary` 把 wgpu-native 完全卸载，下一用例重载 —— Vulkan 加载器反复初始化/卸载在其自建线程/TLS 上崩溃。这是**真实 API 风险**：任何"重建后端"的长跑进程都会踩中，测试只是把它放大 | 动态库按**进程生命周期**持有（`Drop` 不卸载，引擎侧惯例，见 §5 裁决 9）；GPU 用例另加进程内串行锁消除并发多实例的残余抖动，8 轮复跑全部稳定 |
+
+---
+
+## 4. 实测基线（2026-09-30，本机 Windows 10 / Intel Iris Xe / Vulkan）
+
+| 检查项 | 结果 |
+|---|---|
+| 依赖方向守卫 | **G1~G10 = 10/10 PASS**（EXIT 0；G8/G9/G10 为本轮新增） |
+| `nes-scene` | test **75** 全绿（lib 40 + m1 19 + m2 4 + m3 12）｜ clippy 零警告 |
+| `nes-asset` | test **34** 全绿（lib 18 + m3 16）｜ clippy 零警告 |
+| `nes-render-api` | test **40** 全绿（lib 8 + criterion_contract 32）｜ clippy 零警告 |
+| `nes-render-extract` | test **42** 全绿（lib 6 + criterion_extract 24 + criterion_gaps 12）｜ clippy 零警告 |
+| `nes-render-wgpu` | test **15** 全绿（lib 8：png 4 + renderer 4；集成 criterion_backend 7）｜ clippy `--all-targets -D warnings` 零警告｜ GPU 用例串行化 + 动态库进程持有后连续 8 轮复跑无抖动 |
+| `cargo run --example s41_visual_closure` | **PASS**（EXIT 0；适配器 Intel Iris Xe / Vulkan；driver_errors=0） |
+| PNG 外部交叉验证 | System.Drawing 回读 `px(9,9)/(10,10)/(13,13)/(26,26)` 与断言逐字节一致 |
+
+> 记账更正（归档说明 §3.10）：历史封口文档基线 `nes-render-api 39` / `nes-render-extract 41`
+> 为漏记新增用例的旧数，以本表 **40 / 42** 为准（差异来源：`criterion_contract` 32 条、
+> `criterion_gaps` 12 条，均实测清点）。
+
+---
+
+## 5. 架构裁决记录（S4.1 新增，后续里程碑沿用）
+
+1. **读回通道序 = RGBA**（§3 #8）：`FrameImage` 存储即 `wgpuBufferGetMappedRange`
+   原始字节，语义访问唯一入口是 `pixel()`。写 PNG 直接透传，不再有 BGRA→RGBA 换算层。
+2. **消费器条目表跨帧持有**（§3 #10）：与契约 I4 的"一次性生命周期 + 每帧全量属性"
+   复合流对齐；"每帧提取"约束场景侧，不是后端失忆。
+3. **GPU 部件析构序**：`CommandConsumer` 字段声明序 = 析构序（管线 → 图集 → 目标 → 上下文），
+   与创建序相反、与资源所属关系一致。动态库改为进程生命周期持有后（裁决 9），顺序不再是
+   "函数指针失效"意义上的硬约束，但作为创建逆序的卫生纪律保留并注释钉住。
+4. **相机单位视图口径**：示例与测试用"相机中心 = 视口半尺寸"（`transform = translation(vp/2)`）
+   使 `view_matrix()` 恰为单位 —— 既真实走通契约 I9 的视图矩阵路径（`Camera2DState::view_matrix`
+   是唯一权威，后端不另行推导），又让世界坐标 == 屏幕像素坐标，与原型日志同口径。
+   相机缺位 / 禁用 / 视口非法时，消费器退回单位视图 + 目标尺寸（帧本地，无"上一有效相机"可退）。
+5. **图集采样格映射**：`key.slot % (ATLAS_CELLS²)` 确定性选格；格 0 真实图案、
+   其余品红哨兵 —— UV 错采样在像素层立即显形（测试全画面扫描钉住）。
+6. **`SetText` / `SetRect` 的 S4.1 边界**：确认句柄已知并记账（`stats.updates`），
+   不产生像素 —— 排版归属 CPU 侧，字形光栅化属后续里程碑。
+7. **清屏色公开为 `renderer::CLEAR_COLOR`**（f64 通道）并与测试侧字节锚点
+   `CLEAR_RGBA` 用专门测试互锁，防两侧漂移。
+8. **图集尺寸 = 64px**（4x4 格 x 16px）：`64*4=256` 字节/行恰好满足纹理上传的
+   256 字节对齐约束，且与原型 16x16 精灵同格。
+9. **动态库按进程生命周期持有**（§3 #11）：`NativeLib` 的 `Drop` 刻意不
+   `FreeLibrary` —— wgpu-native/Vulkan 加载器自建线程与 TLS，完全卸载后重载
+   会以 0xC000041D 崩溃。句柄与线程由操作系统在进程退出时回收；"重复装配后端"
+   由此从危险操作变回普通操作。测试侧另以进程内串行锁约束 GPU 用例
+   （并发多实例在本机有残余抖动，串行后 8 轮全稳定）。
+
+---
+
+## 6. 复现入口
+
+```powershell
+# 依赖方向守卫（期望 10/10 PASS，EXIT 0）
+cd "F:\All NGVGE\NES 2.0\Current products"
+python check_dependency_direction.py
+
+# 五个 crate（期望分别 75 / 34 / 40 / 42 / 15 全绿，clippy 零警告）
+cd .\nes-scene;          cargo test; cargo clippy --all-targets -- -D warnings
+cd ..\nes-asset;         cargo test; cargo clippy --all-targets -- -D warnings
+cd ..\nes-render-api;    cargo test; cargo clippy --all-targets -- -D warnings
+cd ..\nes-render-extract;cargo test; cargo clippy --all-targets -- -D warnings
+cd ..\nes-render-wgpu;   cargo test; cargo clippy --all-targets -- -D warnings
+
+# 最小可视闭环（期望 PASS；产物 output\s41_visual_closure.png）
+cargo run --example s41_visual_closure
+```
+
+> GPU 用例在无 wgpu-native 资产的机器上会**跳过并打印说明**（`NoLibraryCandidates`），
+> 但只要库存在，装配或渲染失败即判失败 —— "没有库"与"有库跑不通"不互相伪装。
+> 动态库落点：`nes-render-wgpu\..\wgpu-win\lib\wgpu_native.dll`（候选 2），
+> 或用环境变量 `NES_RENDER_WGPU_LIB` 显式指定。
+
+---
+
+## 7. 遗留与后续（S4.1 之后）
+
+> **v1.1 注记**：下表前两行已由 S4.2 关闭（2026-09-30，见
+> `NES2.0_M4渲染接入_S4批量与控件_v1.md`：扩容路径测试 + Control HUD 光栅化 +
+> flip/zoom 像素级实证；测试基线随之升至 19 项）。
+> **v1.2 注记**：真实纹理注册表已由 S4.3 关闭（同日，见
+> `NES2.0_M4渲染接入_S4纹理注册表_v1.md`：宿主侧 `register_texture` API +
+> 两路混画；测试基线升至 23 项）。
+> **v1.3 注记**：Label 文本光栅化已由 S4.4 关闭（同日，见
+> `NES2.0_M4渲染接入_S4文本光栅化_v1.md`：等宽字形表最小口径 + 混排演示；
+> 测试基线升至 26 项）。四类渲染命令（精灵/控件/文本 + 相机）至此全部产生像素。
+> **v1.4 注记**：S4.5 文本契约回归补齐 T-Text-01..14（含 Text+Control+Sprite
+> 同管线架构回归项），并修复自定义 `font` 键未实现的缺口；测试基线升至 40 项
+>（见 `NES2.0_M4渲染接入_S4文本契约回归_v1.md`）。
+> **v1.5 注记**：S4.6 渲染契约回归补齐 T-Sprite / T-Control / T-Camera 三矩阵
+>（24 项，含 HUD 不随相机的逆视图折算口径、DrawKey 三级全序、相机回退分支），
+> 并抓出 `ControlState` offsets 四边偏移语义误用；测试基线升至 64 项
+>（见 `NES2.0_M4渲染接入_S4渲染契约回归_v1.md`）。
+> **v1.6 注记**：S4.7 契约验证收官 —— T-Registry（8）、T-Stats（6，含 36 命令
+> 全量对账）、视觉基线（PNG 哈希锚定 + bless）；`register_texture` 拒绝 NIL 键；
+> 测试基线升至 79 项（见 `NES2.0_M4渲染接入_S4契约验证收尾_v1.md`）。
+> **v1.7 注记（M4 全线收官）**：新增 `nes-runtime` 引擎组装层（M5 文档见
+> `NES2.0_M5引擎组装层_v1.md`）：场景树 + 磁盘资产驱动整条管线，热重载直达
+> 像素；守卫扩至 G1~G11；全仓六 crate 测试 75/34/40/42/79/4 全绿。
+> **v1.8 注记（S6.1 窗口/Surface）**：帧循环从离屏搬到真实 Win32 窗口
+> （手写 FFI，零第三方）：`consume_to_surface` 与 `consume` 共用同一条
+> 命令处理/绘制路径（S6 文档见 `NES2.0_S6窗口Surface_v1.md`）；新增
+> T-Surf-01..04，wgpu crate 基线升至 83 项。
+> **v1.9 注记（S6.2 tick 接线）**：帧内前半程升级为 `SceneTree::tick`
+>（enter/ready/process 生命周期 + Cmd 命令缓冲），宿主行为经
+> `SceneObserver` 挂入，回调命令本帧直达像素（文档见
+> `NES2.0_S6生命周期Tick接线_v1.md`）；新增 T-Tick-01..04，runtime
+> 基线升至 8 项。
+> **v1.10 注记（S6.3 场景序列化闭环）**：`load_scene` / `save_scene` 接入
+> 帧循环，磁盘 RON 场景成为事实来源，`Resource(n)` 槽位身份经磁盘往返
+> 三处同源（文档见 `NES2.0_S6场景序列化闭环_v1.md`）；新增
+> T-Scene-01..04，runtime 基线升至 12 项。
+> **v1.11 注记（S6.4 暂停与时间缩放）**：草案 §9 落地 —— `ProcessMode`
+> 五模式 + 继承解析 + `paused`/`time_scale`，派发口径冻结在 tick
+>（文档见 `NES2.0_S6暂停与时间缩放_v1.md`）；新增 T-Pause 01..08 与
+> T-Pause-R 1..2，scene 基线升至 83、runtime 升至 14。
+> **v1.12 注记（S6.5 序列化口径）**：`process_mode` 裁决为 `NodeDoc`
+> 一等字段（与 `local` 对称；缺省不写出、未知值语义报错），磁盘场景携带
+> 的调度语义经往返仍生效（文档见 `NES2.0_S6序列化口径ProcessMode_v1.md`）；
+> 新增 T-PM 01..04 与 T-Pause-R3，scene 基线升至 87、runtime 升至 15。
+> **v1.13 注记（S6.6 子场景嵌套）**：`sub_scene` 引用递归展开 + 回写
+> 边界（子树归子文件，存盘只留引用），槽位按 (path, kind) 去重合并
+>（文档见 `NES2.0_S6子场景嵌套_v1.md`）；新增 T-Sub 01..04 与
+> T-Scene-05，scene 基线升至 91、runtime 升至 16。
+> **v1.14 注记（S6.7 子场景热重载）**：改子场景文件 -> `poll_scene_reload`
+> 从来源整树重载重展开（子场景文件本就是注册表里的 Scene 资产，缺的只是
+> 来源跟踪与重载触发；文档见 `NES2.0_S6子场景热重载_v1.md`）；新增
+> T-SubR 01..03，runtime 基线升至 19。
+> **v1.15 注记（S6.8 实例级属性覆盖）**：包装节点可携带 `InstanceOverride`
+> 记录（路径 + local/process_mode/props），实例化时应用到展开子树；记录
+> 属父场景文件 —— 热重载后覆盖仍赢、未覆盖字段跟新（文档见
+> `NES2.0_S6实例级属性覆盖_v1.md`）；新增 T-Ovr 01..04 与 T-SubR-04，
+> scene 基线升至 95、runtime 升至 20。
+> **v1.16 注记（S6.9 diff 式回写）**：`sync_overrides` 把运行时对实例
+> 内部节点的编辑烘焙成覆盖记录（参照 = 当前磁盘子场景的独立实例化；
+> 资源按所指路径比较防误报；保存保持纯读 —— 文档见
+> `NES2.0_S6Diff式回写_v1.md`）；新增 T-Ovr-05..06 与 T-Scene-06，
+> scene 基线升至 97、runtime 升至 21。
+> **v1.17 注记（S6.10 结构性覆盖）**：`InstanceOverride` 扩展
+> `add`/`remove`（实例内增删节点成为父文件记录），diff 随之结构化
+>（参照独有 -> remove、当前独有 -> add 子树全量导出；文档见
+> `NES2.0_S6结构性覆盖_v1.md`）；新增 T-Ovr-07..09 与 T-Scene-07，
+> scene 基线升至 100、runtime 升至 22。项目自此入 Git 仓库。
+
+| 事项 | 状态 |
+|---|---|
+| Label / Control 光栅化（字形图集、断行、锚点矩形） | Control ✅ HUD 口径（S4.2）；Label ✅ 等宽字形表最小口径（S4.4，对齐/换行/字号待 Q-S3-2 裁决） |
+| 真实纹理注册表（当前为内建 16 格图集，`key.slot % 16` 选格） | ✅ 宿主侧 API 落地（S4.3）；场景侧从 `nes-asset` 接真实像素属提取层后续接线 |
+| 实例缓冲倍增重建路径（`ensure_capacity` 增长分支）的专项测试 | ✅ 已覆盖（S4.2） |
+| headless Linux x86_64 + Mesa llvmpipe 认证移植（cfg 分支 / 库定位候选） | 未启动 |
+| M5 Scratch 兼容层 / 编辑器可视化脚本 | 未启动 |
+| Q-S3-2 / Q-S3-3 / Q-S3-4（Label 排版参数、相机 `limits` 场景入口、`order` 语义耦合） | 仍待裁决（见归档说明 §6，本轮未动） |
+| 窗口 / surface 接入（当前恒离屏） | ✅ S6.1（Win32 FFI 窗口 + wgpu surface，离屏与窗口共用同一绘制路径） |
+
+---
+
+## 8. 与归档说明 v1 的衔接（计划事项完成状态）
+
+| 计划项（归档说明 §4） | 状态 |
+|---|---|
+| 5.1 补 `src/renderer.rs` | ✅ 完成（本轮） |
+| 5.2 修 `error.rs:102` | ✅ 完成（连带补上 `ConfigMismatch` 分支） |
+| 5.3 写 `examples/s41_visual_closure.rs` 并实机出图 | ✅ 完成（PASS + 外部交叉验证） |
+| 5.4 守卫扩 G8 / G9 / G10 | ✅ 完成（10/10） |
+| 5.5 补出口准则测试 | ✅ 完成（`criterion_backend` 7 条，覆盖计划列举的全部六类） |
+| 5.6 S4 封口并回写文档 | ✅ 本文档即封口记录；归档说明已附 §11 回写 |
+| 5.7 测试基线对齐 | ✅ 见 §4 记账更正（40 / 42 / 15 + 守卫 10/10） |
+
+*（内容由AI生成，仅供参考）*

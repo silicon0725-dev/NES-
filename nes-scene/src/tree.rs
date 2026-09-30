@@ -1,0 +1,1588 @@
+//! 场景树：存储、结构变更、确定性遍历、变换传播。
+//!
+//! # 树不变式（任何时刻都必须成立）
+//!
+//! 1. **父指针与子列表双向一致**：`nodes[c].parent == Some(p)` ⟺ `p.children` 含 `c`。
+//! 2. **子列表按 `(order, slot)` 全序排列**。`order` 单调分配，`slot` 是兜底
+//!    决断项 —— 因此**不存在"顺序未定义"的兄弟对**，遍历必然可复现。
+//! 3. **无环**：`Reparent` 会拒绝把节点挂到自己或自己的后代下。
+//! 4. **根唯一**：`root` 的 `parent` 恒为 `None`，且永远 `IN_TREE`。
+//! 5. **不在树中的节点不出现于任何 `children` 列表中**。
+//!
+//! 这些不变式由 [`SceneTree`] 私有方法集中维护。外部只能通过 [`NodeCtx`] 接触树，
+//! 而 `NodeCtx` 在类型层面只提供只读树 + 命令缓冲，**无法直接改结构** —— 这是
+//! 与 Scratch 扩展生态打交道时最重要的一道防线：脚本作者再怎么写，也写不坏树。
+//!
+//! # 帧模型
+//!
+//! ```text
+//! tick(delta)
+//!   ├─ 1. apply_pending     结构变更统一落地（上一帧累积的全部 TreeOp）
+//!   ├─ 2. enter_tree        自顶向下，仅新入树节点
+//!   ├─ 3. ready             自底向上（逆前序），仅新就绪节点
+//!   ├─ 4. process           自顶向下，全树
+//!   └─ 5. flush_transforms  脏传播 → 世界矩阵
+//! ```
+//!
+//! 回调里发起的结构变更一律进入**下一帧**的 `pending`，因此本帧的遍历序列
+//! 在回调开始前就已固定，回调无法把遍历搅乱。属性写入（`SetLocal`）是例外，
+//! 它立即生效 —— 因为帧内可见的属性写入是脚本的普遍预期，而它不改变树的形状。
+
+use std::collections::HashMap;
+
+use crate::identity::{Arena, NodeId};
+use crate::node::{NodeKind, NodeKindTag};
+use crate::path::{NodePath, PathSeg};
+use crate::props::{PropError, PropStore};
+use crate::scene_io::InstanceOverride;
+use crate::schema::NodeSchema;
+use crate::transform::{Affine, Transform2D, Vec2};
+use crate::value::Value;
+
+/// 节点状态位。用 `u32` 位集而非多个 `bool`：`NodeData` 要保持紧凑。
+pub struct NodeFlags;
+
+impl NodeFlags {
+    /// 无标志。
+    pub const NONE: u32 = 0;
+    /// 已挂到树上（可被遍历）。
+    pub const IN_TREE: u32 = 1 << 0;
+    /// 已派发过 `enter_tree`。
+    pub const ENTERED: u32 = 1 << 1;
+    /// 已派发过 `ready`。
+    pub const READY: u32 = 1 << 2;
+    /// 本地变换已变，世界矩阵待重算。
+    pub const DIRTY_XFORM: u32 = 1 << 3;
+    /// 该节点的**子树**中存在变换脏节点。
+    ///
+    /// 这是 `refresh_transforms` 能安全剪枝的前提：没有这个标记的分支
+    /// 完全不会被遍历，因此无关子树（如"改了 A、不影响 B"里的 B）不会被重算。
+    pub const DIRTY_SUBTREE: u32 = 1 << 4;
+}
+
+/// 单个节点的全部数据。
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeData {
+    /// 类型与专有字段。
+    pub kind: NodeKind,
+    /// 名字。同一父节点下唯一（重名会自动加数字后缀）。
+    pub name: String,
+    /// 父节点。
+    pub parent: Option<NodeId>,
+    /// 子节点，按 `(order, slot)` 排序。
+    pub children: Vec<NodeId>,
+    /// 本地变换（相对父节点）。
+    pub local: Transform2D,
+    /// 世界变换缓存。由 [`SceneTree::refresh_transforms`] 维护。
+    pub world: Affine,
+    /// 兄弟间排序键，全局单调分配。
+    pub order: u64,
+    /// 设计时属性表。
+    ///
+    /// **一切设计时数据都在这里**（M2 实现层修订第 3 条）：`kind` 只表类型，
+    /// M1 时挂在变体上的 `texture` / `text` / `zoom` 等已迁入本表。
+    /// 属性表与树结构是**两条独立的变更通道**：属性写入立即生效，
+    /// 结构变更延迟落地 —— 这个区分是撤销栈与热重载都依赖的。
+    pub props: PropStore,
+    /// 处理模式（草案 §9）。**调度数据**，与 `local` 同级的一等字段
+    /// （空间数据不入属性表的同一裁决）；序列化口径见 S6.4 文档遗留。
+    pub process_mode: ProcessMode,
+    /// 实例级覆盖记录（仅当本节点是绑定了 `sub_scene` 的包装节点时有意义）。
+    ///
+    /// 记录本身是文件事实（父场景文件拥有它），实例化时应用到展开子树；
+    /// 运行时对实例内部节点的直接编辑**不回写**这里（见 S6.8 文档口径）。
+    pub overrides: Vec<InstanceOverride>,
+    /// [`NodeFlags`] 位集。
+    pub flags: u32,
+}
+
+/// 节点的处理模式（草案 §9）：决定树处于 `paused` 时 `process` 的派发。
+///
+/// 生效规则：`Inherit` 沿父链取最近的非 `Inherit` 祖先；整条链都 `Inherit`
+/// （含根）解析为 `Pausable`（与 Godot 缺省一致）。
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum ProcessMode {
+    /// 继承父链（缺省）。
+    #[default]
+    Inherit,
+    /// 受暂停影响（缺省行为）。
+    Pausable,
+    /// 仅在暂停期间派发，且 `delta = 0`（时间冻结，逻辑/结构仍可做）。
+    WhenPaused,
+    /// 永远派发，`delta` 不受暂停影响（UI、存档点必需）。
+    Always,
+    /// 从不派发（无论暂停与否）。
+    Disabled,
+}
+
+impl ProcessMode {
+    /// 稳定字符串名（序列化用，**不得**随重构改名）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "Inherit",
+            Self::Pausable => "Pausable",
+            Self::WhenPaused => "WhenPaused",
+            Self::Always => "Always",
+            Self::Disabled => "Disabled",
+        }
+    }
+
+    /// 从稳定字符串名还原。未知值返回 `None`（由解析层如实报语义错误，
+    /// 不静默回落 —— 调度语义不是可容忍的前向兼容数据）。
+    pub fn from_str_exact(s: &str) -> Option<Self> {
+        match s {
+            "Inherit" => Some(Self::Inherit),
+            "Pausable" => Some(Self::Pausable),
+            "WhenPaused" => Some(Self::WhenPaused),
+            "Always" => Some(Self::Always),
+            "Disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+impl NodeData {
+    fn placeholder(name: &str, kind: NodeKind) -> Self {
+        let props = NodeSchema::of(kind.tag()).default_store();
+        Self {
+            kind,
+            name: name.to_string(),
+            parent: None,
+            children: Vec::new(),
+            local: Transform2D::IDENTITY,
+            world: Affine::IDENTITY,
+            order: 0,
+            props,
+            process_mode: ProcessMode::default(),
+            overrides: Vec::new(),
+            flags: NodeFlags::DIRTY_XFORM,
+        }
+    }
+
+    /// 是否已挂在树上。
+    pub fn is_in_tree(&self) -> bool {
+        self.flags & NodeFlags::IN_TREE != 0
+    }
+
+    /// 是否已派发 `enter_tree`。
+    pub fn is_entered(&self) -> bool {
+        self.flags & NodeFlags::ENTERED != 0
+    }
+
+    /// 是否已派发 `ready`。
+    pub fn is_ready(&self) -> bool {
+        self.flags & NodeFlags::READY != 0
+    }
+
+    /// 世界矩阵是否待重算。
+    pub fn is_transform_dirty(&self) -> bool {
+        self.flags & NodeFlags::DIRTY_XFORM != 0
+    }
+}
+
+/// 结构变更操作。
+///
+/// `Add` 里的 `node` 必须已由 [`SceneTree::add_node`] 或 [`NodeCtx::spawn_child`]
+/// 在 arena 中占好槽位 —— 这样调用方在 `queue` 的当下就能拿到可用的 [`NodeId`]，
+/// 而不必等一帧。占位期间该节点的 `IN_TREE` 为假，遍历看不到它。
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeOp {
+    /// 把已占位的节点挂到父节点下。`at` 为 `None` 时追加到末尾。
+    Add {
+        /// 待挂载节点。
+        node: NodeId,
+        /// 目标父节点。
+        parent: NodeId,
+        /// 插入位置。越界则追加。
+        at: Option<usize>,
+    },
+    /// 移除节点。`keep_children` 为真时把子节点重新挂到被删节点的父上。
+    Remove {
+        /// 目标节点。
+        node: NodeId,
+        /// 是否保留子节点。
+        keep_children: bool,
+    },
+    /// 改挂父节点。
+    Reparent {
+        /// 目标节点。
+        node: NodeId,
+        /// 新父节点。
+        new_parent: NodeId,
+        /// 插入位置。
+        at: Option<usize>,
+    },
+    /// 改名。重名时自动加后缀。
+    Rename {
+        /// 目标节点。
+        node: NodeId,
+        /// 期望名字。
+        name: String,
+    },
+    /// 在同父下换位。
+    Move {
+        /// 目标节点。
+        node: NodeId,
+        /// 新下标。越界则夹到末尾。
+        new_index: usize,
+    },
+}
+
+/// 结构变更结果事件。用于日志、编辑器刷新、以及将来 SignalBus 的上游。
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeEvent {
+    /// 节点已入树。
+    Added {
+        /// 节点。
+        node: NodeId,
+        /// 父节点。
+        parent: NodeId,
+    },
+    /// 节点已出树。
+    Removed {
+        /// 节点。
+        node: NodeId,
+        /// 原父节点。
+        parent: NodeId,
+    },
+    /// 节点已改挂。
+    Reparented {
+        /// 节点。
+        node: NodeId,
+        /// 原父节点。
+        old_parent: NodeId,
+        /// 新父节点。
+        new_parent: NodeId,
+    },
+    /// 节点已改名。
+    Renamed {
+        /// 节点。
+        node: NodeId,
+        /// 原名。
+        old: String,
+        /// 新名。
+        new: String,
+    },
+    /// 节点已换位。
+    Moved {
+        /// 节点。
+        node: NodeId,
+        /// 原下标。
+        from: usize,
+        /// 新下标。
+        to: usize,
+    },
+    /// 请求的名字被占用，已自动调整。
+    NameAdjusted {
+        /// 节点。
+        node: NodeId,
+        /// 请求名。
+        requested: String,
+        /// 实际生效名。
+        actual: String,
+    },
+    /// 操作被拒绝（不变式保护）。
+    Rejected {
+        /// 操作名。
+        op: &'static str,
+        /// 原因。
+        reason: String,
+    },
+}
+
+/// 行为代码发起的命令。
+///
+/// 这是 [`NodeCtx`] 唯一能产生副作用的出口。分成三类：结构变更、属性写入、衍生。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cmd {
+    /// 结构变更，延迟到下一帧帧首落地。
+    Tree(TreeOp),
+    /// 本地变换写入，立即生效（帧内可见）。
+    SetLocal {
+        /// 目标节点。
+        node: NodeId,
+        /// 新本地变换。
+        t: Transform2D,
+    },
+    /// 请求在自身下新建子节点。
+    ///
+    /// 草案第 6 节的 `queue(TreeOp)` 对 `Add` 要求调用方先持有 `NodeId`，
+    /// 但回调里只有只读树，无法分配 arena 槽位。补这条命令解决。
+    Spawn {
+        /// 父节点。
+        parent: NodeId,
+        /// 新节点名。
+        name: String,
+        /// 新节点类型。
+        kind: NodeKind,
+    },
+    /// 属性写入，立即生效。
+    ///
+    /// 与 `SetLocal` 同理：属性不改变树形状，帧内可见是脚本的普遍预期。
+    SetProp {
+        /// 目标节点。
+        node: NodeId,
+        /// 属性名。
+        name: String,
+        /// 新值。
+        value: Value,
+    },
+}
+
+/// 行为代码看到的树句柄：**只读树 + 命令缓冲**。
+///
+/// 它刻意不提供任何 `&mut SceneTree`：脚本能表达的全部意图都必须经过命令，
+/// 命令再统一走帧首落地。因此不会出现"遍历到一半树变了"这类问题。
+pub struct NodeCtx<'a> {
+    this: NodeId,
+    tree: &'a SceneTree,
+    cmds: &'a mut Vec<Cmd>,
+}
+
+impl<'a> NodeCtx<'a> {
+    /// 当前节点。
+    pub fn this(&self) -> NodeId {
+        self.this
+    }
+
+    /// 当前节点的属性表（只读）。
+    pub fn props(&self) -> &'a PropStore {
+        &self.node().props
+    }
+
+    /// 读属性。
+    pub fn prop(&self, name: &str) -> Option<&'a Value> {
+        self.node().props.get(name)
+    }
+
+    /// 写属性，立即生效。
+    ///
+    /// 类型不符 / 名字不在 schema 里时**静默丢弃**：回调里没有事件通道，
+    /// 而脚本写错属性名是常态，不该让整帧崩掉。编辑器要走
+    /// [`SceneTree::set_prop`]，那里会返回 `Result`。
+    pub fn set_prop(&mut self, name: &str, value: Value) {
+        self.cmds.push(Cmd::SetProp {
+            node: self.this,
+            name: name.to_string(),
+            value,
+        });
+    }
+
+    /// 只读树。它是 `&'a`，因此可以在回调内自由传给别的只读函数。
+    pub fn tree(&self) -> &'a SceneTree {
+        self.tree
+    }
+
+    /// 当前节点数据。回调期间该节点必然存活（`tick` 按前序快照派发，不在回调中删节点）。
+    pub fn node(&self) -> &'a NodeData {
+        self.tree
+            .get(self.this)
+            .expect("NodeCtx 持有的节点在回调期间必须存活")
+    }
+
+    /// 当前节点名。
+    pub fn name(&self) -> &'a str {
+        self.node().name.as_str()
+    }
+
+    /// 当前节点类型。
+    pub fn kind(&self) -> &'a NodeKind {
+        &self.node().kind
+    }
+
+    /// 本地变换。
+    pub fn local(&self) -> Transform2D {
+        self.node().local
+    }
+
+    /// 世界变换（上一帧 `flush` 的结果）。
+    pub fn world(&self) -> Affine {
+        self.node().world
+    }
+
+    /// 世界坐标原点。
+    pub fn world_position(&self) -> Vec2 {
+        let w = self.node().world;
+        Vec2::new(w.tx, w.ty)
+    }
+
+    /// 父节点。
+    pub fn parent(&self) -> Option<NodeId> {
+        self.node().parent
+    }
+
+    /// 子节点切片。
+    pub fn children(&self) -> &'a [NodeId] {
+        &self.node().children
+    }
+
+    /// 排队一项结构变更，下一帧帧首落地。
+    pub fn queue(&mut self, op: TreeOp) {
+        self.cmds.push(Cmd::Tree(op));
+    }
+
+    /// 请求在自身下新建子节点。返回的 [`NodeId`] 在本帧内即可用于后续命令。
+    pub fn spawn_child(&mut self, name: &str, kind: NodeKind) {
+        self.cmds.push(Cmd::Spawn {
+            parent: self.this,
+            name: name.to_string(),
+            kind,
+        });
+    }
+
+    /// 写本地变换，立即生效。
+    pub fn set_local(&mut self, t: Transform2D) {
+        self.cmds.push(Cmd::SetLocal {
+            node: self.this,
+            t,
+        });
+    }
+
+    /// 本地平移增量。
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        let mut t = self.local();
+        t.pos.x += dx;
+        t.pos.y += dy;
+        self.set_local(t);
+    }
+
+    /// 当前节点的**生效**处理模式（继承解析后）。配合 `tree().paused()`
+    /// 供行为代码自省调度态。
+    pub fn process_mode(&self) -> ProcessMode {
+        self.tree.effective_process_mode(self.this)
+    }
+}
+
+/// 遍历钩子。引擎与测试都通过它观察树。
+///
+/// 全部方法都有空实现 —— 使用方只覆写关心的那几个。
+pub trait SceneObserver {
+    /// 结构变更已落地。
+    fn on_tree_event(&mut self, _tree: &SceneTree, _ev: &TreeEvent) {}
+    /// 节点首次入树（自顶向下）。
+    fn on_enter_tree(&mut self, _ctx: &mut NodeCtx<'_>) {}
+    /// 节点就绪（自底向上，子先于父）。
+    fn on_ready(&mut self, _ctx: &mut NodeCtx<'_>) {}
+    /// 每帧处理（自顶向下）。
+    fn on_process(&mut self, _ctx: &mut NodeCtx<'_>, _delta: f32) {}
+    /// 节点出树。
+    fn on_exit_tree(&mut self, _tree: &SceneTree, _node: NodeId) {}
+}
+
+/// 空观察者：宿主没有行为代码时的缺省。
+///
+/// 生命周期仍照常推进（标志位照置、命令缓冲照走），只是没人监听 ——
+/// 运行时的无观察者帧循环用它，保证"不接行为"与"接了行为"走同一条 tick 路径。
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NoObserver;
+
+impl SceneObserver for NoObserver {}
+
+/// 一次 `tick` 的统计。用于性能观测与测试断言。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickStats {
+    /// 本次 tick 的帧号。
+    pub frame: u64,
+    /// 落地的结构变更事件数。
+    pub events: usize,
+    /// 派发 `enter_tree` 的节点数。
+    pub entered: usize,
+    /// 派发 `ready` 的节点数。
+    pub readied: usize,
+    /// 派发 `process` 的节点数。
+    pub processed: usize,
+    /// **未**派发 `process` 的节点数（暂停跳过 / Disabled）——
+    /// 与 `processed` 相加恒等于遍历到的节点数。
+    pub process_skipped: usize,
+    /// 重算世界矩阵的节点数。
+    pub dirty_flushed: usize,
+}
+
+/// 场景树。
+pub struct SceneTree {
+    nodes: Arena<NodeData>,
+    root: NodeId,
+    pending: Vec<TreeOp>,
+    order_seq: u64,
+    frame: u64,
+    groups: HashMap<String, Vec<NodeId>>,
+    /// 全局暂停位（草案 §9）。影响 [`ProcessMode::Pausable`]（含 `Inherit`
+    /// 解析结果）的 `process` 派发；生命周期与结构变更**不受影响**。
+    paused: bool,
+    /// 全局时间缩放（草案 §9）。只乘 `delta`，不改遍历次数（确定性优先）。
+    /// 写入时钳到 `[0, +∞)`——负时间没有可解释的语义，宁可夹住不放行。
+    time_scale: f32,
+}
+
+impl SceneTree {
+    /// 建树。根节点固定为 [`NodeKind::Node`]，名字可指定（影响路径首段）。
+    pub fn new(root_name: &str) -> Self {
+        Self::new_with_kind(root_name, NodeKind::Node)
+    }
+
+    /// 建树并指定根节点类型。
+    ///
+    /// 场景实例化需要它 —— 场景文件的根可以是 `Node2D`、`Control` 等。
+    pub fn new_with_kind(root_name: &str, kind: NodeKind) -> Self {
+        let props = NodeSchema::of(kind.tag()).default_store();
+        let mut nodes = Arena::new();
+        let root = nodes.insert(NodeData {
+            kind,
+            name: root_name.to_string(),
+            parent: None,
+            children: Vec::new(),
+            local: Transform2D::IDENTITY,
+            world: Affine::IDENTITY,
+            order: 0,
+            props,
+            process_mode: ProcessMode::default(),
+            overrides: Vec::new(),
+            flags: NodeFlags::IN_TREE | NodeFlags::DIRTY_XFORM,
+        });
+        Self {
+            nodes,
+            root,
+            pending: Vec::new(),
+            order_seq: 0,
+            frame: 0,
+            groups: HashMap::new(),
+            paused: false,
+            time_scale: 1.0,
+        }
+    }
+
+    // ---------- 只读访问 ----------
+
+    /// 根节点。
+    pub fn root(&self) -> NodeId {
+        self.root
+    }
+
+    /// 已推进的帧数。
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// 存活节点数（含未挂树的占位节点）。
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// 是否无节点（恒为假：根节点始终存在）。
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// 身份是否仍有效。
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.nodes.contains(id)
+    }
+
+    /// 节点数据。
+    pub fn get(&self, id: NodeId) -> Option<&NodeData> {
+        self.nodes.get(id)
+    }
+
+    /// 节点名。
+    pub fn name(&self, id: NodeId) -> Option<&str> {
+        self.nodes.get(id).map(|n| n.name.as_str())
+    }
+
+    /// 节点类型。
+    pub fn kind(&self, id: NodeId) -> Option<&NodeKind> {
+        self.nodes.get(id).map(|n| &n.kind)
+    }
+
+    /// 节点类型的标签（不用先解引用 `NodeKind`）。
+    pub fn kind_tag(&self, id: NodeId) -> Option<NodeKindTag> {
+        self.nodes.get(id).map(|n| n.kind.tag())
+    }
+
+    /// 父节点。
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes.get(id).and_then(|n| n.parent)
+    }
+
+    /// 子节点。不存在的节点返回空切片。
+    pub fn children(&self, id: NodeId) -> &[NodeId] {
+        self.nodes
+            .get(id)
+            .map(|n| n.children.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 本地变换。
+    pub fn local(&self, id: NodeId) -> Option<Transform2D> {
+        self.nodes.get(id).map(|n| n.local)
+    }
+
+    /// 世界变换缓存。
+    pub fn world(&self, id: NodeId) -> Option<Affine> {
+        self.nodes.get(id).map(|n| n.world)
+    }
+
+    /// 世界坐标原点。
+    pub fn world_position(&self, id: NodeId) -> Option<Vec2> {
+        self.nodes.get(id).map(|n| {
+            let w = n.world;
+            Vec2::new(w.tx, w.ty)
+        })
+    }
+
+    /// 是否已挂树。
+    pub fn is_in_tree(&self, id: NodeId) -> bool {
+        self.nodes.get(id).map(|n| n.is_in_tree()).unwrap_or(false)
+    }
+
+    /// 是否已派发 `enter_tree`。
+    pub fn is_entered(&self, id: NodeId) -> bool {
+        self.nodes.get(id).map(|n| n.is_entered()).unwrap_or(false)
+    }
+
+    /// 是否已派发 `ready`。
+    pub fn is_ready(&self, id: NodeId) -> bool {
+        self.nodes.get(id).map(|n| n.is_ready()).unwrap_or(false)
+    }
+
+    /// 待落地的结构变更数。
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    // ---------- 遍历 ----------
+
+    /// 前序遍历（自顶向下，兄弟按序）。这是引擎的**确定性遍历序**，全项目以此为准。
+    pub fn preorder(&self) -> Vec<NodeId> {
+        self.subtree_preorder(self.root)
+    }
+
+    /// 某子树的前序遍历。
+    pub fn subtree_preorder(&self, node: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        if !self.is_in_tree(node) {
+            return out;
+        }
+        let mut stack = vec![node];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            if let Some(nd) = self.nodes.get(id) {
+                // 逆序压栈 → 出栈即正向顺序
+                for &c in nd.children.iter().rev() {
+                    stack.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// 某节点的祖先链，自父向上。
+    pub fn ancestors(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut cur = self.parent(id);
+        while let Some(p) = cur {
+            out.push(p);
+            cur = self.parent(p);
+        }
+        out
+    }
+
+    // ---------- 暂停与时间缩放（草案 §9） ----------
+
+    /// 全局暂停位。
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// 设置全局暂停。暂停**不是停止遍历**：结构变更与生命周期照常落地，
+    /// 只是 `Pausable`（含 `Inherit` 解析）节点的 `process` 不再派发。
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// 全局时间缩放（缺省 1.0）。
+    pub fn time_scale(&self) -> f32 {
+        self.time_scale
+    }
+
+    /// 设置全局时间缩放（钳到 `[0, +∞)`）。只乘 `delta`，不改遍历次数。
+    pub fn set_time_scale(&mut self, scale: f32) {
+        self.time_scale = if scale.is_finite() { scale.max(0.0) } else { 1.0 };
+    }
+
+    /// 节点自身设置的处理模式（未经继承解析）。
+    pub fn process_mode(&self, id: NodeId) -> Option<ProcessMode> {
+        self.nodes.get(id).map(|n| n.process_mode)
+    }
+
+    /// 写节点的处理模式。节点不存在时静默忽略（与 `set_local` 同口径）。
+    pub fn set_process_mode(&mut self, id: NodeId, mode: ProcessMode) {
+        if let Some(nd) = self.nodes.get_mut(id) {
+            nd.process_mode = mode;
+        }
+    }
+
+    /// **生效**处理模式：`Inherit` 沿父链取最近的非 `Inherit` 祖先；
+    /// 整条链都 `Inherit`（含根、或节点不在树上）解析为 `Pausable`。
+    pub fn effective_process_mode(&self, id: NodeId) -> ProcessMode {
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            let Some(nd) = self.nodes.get(n) else {
+                break;
+            };
+            if nd.process_mode != ProcessMode::Inherit {
+                return nd.process_mode;
+            }
+            cur = nd.parent;
+        }
+        ProcessMode::Pausable
+    }
+
+    // ---------- 实例级覆盖（S6.8） ----------
+
+    /// 节点携带的实例级覆盖记录（通常只有 `sub_scene` 包装节点非空）。
+    pub fn instance_overrides(&self, id: NodeId) -> Option<&[InstanceOverride]> {
+        self.nodes.get(id).map(|n| n.overrides.as_slice())
+    }
+
+    /// 写实例级覆盖记录（序列化回写用；节点不存在静默忽略，与 `set_local`
+    /// 同口径）。
+    pub fn set_instance_overrides(&mut self, id: NodeId, overrides: Vec<InstanceOverride>) {
+        if let Some(nd) = self.nodes.get_mut(id) {
+            nd.overrides = overrides;
+        }
+    }
+
+    /// `anc` 是否为 `node` 的祖先（含自身）。
+    pub fn is_ancestor_of(&self, anc: NodeId, node: NodeId) -> bool {
+        if anc == node {
+            return true;
+        }
+        let mut cur = self.parent(node);
+        while let Some(id) = cur {
+            if id == anc {
+                return true;
+            }
+            cur = self.parent(id);
+        }
+        false
+    }
+
+    /// 某个节点到根的深度（根为 0）。
+    pub fn depth(&self, id: NodeId) -> usize {
+        self.ancestors(id).len()
+    }
+
+    /// 前序第一个匹配名字的节点。
+    pub fn find_by_name(&self, name: &str) -> Option<NodeId> {
+        self.preorder()
+            .into_iter()
+            .find(|&id| self.nodes.get(id).map(|n| n.name == name).unwrap_or(false))
+    }
+
+    /// 某父节点下所有同名子节点。
+    pub fn children_named(&self, parent: NodeId, name: &str) -> Vec<NodeId> {
+        self.children(parent)
+            .iter()
+            .copied()
+            .filter(|&c| self.nodes.get(c).map(|n| n.name == name).unwrap_or(false))
+            .collect()
+    }
+
+    // ---------- 路径 ----------
+
+    /// 生成节点路径。与 [`Self::find`] 严格互逆。
+    pub fn path_of(&self, id: NodeId) -> Option<NodePath> {
+        self.nodes.get(id)?;
+        let mut segs = Vec::new();
+        let mut cur = id;
+        loop {
+            let nd = self.nodes.get(cur)?;
+            let name = nd.name.clone();
+            let parent = nd.parent;
+            let mut seg = PathSeg::Named(name.clone());
+            if let Some(p) = parent {
+                let siblings = self.children_named(p, &name);
+                if siblings.len() > 1 {
+                    let idx = siblings.iter().position(|&c| c == cur).unwrap_or(0);
+                    seg = PathSeg::Indexed(name, idx);
+                }
+            }
+            segs.push(seg);
+            match parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        segs.reverse();
+        Some(NodePath {
+            absolute: false,
+            segs,
+        })
+    }
+
+    /// 按路径查找。首段必须匹配根节点名。
+    ///
+    /// 该接口是 M5 兼容层（Scratch 的 `getSpriteTargetByName` 之类）的主要入口，
+    /// 因此失败时返回 `None` 而不是 panic，也不做模糊匹配。
+    pub fn find(&self, path: &NodePath) -> Option<NodeId> {
+        let mut iter = path.segs.iter();
+        let first = iter.next()?;
+        let root_name = self.nodes.get(self.root)?.name.as_str();
+        if first.name() != root_name {
+            return None;
+        }
+        let mut cur = self.root;
+        for seg in iter {
+            let want = seg.name();
+            let idx = match seg {
+                PathSeg::Named(_) => None,
+                PathSeg::Indexed(_, i) => Some(*i),
+            };
+            let matches: Vec<NodeId> = self
+                .children(cur)
+                .iter()
+                .copied()
+                .filter(|&c| self.nodes.get(c).map(|n| n.name == want).unwrap_or(false))
+                .collect();
+            cur = match idx {
+                Some(i) => *matches.get(i)?,
+                None => *matches.first()?,
+            };
+        }
+        Some(cur)
+    }
+
+    /// 按路径字符串查找的便捷形式。
+    pub fn find_str(&self, path: &str) -> Option<NodeId> {
+        NodePath::parse(path).ok().and_then(|p| self.find(&p))
+    }
+
+    // ---------- 结构变更（排队） ----------
+
+    /// 在 `parent` 下追加一个新节点，立即返回可用的 [`NodeId`]。
+    ///
+    /// 挂载本身在**下一次** `tick` 帧首完成；在那之前该节点不可遍历。
+    /// 如果你需要它立刻可见（例如初始化代码里连续建树），连续调用后统一 `tick` 一次即可。
+    pub fn add_node(&mut self, parent: NodeId, name: &str, kind: NodeKind) -> NodeId {
+        self.add_node_at(parent, name, kind, None)
+    }
+
+    /// 同 [`Self::add_node`]，但指定插入位置。
+    pub fn add_node_at(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        kind: NodeKind,
+        at: Option<usize>,
+    ) -> NodeId {
+        let node = self.nodes.insert(NodeData::placeholder(name, kind));
+        self.pending.push(TreeOp::Add { node, parent, at });
+        node
+    }
+
+    /// 排队任意结构变更。
+    pub fn queue(&mut self, op: TreeOp) {
+        self.pending.push(op);
+    }
+
+    /// 移除节点。
+    pub fn remove_node(&mut self, node: NodeId, keep_children: bool) {
+        self.pending.push(TreeOp::Remove {
+            node,
+            keep_children,
+        });
+    }
+
+    /// 改挂父节点。
+    pub fn reparent(&mut self, node: NodeId, new_parent: NodeId, at: Option<usize>) {
+        self.pending.push(TreeOp::Reparent {
+            node,
+            new_parent,
+            at,
+        });
+    }
+
+    /// 改名。
+    pub fn rename(&mut self, node: NodeId, name: &str) {
+        self.pending.push(TreeOp::Rename {
+            node,
+            name: name.to_string(),
+        });
+    }
+
+    /// 在同父下换位。
+    pub fn move_child(&mut self, node: NodeId, new_index: usize) {
+        self.pending.push(TreeOp::Move { node, new_index });
+    }
+
+    // ---------- 属性（反射） ----------
+
+    /// 属性表（只读）。
+    pub fn props(&self, id: NodeId) -> Option<&PropStore> {
+        self.nodes.get(id).map(|n| &n.props)
+    }
+
+    /// 读单个属性。
+    pub fn prop(&self, id: NodeId, name: &str) -> Option<&Value> {
+        self.nodes.get(id).and_then(|n| n.props.get(name))
+    }
+
+    /// 该节点的 schema。
+    pub fn schema_of(&self, id: NodeId) -> Option<&'static NodeSchema> {
+        self.kind_tag(id).map(NodeSchema::of)
+    }
+
+    /// 写属性。schema 认识的按 schema 校验（类型不符会按 hint 夹取或拒绝），
+    /// schema 不认识的**拒绝**。
+    ///
+    /// 拒绝是有意的：编辑器面板上拼错属性名，必须当场报错，
+    /// 而不是静默写进表里变成永远读不到的垃圾。加载器要保留未知属性时走
+    /// [`Self::set_prop_raw`]。
+    pub fn set_prop(&mut self, id: NodeId, name: &str, value: Value) -> Result<(), PropError> {
+        let schema = self.schema_of(id).ok_or(PropError::NoSuchNode)?;
+        // 先校验再落盘：`validate` 可能把值夹取到 hint 范围内，
+        // 所以写进去的是**校验后的值**，不是原始输入。
+        let checked = schema.validate(name, &value)?;
+        let nd = self.nodes.get_mut(id).ok_or(PropError::NoSuchNode)?;
+        nd.props.set(name, checked);
+        Ok(())
+    }
+
+    /// 直接写属性表，不做 schema 校验（反序列化的前向兼容通道）。
+    /// 返回属性表的新版本号；节点不存在时返回 0。
+    pub fn set_prop_raw(&mut self, id: NodeId, name: &str, value: Value) -> u64 {
+        match self.nodes.get_mut(id) {
+            Some(nd) => {
+                nd.props.set(name, value);
+                nd.props.version()
+            }
+            None => 0,
+        }
+    }
+
+    /// 立即写本地变换并标记脏。世界矩阵在下一次 `refresh_transforms` / `tick` 时重算。
+    ///
+    /// 脏标记分两份：自身 `DIRTY_XFORM`（自己的世界矩阵要重算），
+    /// 祖先链 `DIRTY_SUBTREE`（子树里有人要重算）。只标自身的话，冲洗阶段
+    /// 无法判断哪条分支需要下探，就只能全树重算。
+    pub fn set_local(&mut self, id: NodeId, t: Transform2D) {
+        match self.nodes.get_mut(id) {
+            Some(nd) => {
+                nd.local = t;
+                nd.flags |= NodeFlags::DIRTY_XFORM;
+            }
+            None => return,
+        }
+        self.mark_subtree_dirty_upwards(id);
+    }
+
+    /// 列出节点加入的组。
+    pub fn groups_of(&self, id: NodeId) -> Vec<&str> {
+        self.groups
+            .iter()
+            .filter(|(_, members)| members.contains(&id))
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// 加组 / 移组。M5 的 Scratch 广播寻址依赖它。
+    pub fn set_group(&mut self, id: NodeId, group: &str, member: bool) {
+        let entry = self.groups.entry(group.to_string()).or_default();
+        let has = entry.contains(&id);
+        if member && !has {
+            entry.push(id);
+        } else if !member && has {
+            entry.retain(|&x| x != id);
+        }
+    }
+
+    /// 组内成员（前序序）。
+    pub fn group_members(&self, group: &str) -> Vec<NodeId> {
+        let mut ids = self.groups.get(group).cloned().unwrap_or_default();
+        // 统一按前序序输出，避免 HashSet/Vec 插入序泄漏成遍历序
+        let order = self.preorder();
+        ids.sort_by_key(|id| order.iter().position(|x| x == id).unwrap_or(usize::MAX));
+        ids
+    }
+
+    // ---------- 帧推进 ----------
+
+    /// 落地全部待处理结构变更，返回产生的事件。
+    pub fn apply_pending(&mut self) -> Vec<TreeEvent> {
+        let ops = std::mem::take(&mut self.pending);
+        let mut events = Vec::with_capacity(ops.len());
+        for op in ops {
+            self.apply_op(op, &mut events);
+        }
+        events
+    }
+
+    /// 重算世界矩阵，返回**实际被重算**的节点数。
+    ///
+    /// 剪枝依据两条不变式：
+    /// 1. 任何 `DIRTY_XFORM` 节点的祖先链上都亮着 `DIRTY_SUBTREE`
+    ///    （由 [`Self::mark_subtree_dirty_upwards`] 维护）；
+    /// 2. 父的世界矩阵若在本轮被重算，则其全部子节点必然需要重算。
+    ///
+    /// 于是"子树无脏标记、父也没变"的分支**完全不进入遍历** ——
+    /// 与脏节点无关的兄弟子树既不会被访问，也不会被计入返回值。
+    ///
+    /// 用显式栈而非递归：深场景不应撞上调用栈上限。
+    pub fn refresh_transforms(&mut self) -> usize {
+        let mut flushed = 0usize;
+        let mut stack: Vec<(NodeId, bool)> = vec![(self.root, false)];
+        while let Some((id, parent_updated)) = stack.pop() {
+            let (self_dirty, subtree_dirty) = match self.nodes.get(id) {
+                Some(n) => (
+                    n.flags & NodeFlags::DIRTY_XFORM != 0,
+                    n.flags & NodeFlags::DIRTY_SUBTREE != 0,
+                ),
+                None => continue,
+            };
+            // 只有"自身脏"或"父刚被重算"才真正重算。仅仅被访问到不算数 ——
+            // root 是每个非空树的必经节点，若无条件计数，静止树的冲洗数就恒 >= 1。
+            let needs = self_dirty || parent_updated;
+            if needs {
+                let world = match self.parent(id) {
+                    None => self
+                        .nodes
+                        .get(id)
+                        .map(|n| n.local.to_affine())
+                        .unwrap_or(Affine::IDENTITY),
+                    Some(p) => {
+                        let pw = self.nodes.get(p).map(|n| n.world).unwrap_or(Affine::IDENTITY);
+                        let l = self
+                            .nodes
+                            .get(id)
+                            .map(|n| n.local.to_affine())
+                            .unwrap_or(Affine::IDENTITY);
+                        pw.mul(&l)
+                    }
+                };
+                if let Some(nd) = self.nodes.get_mut(id) {
+                    nd.world = world;
+                    nd.flags &= !NodeFlags::DIRTY_XFORM;
+                }
+                flushed += 1;
+            }
+
+            // 下探条件：子树里还有脏，或父刚被重算（子必须跟着重算）。
+            if !(subtree_dirty || needs) {
+                continue;
+            }
+            if let Some(nd) = self.nodes.get_mut(id) {
+                nd.flags &= !NodeFlags::DIRTY_SUBTREE;
+            }
+            let kids: Vec<NodeId> = self
+                .nodes
+                .get(id)
+                .map(|n| n.children.clone())
+                .unwrap_or_default();
+            // 逆序压栈 → 出栈即自左向右（只影响可读性，不影响结果）
+            for k in kids.into_iter().rev() {
+                stack.push((k, needs));
+            }
+        }
+        flushed
+    }
+
+    /// 推进一帧。阶段顺序见模块文档。
+    pub fn tick(&mut self, delta: f32, obs: &mut dyn SceneObserver) -> TickStats {
+        let mut stats = TickStats {
+            frame: self.frame,
+            ..TickStats::default()
+        };
+
+        // 1. 结构变更落地
+        let events = self.apply_pending();
+        stats.events = events.len();
+        for ev in &events {
+            obs.on_tree_event(&*self, ev);
+        }
+
+        // 2. enter_tree（自顶向下）
+        for id in self.preorder() {
+            let need = self
+                .nodes
+                .get(id)
+                .map(|n| !n.is_entered())
+                .unwrap_or(false);
+            if !need {
+                continue;
+            }
+            if let Some(nd) = self.nodes.get_mut(id) {
+                nd.flags |= NodeFlags::ENTERED;
+            }
+            let mut cmds: Vec<Cmd> = Vec::new();
+            {
+                let mut ctx = NodeCtx {
+                    this: id,
+                    tree: &*self,
+                    cmds: &mut cmds,
+                };
+                obs.on_enter_tree(&mut ctx);
+            }
+            for c in cmds {
+                self.apply_cmd(c);
+            }
+            stats.entered += 1;
+        }
+
+        // 3. ready（逆前序 ≈ 自底向上：保证子先于父）
+        let mut reversed = self.preorder();
+        reversed.reverse();
+        for id in reversed {
+            let need = self
+                .nodes
+                .get(id)
+                .map(|n| n.is_entered() && !n.is_ready())
+                .unwrap_or(false);
+            if !need {
+                continue;
+            }
+            if let Some(nd) = self.nodes.get_mut(id) {
+                nd.flags |= NodeFlags::READY;
+            }
+            let mut cmds: Vec<Cmd> = Vec::new();
+            {
+                let mut ctx = NodeCtx {
+                    this: id,
+                    tree: &*self,
+                    cmds: &mut cmds,
+                };
+                obs.on_ready(&mut ctx);
+            }
+            for c in cmds {
+                self.apply_cmd(c);
+            }
+            stats.readied += 1;
+        }
+
+        // 4. process（自顶向下）。
+        //    遍历序列在这里一次性快照，回调里发起的一切结构变更都进入下一帧 pending，
+        //    所以回调不可能把本次遍历搅乱。
+        //
+        //    暂停/时间缩放（草案 §9）的派发口径，在此冻结：
+        //    - `time_scale` 只乘 delta，遍历次数不变（确定性优先）；
+        //    - 暂停时 Pausable（含 Inherit 解析）**不派发**；Always 照常派发且
+        //      delta 不受暂停影响；WhenPaused 仅暂停时派发、delta = 0（时间冻结，
+        //      逻辑与结构变更仍可做）；Disabled 永不派发；
+        //    - 生命周期（enter/ready）与结构变更不受暂停影响 —— 暂停期间 UI
+        //      不能僵死，结构照常落地。
+        let scaled_delta = delta * self.time_scale;
+        let paused = self.paused;
+        for id in self.preorder() {
+            let dispatch_delta = match self.effective_process_mode(id) {
+                ProcessMode::Inherit => Some(scaled_delta), // effective 解析后不会出现；防御口径
+                ProcessMode::Pausable => {
+                    if paused {
+                        None
+                    } else {
+                        Some(scaled_delta)
+                    }
+                }
+                ProcessMode::Always => Some(scaled_delta),
+                ProcessMode::WhenPaused => {
+                    if paused {
+                        Some(0.0)
+                    } else {
+                        None
+                    }
+                }
+                ProcessMode::Disabled => None,
+            };
+            let Some(delta) = dispatch_delta else {
+                stats.process_skipped += 1;
+                continue;
+            };
+            let mut cmds: Vec<Cmd> = Vec::new();
+            {
+                let mut ctx = NodeCtx {
+                    this: id,
+                    tree: &*self,
+                    cmds: &mut cmds,
+                };
+                obs.on_process(&mut ctx, delta);
+            }
+            for c in cmds {
+                self.apply_cmd(c);
+            }
+            stats.processed += 1;
+        }
+
+        // 5. 变换冲洗
+        stats.dirty_flushed = self.refresh_transforms();
+
+        self.frame += 1;
+        stats
+    }
+
+    // ---------- 内部：不变式维护 ----------
+
+    fn next_order(&mut self) -> u64 {
+        self.order_seq = self.order_seq.wrapping_add(1);
+        self.order_seq
+    }
+
+    fn apply_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Tree(op) => self.pending.push(op),
+            Cmd::SetLocal { node, t } => self.set_local(node, t),
+            Cmd::SetProp { node, name, value } => {
+                // 静默忽略失败：`apply_cmd` 没有事件通道，且脚本写错属性不该崩帧。
+                let _ = self.set_prop(node, &name, value);
+            }
+            Cmd::Spawn { parent, name, kind } => {
+                // 只占 arena 槽位，结构变更依旧走 pending —— 保持"帧首统一落地"的纪律。
+                let node = self.nodes.insert(NodeData::placeholder(&name, kind));
+                self.pending.push(TreeOp::Add {
+                    node,
+                    parent,
+                    at: None,
+                });
+            }
+        }
+    }
+
+    fn apply_op(&mut self, op: TreeOp, events: &mut Vec<TreeEvent>) {
+        match op {
+            TreeOp::Add { node, parent, at } => {
+                if !self.is_in_tree(parent) {
+                    self.nodes.remove(node);
+                    events.push(TreeEvent::Rejected {
+                        op: "Add",
+                        reason: format!("父节点 {:?} 不在树中", parent),
+                    });
+                    return;
+                }
+                let requested = self
+                    .nodes
+                    .get(node)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_default();
+                let actual = self.unique_name(parent, &requested, Some(node));
+                if actual != requested {
+                    events.push(TreeEvent::NameAdjusted {
+                        node,
+                        requested,
+                        actual: actual.clone(),
+                    });
+                }
+                if let Some(nd) = self.nodes.get_mut(node) {
+                    nd.name = actual;
+                }
+                self.attach(parent, node, at);
+                events.push(TreeEvent::Added { node, parent });
+            }
+
+            TreeOp::Remove { node, keep_children } => {
+                self.apply_remove(node, keep_children, events);
+            }
+
+            TreeOp::Reparent {
+                node,
+                new_parent,
+                at,
+            } => {
+                let old_parent = match self.nodes.get(node).and_then(|n| n.parent) {
+                    Some(p) => p,
+                    None => {
+                        events.push(TreeEvent::Rejected {
+                            op: "Reparent",
+                            reason: format!("节点 {:?} 不在树中", node),
+                        });
+                        return;
+                    }
+                };
+                if node == new_parent || self.is_ancestor_of(node, new_parent) {
+                    events.push(TreeEvent::Rejected {
+                        op: "Reparent",
+                        reason: format!("把 {:?} 挂到自身/后代 {:?} 下会形成环", node, new_parent),
+                    });
+                    return;
+                }
+                if !self.is_in_tree(new_parent) {
+                    events.push(TreeEvent::Rejected {
+                        op: "Reparent",
+                        reason: format!("目标父节点 {:?} 不在树中", new_parent),
+                    });
+                    return;
+                }
+                self.detach_from_parent(node);
+                self.attach(new_parent, node, at);
+                events.push(TreeEvent::Reparented {
+                    node,
+                    old_parent,
+                    new_parent,
+                });
+            }
+
+            TreeOp::Rename { node, name } => {
+                let parent = match self.nodes.get(node).and_then(|n| n.parent) {
+                    Some(p) => p,
+                    None => {
+                        events.push(TreeEvent::Rejected {
+                            op: "Rename",
+                            reason: format!("节点 {:?} 不在树中", node),
+                        });
+                        return;
+                    }
+                };
+                let actual = self.unique_name(parent, &name, Some(node));
+                if actual != name {
+                    events.push(TreeEvent::NameAdjusted {
+                        node,
+                        requested: name,
+                        actual: actual.clone(),
+                    });
+                }
+                let old = self
+                    .nodes
+                    .get(node)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_default();
+                if let Some(nd) = self.nodes.get_mut(node) {
+                    nd.name = actual.clone();
+                }
+                events.push(TreeEvent::Renamed {
+                    node,
+                    old,
+                    new: actual,
+                });
+            }
+
+            TreeOp::Move { node, new_index } => {
+                self.apply_move(node, new_index, events);
+            }
+        }
+    }
+
+    fn apply_remove(&mut self, node: NodeId, keep_children: bool, events: &mut Vec<TreeEvent>) {
+        let parent = match self.nodes.get(node).and_then(|n| n.parent) {
+            Some(p) => p,
+            None => {
+                events.push(TreeEvent::Rejected {
+                    op: "Remove",
+                    reason: format!("节点 {:?} 不在树中", node),
+                });
+                return;
+            }
+        };
+
+        if keep_children {
+            let kids: Vec<NodeId> = self
+                .nodes
+                .get(node)
+                .map(|n| n.children.clone())
+                .unwrap_or_default();
+            for k in kids {
+                self.detach_from_parent(k);
+                self.attach(parent, k, None);
+                events.push(TreeEvent::Reparented {
+                    node: k,
+                    old_parent: node,
+                    new_parent: parent,
+                });
+            }
+            self.detach_from_parent(node);
+            events.push(TreeEvent::Removed { node, parent });
+            self.nodes.remove(node);
+        } else {
+            // 整棵子树移除。自顶向下逐个出树，保证 `Removed` 事件顺序即层级顺序。
+            let subtree = self.subtree_preorder(node);
+            if subtree.is_empty() {
+                events.push(TreeEvent::Rejected {
+                    op: "Remove",
+                    reason: format!("节点 {:?} 不在树中", node),
+                });
+                return;
+            }
+            for n in subtree {
+                if let Some(p) = self.nodes.get(n).and_then(|x| x.parent) {
+                    self.detach_from_parent(n);
+                    events.push(TreeEvent::Removed { node: n, parent: p });
+                }
+                self.nodes.remove(n);
+            }
+        }
+    }
+
+    fn apply_move(&mut self, node: NodeId, new_index: usize, events: &mut Vec<TreeEvent>) {
+        let parent = match self.nodes.get(node).and_then(|n| n.parent) {
+            Some(p) => p,
+            None => {
+                events.push(TreeEvent::Rejected {
+                    op: "Move",
+                    reason: format!("节点 {:?} 不在树中", node),
+                });
+                return;
+            }
+        };
+        let from = match self
+            .nodes
+            .get(parent)
+            .and_then(|p| p.children.iter().position(|&c| c == node))
+        {
+            Some(i) => i,
+            None => {
+                events.push(TreeEvent::Rejected {
+                    op: "Move",
+                    reason: format!("节点 {:?} 不在其父的子列表中", node),
+                });
+                return;
+            }
+        };
+        let len = self.nodes.get(parent).map(|p| p.children.len()).unwrap_or(0);
+        if len == 0 {
+            return;
+        }
+        let to = new_index.min(len - 1);
+        if to == from {
+            return;
+        }
+
+        // 1) 落地新顺序
+        let new_children: Vec<NodeId> = {
+            let mut kids = self
+                .nodes
+                .get(parent)
+                .map(|p| p.children.clone())
+                .unwrap_or_default();
+            let item = kids.remove(from);
+            kids.insert(to, item);
+            kids
+        };
+        // 2) 重写 order 键，使数组顺序即排序结果
+        let mut next = self.order_seq;
+        for &c in &new_children {
+            next = next.wrapping_add(1);
+            if let Some(nd) = self.nodes.get_mut(c) {
+                nd.order = next;
+            }
+        }
+        self.order_seq = next;
+        // 3) 写回。换位只改兄弟顺序、不改父链，因此**不需要**动变换脏标记。
+        if let Some(pd) = self.nodes.get_mut(parent) {
+            pd.children = new_children;
+        }
+        events.push(TreeEvent::Moved { node, from, to });
+    }
+
+    fn attach(&mut self, parent: NodeId, node: NodeId, at: Option<usize>) {
+        let order = self.next_order();
+        match self.nodes.get_mut(node) {
+            Some(nd) => {
+                nd.parent = Some(parent);
+                nd.order = order;
+                nd.flags |= NodeFlags::IN_TREE | NodeFlags::DIRTY_XFORM;
+            }
+            None => return,
+        }
+        if let Some(pd) = self.nodes.get_mut(parent) {
+            let len = pd.children.len();
+            let idx = match at {
+                Some(i) if i <= len => i,
+                _ => len,
+            };
+            pd.children.insert(idx, node);
+        }
+        self.sort_children(parent);
+        // 新挂载节点及其**整棵子树**的世界矩阵全部失效：它的父变了。
+        // （`attach` 也被 `keep_children` 的移除路径复用，因此这一条覆盖了
+        //  "删父保留子"时把孙节点提升到祖父下导致的世界矩阵变化。）
+        self.mark_subtree_transform_dirty(node);
+        self.mark_subtree_dirty_upwards(node);
+    }
+
+    fn detach_from_parent(&mut self, node: NodeId) {
+        let parent = self.nodes.get(node).and_then(|n| n.parent);
+        if let Some(p) = parent {
+            if let Some(pd) = self.nodes.get_mut(p) {
+                if let Some(pos) = pd.children.iter().position(|&c| c == node) {
+                    pd.children.remove(pos);
+                }
+            }
+            if let Some(nd) = self.nodes.get_mut(node) {
+                nd.parent = None;
+            }
+        }
+    }
+
+    /// 子列表按 `(order, slot)` 排序。`slot` 是兜底决断项，保证全序无并列。
+    fn sort_children(&mut self, parent: NodeId) {
+        let mut items: Vec<(u64, u32, NodeId)> = Vec::new();
+        if let Some(pd) = self.nodes.get(parent) {
+            for &c in &pd.children {
+                let key = self
+                    .nodes
+                    .get(c)
+                    .map(|n| (n.order, c.slot()))
+                    .unwrap_or((u64::MAX, c.slot()));
+                items.push((key.0, key.1, c));
+            }
+        }
+        items.sort_unstable();
+        if let Some(pd) = self.nodes.get_mut(parent) {
+            pd.children = items.into_iter().map(|(_, _, c)| c).collect();
+        }
+    }
+
+    /// 标记 `start` 的**全部祖先**为 `DIRTY_SUBTREE`：告诉它们"子树里有人要重算"。
+    ///
+    /// `start` 自身不在标记范围内 —— 它该不该重算由调用方决定
+    /// （`set_local` 会自己置 `DIRTY_XFORM`）。这条区分是剪枝能成立的关键。
+    fn mark_subtree_dirty_upwards(&mut self, start: NodeId) {
+        let mut cur = self.nodes.get(start).and_then(|n| n.parent);
+        while let Some(id) = cur {
+            match self.nodes.get_mut(id) {
+                Some(nd) => {
+                    nd.flags |= NodeFlags::DIRTY_SUBTREE;
+                    cur = nd.parent;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 把 `node` 及其整棵子树标为 `DIRTY_XFORM`。
+    /// 用于子树被挂到新父下：父变换变了，全部后代的世界矩阵都失效。
+    fn mark_subtree_transform_dirty(&mut self, node: NodeId) {
+        for n in self.subtree_preorder(node) {
+            if let Some(nd) = self.nodes.get_mut(n) {
+                nd.flags |= NodeFlags::DIRTY_XFORM;
+            }
+        }
+    }
+
+    /// 在 `parent` 下求一个不撞车的名字。
+    fn unique_name(&self, parent: NodeId, requested: &str, exclude: Option<NodeId>) -> String {
+        let taken = |candidate: &str, this: &Self| -> bool {
+            this.nodes
+                .get(parent)
+                .map(|p| {
+                    p.children.iter().any(|&c| {
+                        Some(c) != exclude
+                            && this.nodes.get(c).map(|n| n.name == candidate).unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if !taken(requested, self) {
+            return requested.to_string();
+        }
+        let mut i = 2u32;
+        loop {
+            let cand = format!("{}{}", requested, i);
+            if !taken(&cand, self) {
+                return cand;
+            }
+            i += 1;
+        }
+    }
+}
+
+impl Default for SceneTree {
+    fn default() -> Self {
+        Self::new("root")
+    }
+}

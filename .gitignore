@@ -1,0 +1,10 @@
+# 构建产物
+target/
+output/
+
+# wgpu-native 厂商包：运行时只动态加载 DLL，静态库/导入库不入库（各 37MB/0.2MB）
+wgpu-win/lib/*.a
+wgpu-win/lib/*.dll.a
+
+# 临时文件
+*.tmp

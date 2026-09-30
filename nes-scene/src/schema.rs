@@ -1,0 +1,470 @@
+//! 属性 schema：每个节点类型有哪些属性、什么类型、默认值、怎么编辑。
+//!
+//! 这是"属性反射"的权威描述，也是**唯一**一份属性默认值来源：
+//! [`crate::tree::NodeData`] 建节点时按它填默认值，序列化省略默认值时按它比对，
+//! 编辑器属性面板按它出控件，M5 脚本节点按它注册自定义属性。
+//!
+//! 继承是**聚合**而非覆盖：子类型的属性集 = 祖先属性（基类在前）+ 自身属性。
+//! 因此 `Sprite2D` 的 schema 里能同时看到 `visible`（来自 `Node`）与 `texture`
+//! （自身）。类型字段的继承关系仍由 [`NodeKindTag::chain`] 定义，schema 只是投影。
+
+use std::sync::OnceLock;
+
+use crate::node::NodeKindTag;
+use crate::props::{PropError, PropStore};
+use crate::transform::Vec2;
+use crate::value::{Value, ValueType};
+
+/// 编辑器提示。只影响属性面板怎么画控件，不影响语义与序列化。
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditorHint {
+    /// 无提示。
+    None,
+    /// 数值滑杆。
+    Number {
+        /// 下界（含）。
+        min: f32,
+        /// 上界（含）。
+        max: f32,
+        /// 步进。
+        step: f32,
+    },
+    /// 资源引用。`kind` 是资源类别（M3 接入注册表后用于过滤候选）。
+    Resource {
+        /// 资源类别。
+        kind: &'static str,
+    },
+    /// 多行文本。
+    Multiline,
+    /// 枚举取值。
+    Enum {
+        /// 允许的取值。
+        values: &'static [&'static str],
+    },
+}
+
+/// 单条属性描述。
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropDesc {
+    name: &'static str,
+    ty: ValueType,
+    default: Value,
+    hint: EditorHint,
+    doc: &'static str,
+}
+
+impl PropDesc {
+    /// 构造。`ty` 必须与 `default` 的变体一致 —— 由 [`NodeSchema::build`] 的
+    /// 自检断言保证，不一致会在首次取 schema 时直接 panic，而不是悄悄跑歪。
+    pub fn new(
+        name: &'static str,
+        ty: ValueType,
+        default: Value,
+        hint: EditorHint,
+        doc: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            ty,
+            default,
+            hint,
+            doc,
+        }
+    }
+
+    /// 属性名。
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// 声明类型。
+    pub fn ty(&self) -> ValueType {
+        self.ty
+    }
+
+    /// 默认值。
+    pub fn default_value(&self) -> &Value {
+        &self.default
+    }
+
+    /// 编辑器提示。
+    pub fn hint(&self) -> &EditorHint {
+        &self.hint
+    }
+
+    /// 文档串。
+    pub fn doc(&self) -> &'static str {
+        self.doc
+    }
+
+    /// 该值是否等于默认值（序列化省略默认值时用）。
+    pub fn is_default(&self, value: &Value) -> bool {
+        *value == self.default
+    }
+}
+
+/// 一个节点类型的完整属性集。
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeSchema {
+    tag: NodeKindTag,
+    chain: Vec<NodeKindTag>,
+    own: Vec<PropDesc>,
+    all: Vec<PropDesc>,
+}
+
+impl NodeSchema {
+    /// 取某类型的 schema。首次调用时构造并缓存全部 7 张表。
+    pub fn of(tag: NodeKindTag) -> &'static NodeSchema {
+        static CACHE: OnceLock<Vec<NodeSchema>> = OnceLock::new();
+        let tables = CACHE.get_or_init(|| {
+            NodeKindTag::ALL
+                .iter()
+                .map(|t| NodeSchema::build(*t))
+                .collect()
+        });
+        &tables[tag.index()]
+    }
+
+    /// 类型标签。
+    pub fn tag(&self) -> NodeKindTag {
+        self.tag
+    }
+
+    /// 继承链，**基类在前**（`Node, Node2D, Sprite2D`）。
+    pub fn chain(&self) -> &[NodeKindTag] {
+        &self.chain
+    }
+
+    /// 本类型自身的属性（不含继承）。
+    pub fn own_props(&self) -> &[PropDesc] {
+        &self.own
+    }
+
+    /// 完整属性集，继承的在先。
+    pub fn props(&self) -> &[PropDesc] {
+        &self.all
+    }
+
+    /// 属性个数。
+    pub fn len(&self) -> usize {
+        self.all.len()
+    }
+
+    /// 是否无属性。
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty()
+    }
+
+    /// 按名查属性描述。
+    pub fn prop(&self, name: &str) -> Option<&PropDesc> {
+        self.all.iter().find(|p| p.name == name)
+    }
+
+    /// 按名取默认值。
+    pub fn default_value(&self, name: &str) -> Option<&Value> {
+        self.prop(name).map(|p| p.default_value())
+    }
+
+    /// 生成一份填满默认值的属性存储。
+    pub fn default_store(&self) -> PropStore {
+        let mut s = PropStore::new();
+        for p in &self.all {
+            s.set(p.name, p.default.clone());
+        }
+        s
+    }
+
+    /// 校验并归一化一次写入。
+    ///
+    /// 1. 属性必须存在，否则 [`PropError::UnknownProp`]；
+    /// 2. 类型必须一致，或构成合法数值转换（见 [`Value::coerce_to`]），
+    ///    否则 [`PropError::TypeMismatch`]；
+    /// 3. 带 [`EditorHint::Number`] 的属性按上下界 **clamp**，而不是报错 ——
+    ///    脚本设超范围的缩放值应当被夹到边界，这是编辑器滑杆的同一语义。
+    pub fn validate(&self, name: &str, value: &Value) -> Result<Value, PropError> {
+        let desc = self
+            .prop(name)
+            .ok_or_else(|| PropError::UnknownProp(name.to_string()))?;
+        let coerced = value.coerce_to(desc.ty()).ok_or_else(|| PropError::TypeMismatch {
+            name: name.to_string(),
+            expected: desc.ty(),
+            got: value.type_of(),
+        })?;
+        Ok(clamp_to_hint(coerced, desc.hint()))
+    }
+
+    fn build(tag: NodeKindTag) -> NodeSchema {
+        let mut chain = tag.chain();
+        chain.reverse();
+        let own = own_props(tag);
+        let mut all = Vec::new();
+        for t in &chain {
+            all.extend(own_props(*t));
+        }
+        debug_assert!(all
+            .iter()
+            .all(|p| p.ty() == p.default_value().type_of()));
+        NodeSchema {
+            tag,
+            chain,
+            own,
+            all,
+        }
+    }
+}
+
+fn clamp_to_hint(value: Value, hint: &EditorHint) -> Value {
+    let (min, max) = match hint {
+        EditorHint::Number { min, max, .. } => (*min, *max),
+        _ => return value,
+    };
+    match value {
+        Value::F32(f) => {
+            if f.is_nan() {
+                Value::F32(f)
+            } else {
+                Value::F32(f.clamp(min, max))
+            }
+        }
+        Value::I64(i) => Value::I64((i as f64).clamp(min as f64, max as f64) as i64),
+        other => other,
+    }
+}
+
+/// 每个类型自身的属性表。命名顺序即编辑器显示顺序。
+fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
+    use EditorHint as H;
+    match tag {
+        NodeKindTag::Node => vec![PropDesc::new(
+            "visible",
+            ValueType::Bool,
+            Value::Bool(true),
+            H::None,
+            "是否参与显示与处理。隐藏节点仍参与变换与脚本逻辑。",
+        )],
+        NodeKindTag::Node2D => vec![PropDesc::new(
+            "z_index",
+            ValueType::I64,
+            Value::I64(0),
+            H::Number {
+                min: -4096.0,
+                max: 4096.0,
+                step: 1.0,
+            },
+            "绘制层级。同层内越大越靠前。",
+        )],
+        NodeKindTag::Sprite2D => vec![
+            PropDesc::new(
+                "texture",
+                ValueType::Resource,
+                Value::Resource(0),
+                H::Resource { kind: "texture" },
+                "纹理资源键。0 表示未绑定。",
+            ),
+            PropDesc::new(
+                "flip_h",
+                ValueType::Bool,
+                Value::Bool(false),
+                H::None,
+                "水平翻转。",
+            ),
+            PropDesc::new(
+                "flip_v",
+                ValueType::Bool,
+                Value::Bool(false),
+                H::None,
+                "垂直翻转。",
+            ),
+        ],
+        NodeKindTag::Camera2D => vec![
+            PropDesc::new(
+                "zoom",
+                ValueType::F32,
+                Value::F32(1.0),
+                H::Number {
+                    min: 0.05,
+                    max: 16.0,
+                    step: 0.05,
+                },
+                "缩放倍数。越大画面越近。",
+            ),
+            PropDesc::new(
+                "active",
+                ValueType::Bool,
+                Value::Bool(true),
+                H::None,
+                "是否为当前生效的相机。",
+            ),
+        ],
+        NodeKindTag::Control => vec![
+            PropDesc::new(
+                "anchor",
+                ValueType::Vec2,
+                Value::Vec2(Vec2::ZERO),
+                H::None,
+                "归一化锚点（0..1）。",
+            ),
+            PropDesc::new(
+                "offset",
+                ValueType::Vec2,
+                Value::Vec2(Vec2::ZERO),
+                H::None,
+                "相对锚点的像素偏移。",
+            ),
+            PropDesc::new(
+                "size",
+                ValueType::Vec2,
+                Value::Vec2(Vec2::new(100.0, 100.0)),
+                H::None,
+                "控件尺寸（像素）。",
+            ),
+        ],
+        NodeKindTag::Label => vec![
+            PropDesc::new(
+                "text",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::Multiline,
+                "显示文本。",
+            ),
+            PropDesc::new(
+                "font_size",
+                ValueType::I64,
+                Value::I64(16),
+                H::Number {
+                    min: 8.0,
+                    max: 128.0,
+                    step: 1.0,
+                },
+                "字号（像素）。",
+            ),
+        ],
+        NodeKindTag::Script => vec![
+            PropDesc::new(
+                "registry_key",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::None,
+                "脚本注册表键。空串表示未绑定；这是 M5 兼容层的唯一挂载点。",
+            ),
+            PropDesc::new(
+                "enabled",
+                ValueType::Bool,
+                Value::Bool(true),
+                H::None,
+                "是否参与脚本调度。",
+            ),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inheritance_aggregates_base_first() {
+        let s = NodeSchema::of(NodeKindTag::Sprite2D);
+        assert_eq!(
+            s.chain(),
+            &[
+                NodeKindTag::Node,
+                NodeKindTag::Node2D,
+                NodeKindTag::Sprite2D
+            ]
+        );
+        let names: Vec<&str> = s.props().iter().map(|p| p.name()).collect();
+        assert_eq!(names, vec!["visible", "z_index", "texture", "flip_h", "flip_v"]);
+        assert_eq!(s.len(), 5);
+    }
+
+    #[test]
+    fn own_props_hold_only_own_members() {
+        let s = NodeSchema::of(NodeKindTag::Node2D);
+        assert_eq!(s.own_props().len(), 1);
+        assert_eq!(s.own_props()[0].name(), "z_index");
+        assert_eq!(NodeSchema::of(NodeKindTag::Node).own_props().len(), 1);
+    }
+
+    #[test]
+    fn every_tag_has_a_schema_with_consistent_types() {
+        for tag in NodeKindTag::ALL {
+            let s = NodeSchema::of(tag);
+            assert_eq!(s.tag(), tag);
+            assert!(!s.is_empty(), "{tag:?} 应当至少继承到 visible");
+            for p in s.props() {
+                assert_eq!(p.ty(), p.default_value().type_of(), "{:?}", p.name());
+            }
+        }
+    }
+
+    #[test]
+    fn default_store_is_filled_from_schema() {
+        let s = NodeSchema::of(NodeKindTag::Camera2D);
+        let store = s.default_store();
+        // visible（Node）+ z_index（Node2D）+ zoom / active（Camera2D）
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.get("visible"), Some(&Value::Bool(true)));
+        assert_eq!(store.get("zoom"), Some(&Value::F32(1.0)));
+        assert_eq!(store.get("active"), Some(&Value::Bool(true)));
+        assert_eq!(store.get("nope"), None);
+
+        // 默认表必须与 schema 声明的默认值逐项一致（否则实例化出来的树
+        // 会与"新建节点"的树不一致，序列化快照对不上）。
+        for (name, value) in store.iter() {
+            assert_eq!(s.default_value(name), Some(value), "{name}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_and_mismatched() {
+        let s = NodeSchema::of(NodeKindTag::Node2D);
+        assert_eq!(
+            s.validate("nope", &Value::I64(1)),
+            Err(PropError::UnknownProp("nope".into()))
+        );
+        assert_eq!(
+            s.validate("visible", &Value::str("yes")),
+            Err(PropError::TypeMismatch {
+                name: "visible".into(),
+                expected: ValueType::Bool,
+                got: ValueType::Str,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_coerces_and_clamps() {
+        let n2d = NodeSchema::of(NodeKindTag::Node2D);
+        assert_eq!(n2d.validate("z_index", &Value::F32(3.0)), Ok(Value::I64(3)));
+        // clamp 而不是报错
+        assert_eq!(n2d.validate("z_index", &Value::I64(99999)), Ok(Value::I64(4096)));
+        let cam = NodeSchema::of(NodeKindTag::Camera2D);
+        assert_eq!(cam.validate("zoom", &Value::F32(100.0)), Ok(Value::F32(16.0)));
+        assert_eq!(cam.validate("zoom", &Value::F32(1.5)), Ok(Value::F32(1.5)));
+        assert_eq!(
+            cam.validate("zoom", &Value::I64(2)),
+            Ok(Value::F32(2.0))
+        );
+    }
+
+    #[test]
+    fn is_default_compares_against_declared_default() {
+        let p = NodeSchema::of(NodeKindTag::Node)
+            .prop("visible")
+            .expect("visible 应当存在");
+        assert!(p.is_default(&Value::Bool(true)));
+        assert!(!p.is_default(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn numeric_hint_bounds_are_sane() {
+        let s = NodeSchema::of(NodeKindTag::Label);
+        match s.prop("font_size").map(|p| p.hint()) {
+            Some(EditorHint::Number { min, max, step }) => {
+                assert!(*min < *max && *step > 0.0);
+            }
+            other => panic!("font_size 应当带数值提示，实际 {other:?}"),
+        }
+    }
+}
