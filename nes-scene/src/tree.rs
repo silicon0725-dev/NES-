@@ -290,6 +290,23 @@ pub enum TreeEvent {
     },
 }
 
+impl TreeEvent {
+    /// 桥信号的稳定名（`tree/*`，S6.15：TreeEvent 是 SignalBus 的上游 ——
+    /// 草案 TreeEvent 文档"用于日志、编辑器刷新、以及将来 SignalBus 的上游"）。
+    /// **不得**随重构改名。
+    pub const fn signal_name(&self) -> &'static str {
+        match self {
+            Self::Added { .. } => "tree/added",
+            Self::Removed { .. } => "tree/removed",
+            Self::Reparented { .. } => "tree/reparented",
+            Self::Renamed { .. } => "tree/renamed",
+            Self::Moved { .. } => "tree/moved",
+            Self::NameAdjusted { .. } => "tree/name_adjusted",
+            Self::Rejected { .. } => "tree/rejected",
+        }
+    }
+}
+
 /// 行为代码发起的命令。
 ///
 /// 这是 [`NodeCtx`] 唯一能产生副作用的出口。分成三类：结构变更、属性写入、衍生。
@@ -459,6 +476,7 @@ impl<'a> NodeCtx<'a> {
             src: Some(self.this),
             name: name.to_string(),
             payload,
+            event: None,
         });
     }
 }
@@ -488,12 +506,15 @@ pub trait SceneObserver {
 /// 禁止 emit 中同步递归 —— 泵以工作队列迭代级联（带上限），不违反。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Signal {
-    /// 发射源节点（`NodeCtx::emit` 自动填当前节点）。
+    /// 发射源节点（`NodeCtx::emit` 自动填当前节点；桥信号与宿主预发为 `None`）。
     pub src: Option<NodeId>,
-    /// 信号名（接收方按名过滤）。
+    /// 信号名（接收方按名过滤；桥信号用 `tree/*` 稳定名）。
     pub name: String,
-    /// 载荷。
+    /// 载荷（用户信号；桥信号为 `Bool(true)` 占位，事实在 `event`）。
     pub payload: Value,
+    /// 结构事件原文（**仅 `tree/*` 桥信号**非空 —— NodeId 无法编进 `Value`，
+    /// 硬编码槽位/代际是身份谎言；用户信号恒 `None`）。
+    pub event: Option<TreeEvent>,
 }
 
 /// 信号处理器看到的句柄：**只读树 + 命令缓冲 + 再发射**（与 [`NodeCtx`]
@@ -516,6 +537,7 @@ impl<'a> SignalCtx<'a> {
             src: None,
             name: name.to_string(),
             payload,
+            event: None,
         });
     }
 
@@ -779,6 +801,7 @@ impl SceneTree {
             src: None,
             name: name.to_string(),
             payload,
+            event: None,
         });
     }
 
@@ -1196,11 +1219,20 @@ impl SceneTree {
         // 本帧各回调阶段发射的信号（帧末泵统一交付）。
         let mut emitted: Vec<Signal> = Vec::new();
 
-        // 1. 结构变更落地
+        // 1. 结构变更落地 + 信号桥（S6.15）
         let events = self.apply_pending();
         stats.events = events.len();
         for ev in &events {
             obs.on_tree_event(&*self, ev);
+            // 双通道不互斥：`on_tree_event` 即时回调照旧；同一事件以
+            // `tree/*` 桥信号入泵（帧末交付，携带事件原文）。桥信号在泵序
+            // 最前（结构落地是帧内最早阶段），src = None（引擎源）。
+            emitted.push(Signal {
+                src: None,
+                name: ev.signal_name().to_string(),
+                payload: Value::Bool(true),
+                event: Some(ev.clone()),
+            });
         }
 
         // 2. enter_tree（自顶向下）

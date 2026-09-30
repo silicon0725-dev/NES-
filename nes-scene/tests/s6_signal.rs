@@ -190,3 +190,126 @@ fn t_sig_05_host_preemit_delivered_once() {
     let stats2 = t.tick(0.016, &mut quiet2);
     assert_eq!(stats2.signals_delivered, 0, "不重投");
 }
+
+// ---------------------------------------------------------------- 信号桥
+// S6.15：TreeEvent -> `tree/*` 桥信号（草案 TreeEvent 文档"SignalBus 的上游"）。
+
+/// 收集桥信号（名字 + 事件原文）。
+#[derive(Default)]
+struct BridgeSpy {
+    tree_events: usize,
+    signals: Vec<(String, Option<nes_scene::TreeEvent>)>,
+}
+
+impl SceneObserver for BridgeSpy {
+    fn on_tree_event(&mut self, _tree: &SceneTree, _ev: &nes_scene::TreeEvent) {
+        self.tree_events += 1;
+    }
+    fn on_signal(&mut self, _ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        self.signals.push((sig.name.clone(), sig.event.clone()));
+    }
+}
+
+/// T-Sig-06：桥交付 —— tick 前挂起的结构变更在阶段 1 落地，`on_tree_event`
+/// 即时回调与 `tree/added` 桥信号**双通道同时**送达；信号携带事件原文，
+/// src = None（引擎源）。
+#[test]
+fn t_sig_06_bridge_delivers_event_verbatim() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D); // 挂起，未落地
+    let mut spy = BridgeSpy::default();
+    let stats = t.tick(0.016, &mut spy);
+
+    assert_eq!(spy.tree_events, 1, "on_tree_event 照旧");
+    assert_eq!(spy.signals.len(), 1, "桥信号帧末交付");
+    let (name, event) = &spy.signals[0];
+    assert_eq!(name, "tree/added");
+    assert_eq!(
+        event.as_ref(),
+        Some(&nes_scene::TreeEvent::Added {
+            node: a,
+            parent: t.root(),
+        }),
+        "事件原文随行"
+    );
+    assert_eq!(stats.signals_delivered, 1);
+}
+
+/// T-Sig-07：全变体映射 + 顺序 —— 一批挂起操作（重名自动调整 + 换位），
+/// 桥信号按事件序、名字与 `signal_name` 一一对应。
+#[test]
+fn t_sig_07_bridge_covers_all_variants_in_order() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "a", NodeKind::Node2D); // 重名 -> NameAdjusted
+    t.apply_pending(); // 先落地一批（a, a2）
+
+    // 下一批：重命名 + 换位（挂起，等 tick 落地）。
+    t.queue(nes_scene::TreeOp::Rename { node: a, name: "hero".to_string() });
+    t.queue(nes_scene::TreeOp::Move { node: b, new_index: 0 });
+    let mut spy = BridgeSpy::default();
+    let stats = t.tick(0.016, &mut spy);
+
+    let names: Vec<&str> = spy.signals.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["tree/renamed", "tree/moved"],
+        "桥信号按事件序，名字一一映射：{names:?}"
+    );
+    // 事件原文可判别（改名含新旧名；换位含下标）。
+    assert!(matches!(
+        &spy.signals[0].1,
+        Some(nes_scene::TreeEvent::Renamed { node, old, new, .. })
+            if *node == a && old == "a" && new == "hero"
+    ));
+    assert!(matches!(
+        &spy.signals[1].1,
+        Some(nes_scene::TreeEvent::Moved { from: 1, to: 0, .. })
+    ));
+    assert_eq!(stats.events, 2);
+    assert_eq!(stats.signals_delivered, 2);
+}
+
+/// 信号处理器做结构变更 -> 下帧桥信号回流（跨帧链路闭环）。
+#[derive(Default)]
+struct StructuringSpy {
+    names: Vec<String>,
+    armed: bool,
+}
+
+impl SceneObserver for StructuringSpy {
+    fn on_signal(&mut self, ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        self.names.push(sig.name.clone());
+        if sig.name == "tree/added" && !self.armed {
+            self.armed = true;
+            // 借事件原文拿节点，对它排队一次改名（延迟落地）。
+            if let Some(nes_scene::TreeEvent::Added { node, .. }) = &sig.event {
+                let node = *node;
+                ctx.queue(nes_scene::TreeOp::Rename { node, name: "renamed".to_string() });
+            }
+        }
+    }
+}
+
+/// T-Sig-08：处理器响应桥信号再改结构 -> 命令延迟到下一帧落地 -> 该帧
+/// 桥又发出 `tree/renamed` —— 事件驱动的结构变更跨帧闭环，且不构成
+/// runaway（每帧至多一条新事件）。
+#[test]
+fn t_sig_08_handler_struct_change_reflows_next_frame() {
+    let mut t = SceneTree::new("root");
+    let _a = t.add_node(t.root(), "a", NodeKind::Node2D); // 挂起
+
+    let mut spy = StructuringSpy::default();
+    let stats1 = t.tick(0.016, &mut spy); // 帧 1：added 落地 -> 桥 -> 处理器排 Rename
+    assert_eq!(spy.names, vec!["tree/added"]);
+    assert_eq!(stats1.signals_delivered, 1);
+
+    let stats2 = t.tick(0.016, &mut spy); // 帧 2：Rename 落地 -> tree/renamed 桥
+    assert_eq!(spy.names, vec!["tree/added", "tree/renamed"], "跨帧回流闭环");
+    assert_eq!(stats2.signals_delivered, 1);
+    assert_eq!(stats2.events, 1);
+    assert!(t.find_by_name("renamed").is_some(), "改名已生效");
+
+    let stats3 = t.tick(0.016, &mut spy); // 帧 3：无新事件，无新信号
+    assert_eq!(stats3.signals_delivered, 0, "不 runaway");
+}

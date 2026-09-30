@@ -91,7 +91,7 @@ nes-runtime 零改动（`frame_with` 透传观察者，信号随 tick 自动流�
 |---|---|
 | 订阅册 `connect/disconnect`（节点-方法级，随脚本 VM） | 未启动（§1.1 分歧表） |
 | 节点销毁时信号源的可追溯清理（无连接表则无需清理；src 失效仅指无效 id，交付侧已只读） | 消解 |
-| TreeEvent -> 信号桥（`tree/added` 等自动入管道） | 未启动（观察者已有 `on_tree_event`） |
+| TreeEvent -> 信号桥（`tree/*` 自动入管道） | ✅ S6.15（见 `NES2.0_S6信号桥_v1.md`） |
 | 编辑器信号监视器（`pending_signals`/统计面板） | 未启动 |
 | WM_SIZE / DPI / headless Linux | 沿各文档遗留表 |
 

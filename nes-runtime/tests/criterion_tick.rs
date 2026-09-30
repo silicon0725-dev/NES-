@@ -293,7 +293,12 @@ fn t_tick_05_signal_moves_sprite_same_frame() {
         handled: Vec::new(),
     };
     let outcome = rt.frame_with(&frame(0), &mut mover).expect("首帧");
-    assert_eq!(mover.handled, vec!["go"], "信号同帧交付");
+    // 首帧泵序：桥信号在前（装配的节点首帧落地 -> tree/added x2），用户信号在后。
+    assert_eq!(
+        mover.handled,
+        vec!["tree/added", "tree/added", "go"],
+        "桥在前、用户信号同帧交付"
+    );
     assert_eq!(outcome.stats.drawn, 1);
     // 精灵 (10,10) -> (26,10)：信号触发的移动当帧入画。
     assert_eq!(outcome.image.pixel(28, 12), Some(V1[0]), "同帧新位置");
