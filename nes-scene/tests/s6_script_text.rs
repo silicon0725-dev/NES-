@@ -1160,3 +1160,91 @@ fn t_cmp_29_incdec() {
     let s2 = compile_script("on \"x\" { i += 1 }").unwrap();
     assert_eq!(s1.ops, s2.ops, "i++ === i += 1（脱糖同构）");
 }
+
+// ---------------------------------------------------------------- S6.30
+// 字符串比较（码点字典序，六比较族全通）/ 长度 len（Unicode 标量）/
+// 索引 s[i]（单字符 Str，按字符；越界/负/非 Str 诚实停机）。
+
+/// T-Cmp-30：三族 + 组合实用例。
+#[test]
+fn t_cmp_30_string_ops() {
+    // ① 比较族（Eq 已有；Lt 扩 Str 后 > <= >= 组合全通）。
+    let l = run_locals(
+        "every {
+            a = \"abc\" == \"abc\"
+            b = \"abc\" != \"abd\"
+            c = \"abc\" < \"abd\"
+            d = \"b\" > \"abc\"
+            e = \"abc\" <= \"abc\"
+            f = \"abd\" >= \"abc\"
+            g = \"Z\" < \"a\"
+        }",
+    );
+    assert_eq!(l.get("a"), Some(&Value::Bool(true)), "相等");
+    assert_eq!(l.get("b"), Some(&Value::Bool(true)), "不等");
+    assert_eq!(l.get("c"), Some(&Value::Bool(true)), "字典序 abc<abd");
+    assert_eq!(l.get("d"), Some(&Value::Bool(true)), "前缀短者小：b>abc");
+    assert_eq!(l.get("e"), Some(&Value::Bool(true)), "闭区间组合 <=");
+    assert_eq!(l.get("f"), Some(&Value::Bool(true)), "闭区间组合 >=");
+    assert_eq!(l.get("g"), Some(&Value::Bool(true)), "码点序：Z(90)<a(97)");
+
+    // ② 长度：Unicode 标量数（中文 2、emoji 1），拼接后长度。
+    let l2 = run_locals(
+        "every {
+            a = len(\"hello\")
+            b = len(\"\")
+            c = len(\"你好\")
+            d = len(\"hi\" + \"!\")
+        }",
+    );
+    assert_eq!(l2.get("a"), Some(&Value::I64(5)), "hello=5");
+    assert_eq!(l2.get("b"), Some(&Value::I64(0)), "空串=0");
+    assert_eq!(l2.get("c"), Some(&Value::I64(2)), "你好=2（chars 非字节 6）");
+    assert_eq!(l2.get("d"), Some(&Value::I64(3)), "拼接后长度");
+
+    // ③ 索引：单字符 Str、中文按字符、边界。
+    let l3 = run_locals(
+        "every {
+            h = \"hello\"[0]
+            o = \"hello\"[4]
+            c = \"你好\"[1]
+            n = 0
+            n = len(\"banana\")
+            last = \"banana\"[5]
+        }",
+    );
+    assert_eq!(l3.get("h"), Some(&Value::Str("h".into())), "[0]");
+    assert_eq!(l3.get("o"), Some(&Value::Str("o".into())), "[4]（末字符）");
+    assert_eq!(l3.get("c"), Some(&Value::Str("好".into())), "中文按字符索引");
+    assert_eq!(l3.get("last"), Some(&Value::Str("a".into())), "len-1 边界");
+
+    // ④ 停机三例：越界（附下标与长度）、负下标、非 Str 索引。
+    let l4 = run_locals("every { x = \"abc\"[3] }");
+    assert!(
+        matches!(l4.get(HALT_LOCAL), Some(Value::Str(s)) if s.contains("索引越界 3（长度 3）")),
+        "越界指名：{:?}",
+        l4.get(HALT_LOCAL)
+    );
+    let l5 = run_locals("every { x = \"abc\"[-1] }");
+    assert!(
+        matches!(l5.get(HALT_LOCAL), Some(Value::Str(s)) if s.contains("索引越界 -1")),
+        "负下标：{:?}",
+        l5.get(HALT_LOCAL)
+    );
+    let l6 = run_locals("every { x = 5[0] }");
+    assert_eq!(l6.get(HALT_LOCAL), Some(&Value::Str("索引需要 Str".into())), "非 Str 索引");
+
+    // ⑤ 组合实用例：循环 + 索引统计某字符出现次数（banana 中 a=3）。
+    let l7 = run_locals(
+        "every {
+            s = \"banana\"
+            hits = 0
+            for i in 0..len(s) {
+                if s[i] == \"a\" {
+                    hits++
+                }
+            }
+        }",
+    );
+    assert_eq!(l7.get("hits"), Some(&Value::I64(3)), "banana 中 a 出现 3 次（索引+比较+len 组合）");
+}

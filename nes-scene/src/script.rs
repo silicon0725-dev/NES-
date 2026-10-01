@@ -101,6 +101,11 @@ pub enum Op {
     BitXor,
     Shl,
     Shr,
+    /// 弹 Str，压长度（**Unicode 标量数**，非字节 —— `"你好"` 是 2）。
+    StrLen,
+    /// 弹下标（I64）、弹 Str，压**单字符 Str**（无 char 类型，一字符串即
+    /// 字符的表达）。按字符索引；负数或 >= 长度停机记 `__halt`（附下标）。
+    StrIndex,
 }
 
 /// 脚本入口。
@@ -329,9 +334,13 @@ fn run<'a, 'b>(
             Op::Lt => {
                 let b = pop_val!();
                 let a = pop_val!();
-                stack.push(StackVal::V(match (num_of(&a), num_of(&b)) {
-                    (Some(x), Some(y)) => Value::Bool(x < y),
-                    _ => halt!("Lt 类型不符"),
+                stack.push(StackVal::V(match (a, b) {
+                    // 字符串按码点字典序（S6.30）—— Rust String Ord 即此序。
+                    (Value::Str(x), Value::Str(y)) => Value::Bool(x < y),
+                    (a, b) => match (num_of(&a), num_of(&b)) {
+                        (Some(x), Some(y)) => Value::Bool(x < y),
+                        _ => halt!("Lt 类型不符"),
+                    },
                 }));
             }
             Op::Eq => {
@@ -423,6 +432,29 @@ fn run<'a, 'b>(
                     _ => x.wrapping_shr(y as u32),
                 };
                 stack.push(StackVal::V(Value::I64(v)));
+            }
+            Op::StrLen => {
+                let a = pop_val!();
+                let Value::Str(s) = a else {
+                    halt!("len 需要 Str");
+                };
+                stack.push(StackVal::V(Value::I64(s.chars().count() as i64)));
+            }
+            Op::StrIndex => {
+                let idx = pop_val!();
+                let a = pop_val!();
+                let Value::Str(s) = a else {
+                    halt!("索引需要 Str");
+                };
+                let Value::I64(i) = idx else {
+                    halt!("下标需要 I64");
+                };
+                // 负数或 >= 长度：停机附下标（诚实指名，不回绕不编空）。
+                if i < 0 || i >= s.chars().count() as i64 {
+                    halt!(format!("索引越界 {i}（长度 {}）", s.chars().count()));
+                }
+                let ch = s.chars().nth(i as usize).expect("已校验范围");
+                stack.push(StackVal::V(Value::Str(ch.to_string())));
             }
         }
         pc += 1;
@@ -798,8 +830,8 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 i += 2;
                 col += 2;
             }
-            '{' | '}' | '(' | ')' | ',' | '.' | ':' | '=' | '+' | '-' | '*' | '<' | '>' | '!'
-                | ';' | '&' | '|' | '^' | '%' | '/' => {
+            '{' | '}' | '(' | ')' | '[' | ']' | ',' | '.' | ':' | '=' | '+' | '-' | '*' | '<'
+                | '>' | '!' | ';' | '&' | '|' | '^' | '%' | '/' => {
                 out.push(Spanned {
                     tok: Tok::Sym(c),
                     line,
@@ -1666,7 +1698,22 @@ impl TextParser {
         }
     }
 
+    /// primary := unary（负号/非）→ 基元 → 后缀索引 `s[i]`*（S6.30）。
+    /// 索引比一元绑定更紧（C 序：`-s[0]` 是 `-(s[0])`）—— 后缀环在基元
+    /// 产出后立即应用。
     fn primary(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.unary(ops)?;
+        // 后缀索引环：`expr [ expr ]` -> StrIndex（仅 Str 运行时校验）。
+        while matches!(self.peek().tok, Tok::Sym('[')) {
+            self.pos += 1;
+            self.expr(ops)?; // 下标（完整表达式级）
+            self.expect_sym(']')?;
+            ops.push(Op::StrIndex);
+        }
+        Ok(())
+    }
+
+    fn unary(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
         // 一元负号（最小集）：`-x` -> `0 - x`（先垫 0 再解析操作数，Sub 弹序恰好）。
         if matches!(self.peek().tok, Tok::Sym('-')) {
             self.pos += 1;
@@ -1681,6 +1728,17 @@ impl TextParser {
             self.primary(ops)?;
             ops.push(Op::Not);
             return Ok(());
+        }
+        // 内建调用（S6.30）：`ident (` —— 目前仅 `len`。后随括号消歧，
+        // 不占保留字（局部名 `len` 不带括号照常是局部）。未知内建如实报错。
+        if let Tok::Ident(name) = self.peek().tok.clone() {
+            if name == "len" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // len (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::StrLen);
+                return Ok(());
+            }
         }
         let sp = self.peek().clone();
         match self.next().tok.clone() {
