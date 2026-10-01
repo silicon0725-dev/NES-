@@ -31,7 +31,13 @@ const WM_CHAR: u32 = 0x0102;
 /// **单窗口口径**：本引擎的帧循环一次驱动一个窗口，队列不区分来源
 /// （多窗口同时泵会串键 —— 编辑器面板是首个消费者，多窗口输入属后续）。
 /// [`inject_char`] 是同队列的程序化入口（自动化测试 / 辅助技术路径）。
+///
+/// **容量上限**（收束阶段）：宿主不排空时队列也不无界增长 —— 满时
+/// 丢弃新字符（键盘语义：按住不放也只排这么多）。
 static TYPED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// 队列容量上限（字符数）。
+const TYPED_CAP: usize = 4096;
 
 /// 取走全部已入队的字符（按到达序）。
 pub fn drain_chars() -> Vec<u32> {
@@ -40,11 +46,12 @@ pub fn drain_chars() -> Vec<u32> {
 }
 
 /// 程序化注入一个字符（与真实按键同队列；自动化测试与示例演示用）。
+/// 队列满时丢弃（见 [`TYPED_CAP`]）。
 pub fn inject_char(code: u32) {
-    TYPED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(code);
+    let mut guard = TYPED.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.len() < TYPED_CAP {
+        guard.push(code);
+    }
 }
 
 #[repr(C)]
@@ -136,7 +143,8 @@ unsafe extern "system" fn wnd_proc(
     if msg == WM_CHAR {
         // 键盘字符入队（回车 \r、退格 \x08 也在其中 —— 面板的编辑语义
         // 由宿主解释，窗口层只投递事实）。wparam 是字符码（UTF-16 单元）。
-        TYPED.lock().unwrap_or_else(|p| p.into_inner()).push(wparam as u32);
+        // 经 inject_char 入队：与程序化注入共用同一容量上限。
+        inject_char(wparam as u32);
         return 0;
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

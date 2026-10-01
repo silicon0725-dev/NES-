@@ -666,17 +666,39 @@ impl ScriptVm {
         }
     }
 
-    /// 批量装载：遍历树中全部 `Script` 节点，返回（节点, 缺口）清单 ——
-    /// 一个坏键不挡其他节点（部分成功如实上报）。
+    /// 死节点清理（内存卫生口径）：五张节点登记表按 arena 存活裁剪。
     ///
-    /// 前置**死节点清理**（S6.32）：树被整体替换后（如
-    /// `NesRuntime::poll_scene_reload`），VM 里旧 NodeId 的状态/戳/连接
-    /// 登记残留 —— arena 查无即移除（内存卫生 + 防陈旧戳误判）。
-    pub fn attach_all(&mut self, tree: &mut SceneTree) -> Vec<(NodeId, String)> {
+    /// S6.32 引入（attach_all 前置），收束阶段统一：S6.33 新增的
+    /// `file_stamp` 当时漏进清理表、`attach_all_with_sources` 整个入口
+    /// 没有清理 —— 五个装载/轮询入口现在都走这里。NodeId 带代号
+    /// （slot+gen），陈旧键即使残留也不会误交付；清理是卫生措施 +
+    /// 防陈旧戳误判，不是正确性防线。
+    fn prune_dead(&mut self, tree: &SceneTree) {
         self.states.borrow_mut().retain(|n, _| tree.contains(*n));
         self.process_scripts.retain(|(n, _)| tree.contains(*n));
         self.inline_stamp.retain(|n, _| tree.contains(*n));
+        self.file_stamp.retain(|n, _| tree.contains(*n));
         self.node_conn.retain(|n, _| tree.contains(*n));
+    }
+
+    /// VM 登记的节点数（五表取最大 —— 观测内存卫生的口径；正常时
+    /// 五表同键集）。测试与诊断用：树整体替换 + 重装载后应归零。
+    pub fn tracked_nodes(&self) -> usize {
+        self.states
+            .borrow()
+            .len()
+            .max(self.process_scripts.len())
+            .max(self.inline_stamp.len())
+            .max(self.file_stamp.len())
+            .max(self.node_conn.len())
+    }
+
+    /// 批量装载：遍历树中全部 `Script` 节点，返回（节点, 缺口）清单 ——
+    /// 一个坏键不挡其他节点（部分成功如实上报）。
+    ///
+    /// 前置死节点清理见 [`Self::prune_dead`]。
+    pub fn attach_all(&mut self, tree: &mut SceneTree) -> Vec<(NodeId, String)> {
+        self.prune_dead(tree);
         let nodes: Vec<NodeId> = tree
             .preorder()
             .into_iter()
@@ -705,6 +727,7 @@ impl ScriptVm {
         &mut self,
         tree: &mut SceneTree,
     ) -> (Vec<NodeId>, Vec<(NodeId, String)>) {
+        self.prune_dead(tree);
         let mut reloaded = Vec::new();
         let mut failed = Vec::new();
         let nodes: Vec<NodeId> = tree
@@ -740,6 +763,8 @@ impl ScriptVm {
         table: &crate::resources::ResourceTable,
         read: &mut dyn FnMut(&str) -> Result<String, String>,
     ) -> Vec<(NodeId, String)> {
+        // 前置死节点清理（与其余装载/轮询入口统一，见 prune_dead）。
+        self.prune_dead(tree);
         // 外置节点先解析（读文件 + 编译），再统一走 attach。
         let nodes: Vec<NodeId> = tree
             .preorder()
@@ -782,12 +807,8 @@ impl ScriptVm {
         table: &crate::resources::ResourceTable,
         read: &mut dyn FnMut(&str) -> Result<String, String>,
     ) -> (Vec<NodeId>, Vec<(NodeId, String)>) {
-        // 先清死节点（树整体替换后的残留）。
-        self.states.borrow_mut().retain(|n, _| tree.contains(*n));
-        self.process_scripts.retain(|(n, _)| tree.contains(*n));
-        self.inline_stamp.retain(|n, _| tree.contains(*n));
-        self.file_stamp.retain(|n, _| tree.contains(*n));
-        self.node_conn.retain(|n, _| tree.contains(*n));
+        // 先清死节点（树整体替换后的残留，五表统一见 prune_dead）。
+        self.prune_dead(tree);
         let mut reloaded = Vec::new();
         let mut failed = Vec::new();
         let nodes: Vec<NodeId> = tree

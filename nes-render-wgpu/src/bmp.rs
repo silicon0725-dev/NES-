@@ -45,8 +45,16 @@ pub fn load_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), BackendError> {
         24 => 3,
         other => return Err(invalid(&format!("位深 {other} 不支持（仅 24/32bpp）"))),
     };
+    // 尺寸算术用 checked（收束阶段）：恶构头（w/h 近 i32 上限）会让
+    // 乘加在 debug 下溢出 panic、release 下回绕 —— 先算出可寻址总量，
+    // 溢出即按不合法头报错，再与实际长度比对（分配因此也受文件长度约束）。
     let row = (w as usize * bytes_per_px).div_ceil(4) * 4; // 行按 4 字节对齐补齐
-    let expected = data_off + row * h as usize;
+    let pixels = row
+        .checked_mul(h as usize)
+        .ok_or_else(|| invalid("像素总量超出可寻址范围（头尺寸字段非法）"))?;
+    let expected = data_off
+        .checked_add(pixels)
+        .ok_or_else(|| invalid("数据偏移 + 像素总量溢出（头尺寸字段非法）"))?;
     if bytes.len() < expected {
         return Err(invalid(&format!(
             "像素数据截断：需要 {expected} 字节，实际 {}",
@@ -54,7 +62,9 @@ pub fn load_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), BackendError> {
         )));
     }
 
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    // 容量按 usize 算（w*h*4 在 u32 域会回绕 —— 大图合法文件也中招）；
+    // 此时 expected <= len 已成立，分配受文件长度约束。
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
     for y in (0..h).rev() {
         // 自底向上：文件里第 0 行是图像最后一行。
         let start = data_off + y as usize * row;

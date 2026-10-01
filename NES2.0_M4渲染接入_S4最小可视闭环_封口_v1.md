@@ -333,6 +333,19 @@ cargo run --example s41_visual_closure
 > 默认字体须宿主登记（无字体 Label 回落图集格）。场景/提取/渲染语义
 > 零改动（文档见 `NES2.0_S6编辑器脚本面板_v1.md`）；新增 T-In-01 与
 > T-Panel-R1，wgpu 升至 84、runtime 至 31（全仓合计 396）。
+> **v1.42 注记（S7 引擎收束）**：不横向加功能，用测试网反向审整个
+> Runtime：五项发现全修 —— ①死节点清理五表统一（S6.33 的 file_stamp
+> 曾漏进清理表、attach_all_with_sources 曾整入口无清理 → `prune_dead`
+> 统一 + `tracked_nodes()` 观测口径）；②表面获取失败命名化分类
+>（status=3 实为 wgpu **Timeout** 瞬态 —— 曾被误诊 ConfigMismatch 并
+> 实测杀死示例进程；Timeout 归既有瞬态类，OUTDATED/LOST/OOM 带名
+> ConfigMismatch）；③两示例帧循环瞬态容忍（连续上限 120 帧，跳帧重试）；
+> ④字符队列容量上限 4096（丢新保旧）；⑤BMP 尺寸算术 checked + 容量
+> usize 域（u32 域乘法在 debug 下对合法大图 panic）。清洁账单：库代码
+> panic 家族零裸用、**帧路径零 HashMap 迭代**（连接注册序/BTreeMap/
+> 前序）、NodeId 带代号、unsafe 逐块 SAFETY 注。新增 T-Stab-01..04，
+> scene 升至 166、wgpu 至 87（全仓合计 400，文档见
+> `NES2.0_S7引擎收束_stabilization_v1.md`）。
 
 | 事项 | 状态 |
 |---|---|

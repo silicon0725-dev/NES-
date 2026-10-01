@@ -1743,6 +1743,20 @@ pub struct SurfaceFrame {
     pub view: *mut c_void,
 }
 
+/// `WGPUSurfaceGetCurrentTextureStatus` 的状态名（错误信息用；未知码
+/// 如实报"未知"不猜）。纯函数 —— 收束阶段的可测性口径。
+pub fn surface_status_name(status: i32) -> &'static str {
+    match status {
+        ffi::WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL => "SUCCESS_OPTIMAL",
+        ffi::WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL => "SUCCESS_SUBOPTIMAL",
+        ffi::WGPU_SURFACE_STATUS_TIMEOUT => "TIMEOUT",
+        ffi::WGPU_SURFACE_STATUS_OUTDATED => "OUTDATED",
+        ffi::WGPU_SURFACE_STATUS_LOST => "LOST",
+        ffi::WGPU_SURFACE_STATUS_OUT_OF_MEMORY => "OUT_OF_MEMORY",
+        _ => "未知状态",
+    }
+}
+
 /// 窗口呈现目标：HWND -> wgpu surface（按客户区配置，Fifo 垂直同步）。
 ///
 /// # 兼容性口径（S6.1）
@@ -1866,6 +1880,9 @@ impl SurfaceTarget {
     }
 
     /// 获取当前帧的表面纹理与视图（渲染目标）。状态非成功即如实报错。
+    /// 获取当前帧的表面纹理与视图（渲染目标）。状态非成功即如实报错
+    /// （状态名 + 原始码；**Timeout 归瞬态类** —— 呈现队列暂满不是配置
+    /// 矛盾，宿主可跳过该帧重试，见 [`BackendError::Timeout`]）。
     pub fn acquire(&self, ctx: &GpuContext) -> Result<SurfaceFrame, BackendError> {
         let mut st = ffi::SurfaceTexture {
             next_in_chain: ptr::null_mut(),
@@ -1877,8 +1894,14 @@ impl SurfaceTarget {
         if st.status != ffi::WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL
             && st.status != ffi::WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL
         {
+            if st.status == ffi::WGPU_SURFACE_STATUS_TIMEOUT {
+                // 瞬态：窗口被遮挡/合成器停顿时呈现队列暂满 —— 与异步
+                // 回调超时同一类（可重试），不误诊成配置矛盾。
+                return Err(BackendError::Timeout("surface_get_current_texture"));
+            }
             return Err(BackendError::ConfigMismatch(format!(
-                "获取表面纹理失败：status={}",
+                "获取表面纹理失败：{}(status={})",
+                surface_status_name(st.status),
                 st.status
             )));
         }

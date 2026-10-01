@@ -73,6 +73,15 @@ pub const WGPU_COMPOSITE_ALPHA_MODE_AUTO: i32 = 0;
 pub const WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL: i32 = 1;
 /// `WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal`（仍可呈现）。
 pub const WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL: i32 = 2;
+/// `WGPUSurfaceGetCurrentTextureStatus_Timeout`（瞬态：呈现队列暂满，
+/// 常见于窗口被遮挡/合成器停顿 —— 下一帧重试通常即恢复）。
+pub const WGPU_SURFACE_STATUS_TIMEOUT: i32 = 3;
+/// `WGPUSurfaceGetCurrentTextureStatus_Outdated`（表面已过期，需重配置）。
+pub const WGPU_SURFACE_STATUS_OUTDATED: i32 = 4;
+/// `WGPUSurfaceGetCurrentTextureStatus_Lost`（表面已丢失，需重建）。
+pub const WGPU_SURFACE_STATUS_LOST: i32 = 5;
+/// `WGPUSurfaceGetCurrentTextureStatus_OutOfMemory`。
+pub const WGPU_SURFACE_STATUS_OUT_OF_MEMORY: i32 = 6;
 /// `WGPUMapMode_Read`
 pub const WGPU_MAP_MODE_READ: u64 = 1;
 /// `WGPUAddressMode_ClampToEdge`

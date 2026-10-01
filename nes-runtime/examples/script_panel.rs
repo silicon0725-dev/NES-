@@ -207,6 +207,11 @@ fn main() {
     let typed: Option<String> = std::env::var("NES_PANEL_TYPE").ok();
 
     let mut rendered = 0u64;
+    // 瞬态容错（收束阶段）：表面获取 Timeout 一类瞬态错跳过该帧重试
+    // （引擎按可重试类如实分类了）；连续失败超限才退出 —— 不让一次
+    // 遮挡/合成器停顿杀死编辑器。
+    let mut transient = 0u64;
+    const TRANSIENT_LIMIT: u64 = 120;
     for index in 0..total {
         if index == 80 {
             if let Some(script) = typed.as_deref() {
@@ -264,14 +269,19 @@ fn main() {
                     eprintln!("[帧 {index}] driver_errors={}", stats.driver_errors);
                 }
                 rendered += 1;
+                transient = 0;
             }
             Ok(None) => {
                 println!("[帧 {index}] 窗口已关闭，退出");
                 break;
             }
             Err(err) => {
-                eprintln!("帧 {index} 失败（如实报告）：{err}");
-                std::process::exit(1);
+                transient += 1;
+                eprintln!("[帧 {index}] 失败（{transient}/{TRANSIENT_LIMIT}）：{err}");
+                if transient >= TRANSIENT_LIMIT {
+                    eprintln!("连续瞬态失败超限，退出");
+                    std::process::exit(1);
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(16));

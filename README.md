@@ -29,10 +29,10 @@ python check_dependency_direction.py
 
 # 六 crate 测试（GPU 用例在无 DLL 环境自动跳过）
 cd nes-asset  && cargo test   # 34
-cd nes-scene  && cargo test   # 165
+cd nes-scene  && cargo test   # 166
 cd nes-render-extract && cargo test  # 42
 cd nes-render-api    && cargo test  # 40
-cd nes-render-wgpu   && cargo test  # 84
+cd nes-render-wgpu   && cargo test  # 87
 cd nes-runtime && cargo test        # 31
 
 cargo clippy --all-targets   # 各 crate 零警告
