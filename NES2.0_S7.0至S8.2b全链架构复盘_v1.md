@@ -62,6 +62,26 @@ Script Node = 执行上下文（this 的所指）
 
 组件化/脚本资产复用时此契约为准。
 
+### P2.1 `this` 的防猜测价值（第三次实证，S8.3-1）
+
+旧 fly 挂弹丸子节点、`this.pos` 动的是隐形脚本节点 —— P2 阻止的正是
+"自动猜用户想要的实体"这类隐蔽 runtime magic。修法不碰 `this`：
+Controller + for_each + `it.pos` 即可表达。`this` = 执行上下文、
+`node(h)` = 实体引用，两通道永不合流。
+
+### P4 复用的双形态裁决（S8.3-1 升格）
+
+> **"脚本复用"与"实体行为复用"不是同一个问题。**
+
+```text
+行为完全相同         → Controller + Collection（for_each children）
+入口/参数/生命周期不同 → 共享 .nes 资产 + 独立实例（产物共享状态独立）
+```
+
+看到"5 实体 × 5 份相同行为"默认先考虑 Controller，而非机械产生
+Entity × ScriptInstance。选择条件是**状态所有权与生命周期差异**，
+不是"代码像不像"。
+
 ### P3 "几何即状态"的正当形态（与 hack 的区分）
 
 ```text
