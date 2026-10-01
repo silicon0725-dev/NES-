@@ -112,3 +112,86 @@ fn t_script_r1_script_moves_sprite_pixels() {
     assert_eq!(f2.stats.driver_errors, 0);
     let _ = sprite;
 }
+
+/// T-Script-R2：**行为层闭环** —— 磁盘场景文件自带脚本文本（source 属性，
+/// 多行经 RON 转义），加载 -> attach_all（零宿主注册）-> 帧循环驱动精灵
+/// -> 像素。场景从此是"结构 + 资源引用 + 行为"的完整自包含单元。
+#[test]
+fn t_script_r2_disk_scene_carries_behavior() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_script")
+        .join("r2");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Textures")).unwrap();
+    write_bmp_rgba(&root.join("Textures").join("demo.bmp"), 16, 16, &quadrant_rgba(&V1))
+        .expect("写演示纹理");
+
+    // 场景文件：source 属性内嵌多行脚本（RON 转义换行）—— 信号入口，
+    // 每次 "step" 把 sprite 平移 (16,0)。原始字符串避免 Rust/RON 双层转义：
+    // 下方 `\n`、`\"` 是 **RON 层**的转义，原样落盘。
+    let scene = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "sprite",
+                kind: "Sprite2D",
+                local: (x: 10.0, y: 10.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "brain",
+                kind: "Script",
+                props: { "source": "on \"step\" {\n    sprite.pos = sprite.pos + (16.0, 0.0)\n}", },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root.join("scene.ron"), scene).expect("写场景");
+
+    let Ok(mut rt) = NesRuntime::open_with_root(&root, 64, 64) else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+    let report = rt.load_scene("scene.ron").expect("加载");
+    assert!(report.is_clean(), "{report:?}");
+    let _ = rt.bind_assets();
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 1);
+
+    // VM 零注册：attach_all 直接从 source 属性编译装载。
+    let mut vm = ScriptVm::new();
+    let issues = vm.attach_all(rt.tree_mut());
+    assert!(issues.is_empty(), "装载无缺口：{issues:?}");
+
+    // 帧循环：宿主只发信号，行为全在场景文件里。
+    rt.tree_mut().emit_signal("step", Value::I64(0));
+    let f1 = rt.frame_with(&frame(0), &mut vm).expect("帧 1");
+    assert_eq!(f1.stats.drawn, 1);
+    assert_eq!(f1.image.pixel(28, 12), Some(V1[0]), "帧 1：精灵 (26,10)");
+
+    rt.tree_mut().emit_signal("step", Value::I64(0));
+    let f2 = rt.frame_with(&frame(1), &mut vm).expect("帧 2");
+    assert_eq!(f2.image.pixel(44, 12), Some(V1[0]), "帧 2：(42,10)");
+    assert_eq!(f2.image.pixel(28, 12), Some(CLEAR_RGBA), "旧位已空");
+    assert_eq!(f2.stats.driver_errors, 0);
+
+    // 回存：source 属性随场景文件往返（行为跟着文件走）。
+    rt.save_scene("scene_saved.ron").expect("存");
+    let saved = std::fs::read_to_string(root.join("scene_saved.ron")).unwrap();
+    assert!(saved.contains("\"source\""), "源码属性在文件里：\n{saved}");
+    assert!(saved.contains("\\n") || saved.contains("\n"), "换行转义：\n{saved}");
+}

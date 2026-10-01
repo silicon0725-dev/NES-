@@ -67,7 +67,7 @@
 | 切片 `s[a..b]` / `contains` / `upper`/`lower` 内建 | 未启动（调用语法已备，逐个加臂） |
 | 字节序（`bytes()` 内建） | 未启动（字符序已覆盖用户直觉） |
 | 转义串内插值（`"hp={x}"`） | 未启动（拼接已可用） |
-| 脚本进场景文件 / headless Linux / WM_SIZE / DPI | 沿各文档遗留表 |
+| 脚本进场景文件 | ✅ S6.31（见 `NES2.0_S6脚本进场景文件_v1.md`）；headless Linux / WM_SIZE / DPI 沿遗留表 |
 
 ## 5. 记账
 

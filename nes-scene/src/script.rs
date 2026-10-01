@@ -510,13 +510,34 @@ impl ScriptVm {
         if tree.kind_tag(node) != Some(NodeKindTag::Script) {
             return Err("节点不是 Script 类型".to_string());
         }
-        let key = match tree.prop(node, "registry_key") {
-            Some(Value::Str(k)) if !k.is_empty() => k.clone(),
-            _ => return Err("registry_key 为空（未绑定）".to_string()),
+        // 双装载路径（S6.31）：内嵌 source 属性（场景文件自带行为）优先于
+        // registry_key（宿主注册表 —— 兼容层路径）。两者同设是接线错误：
+        // 一个节点一个事实来源，如实拒绝不猜。
+        let key_owned;
+        let key: &str = if let Some(Value::Str(src)) = tree.prop(node, "source") {
+            if !src.is_empty() {
+                if let Some(Value::Str(k)) = tree.prop(node, "registry_key") {
+                    if !k.is_empty() {
+                        return Err("source 与 registry_key 互斥（一个节点一个事实来源）".to_string());
+                    }
+                }
+                // 编译即装载：错误带脚本文本的行/列（attach 缺口如实上报）。
+                let script = compile_script(src)
+                    .map_err(|e| format!("内嵌脚本编译失败：{e}"))?;
+                // 注册表键用节点路径无关的稳定派生键（宿主不感知；重挂载
+                // 覆盖同键）。源码属节点所有，不占宿主命名空间。
+                key_owned = format!("__inline__:{:?}", node);
+                self.scripts.insert(key_owned.clone(), script);
+                &key_owned
+            } else {
+                Self::require_key(tree, node)?
+            }
+        } else {
+            Self::require_key(tree, node)?
         };
         let script = self
             .scripts
-            .get(&key)
+            .get(key)
             .cloned()
             .ok_or_else(|| format!("注册表无脚本 `{key}`"))?;
 
@@ -557,6 +578,14 @@ impl ScriptVm {
                     .map(|_| ())
                     .ok_or_else(|| format!("连接 `{name}` 失败"))
             }
+        }
+    }
+
+    /// registry_key 路径的键提取（source 为空时走此路）。
+    fn require_key(tree: &SceneTree, node: NodeId) -> Result<&str, String> {
+        match tree.prop(node, "registry_key") {
+            Some(Value::Str(k)) if !k.is_empty() => Ok(k.as_str()),
+            _ => Err("registry_key 为空（未绑定）".to_string()),
         }
     }
 

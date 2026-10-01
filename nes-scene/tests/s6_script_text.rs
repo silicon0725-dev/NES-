@@ -1248,3 +1248,74 @@ fn t_cmp_30_string_ops() {
     );
     assert_eq!(l7.get("hits"), Some(&Value::I64(3)), "banana 中 a 出现 3 次（索引+比较+len 组合）");
 }
+
+// ---------------------------------------------------------------- S6.31
+// 脚本进场景文件：Script 节点 source 属性（内嵌源码，随 RON 往返）。
+
+/// T-Cmp-31：source 属性装载 / RON 往返 / 三类错误。
+#[test]
+fn t_cmp_31_inline_source() {
+    // ① source 装载（不预注册 —— 宿主零注册步骤）。
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sp, Transform2D::from_pos(0.0, 0.0));
+    t.set_prop(
+        brain,
+        "source",
+        Value::Str("on \"go\" { sp.pos = sp.pos + (4.0, 0.0) }".into()),
+    )
+    .unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach(&mut t, brain).is_ok(), "source 装载（无需注册）");
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 4.0, "内嵌脚本驱动");
+
+    // ② RON 往返：多行源码（含换行）经转义存取，行为不丢。
+    //（`sp.pos = (n, 0.0)` 的 Vec2 任意表达式是 Pack 缺口 —— 用局部断言。）
+    let multi = "every {\n    n = 0\n    while n < 3 {\n        n++\n    }\n    done = n * 10\n}";
+    let mut t2 = SceneTree::new("root");
+    let _sp2 = t2.add_node(t2.root(), "sp", NodeKind::Node2D); // 往返见证（脚本现用局部断言）
+    let b2 = t2.add_node(t2.root(), "b", NodeKind::Script);
+    t2.apply_pending();
+    t2.set_prop(b2, "source", Value::Str(multi.into())).unwrap();
+    let ron = nes_scene::write_ron(&t2, &nes_scene::PackOptions::verbose());
+    assert!(ron.contains("\\n"), "换行已转义：\n{ron}");
+    let mut back = nes_scene::instantiate(&ron).unwrap();
+    let b3 = back.find_by_name("b").unwrap();
+    assert_eq!(
+        back.prop(b3, "source"),
+        Some(&Value::Str(multi.to_string())),
+        "源码逐字往返"
+    );
+    // 也可以直接在回读的树上跑。
+    let mut vm2 = ScriptVm::new();
+    assert!(vm2.attach(&mut back, b3).is_ok());
+    back.tick(0.016, &mut vm2);
+    assert_eq!(
+        vm2.locals(b3).unwrap().get("done"),
+        Some(&Value::I64(30)),
+        "往返后行为不丢（循环 + ++ + 后置计算）"
+    );
+
+    // ③ 三错：互斥 / 编译错带行号 / 双空。
+    let mut t4 = SceneTree::new("root");
+    let b4 = t4.add_node(t4.root(), "b", NodeKind::Script);
+    t4.apply_pending();
+    t4.set_prop(b4, "source", Value::Str("on \"x\" { }".into())).unwrap();
+    t4.set_prop(b4, "registry_key", Value::Str("k".into())).unwrap();
+    let mut vm4 = ScriptVm::new();
+    let e1 = vm4.attach(&mut t4, b4).unwrap_err();
+    assert!(e1.contains("互斥"), "{e1}");
+
+    t4.set_prop(b4, "registry_key", Value::Str(String::new())).unwrap();
+    t4.set_prop(b4, "source", Value::Str("on \"x\" { a = }".into())).unwrap();
+    let e2 = vm4.attach(&mut t4, b4).unwrap_err();
+    assert!(e2.contains("编译失败") && e2.contains("1"), "带行号：{e2}");
+
+    t4.set_prop(b4, "source", Value::Str(String::new())).unwrap();
+    let e3 = vm4.attach(&mut t4, b4).unwrap_err();
+    assert!(e3.contains("registry_key 为空"), "{e3}");
+}

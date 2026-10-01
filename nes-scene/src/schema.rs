@@ -348,6 +348,15 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 "脚本注册表键。空串表示未绑定；这是 M5 兼容层的唯一挂载点。",
             ),
             PropDesc::new(
+                "source",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::None,
+                "内嵌脚本文本（S6.31）。非空即由 ScriptVm 在 attach 时编译装载；\
+                 与 registry_key 互斥（一个节点一个事实来源）。\
+                 多行源码经 RON 字符串转义随场景文件往返。",
+            ),
+            PropDesc::new(
                 "enabled",
                 ValueType::Bool,
                 Value::Bool(true),
