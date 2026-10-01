@@ -688,6 +688,11 @@ cargo run --example s41_visual_closure
 > Cmd→NodeData 桥的时序细节需专核）。schema 测试补 timer 预期
 >（m2 属性列表）。Dodge 基线重生成（timer 属性入指纹）。
 > scene 210 / runtime 53，全仓合计 474 全绿。
+> **v1.76 注记（S10-1 收尾）**：farm v2 场景就位（hit 点击种植 +
+> per-entity timer）；T-FARM-02 集成标记 `#[ignore]`（探针实测：
+> gold 始终 20 不变 —— 按钮状态或 hit 路径在 headless 集成中未触发，
+> timer 与 hit 单项各自 T-TIMER-01/T-HIT-01 已过；集成链路为下轮
+> 优先调试项）。全仓 474 绿 / 守卫 11/11 / clippy 零。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |
