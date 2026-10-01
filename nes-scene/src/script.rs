@@ -783,6 +783,10 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                         | ('&', '=')
                         | ('|', '=')
                         | ('^', '=')
+                        // ++/--（S6.29，最大匹配如 C：`a--1` 是 (a--)-1 而非 a-(-1)，
+                        // 想减负数请加空格 `a - -1`）。
+                        | ('+', '+')
+                        | ('-', '-')
                 ) =>
             {
                 let pair: String = [c, chars[i + 1]].iter().collect();
@@ -968,6 +972,64 @@ impl TextParser {
         };
         self.pos += 1;
         Ok(op)
+    }
+
+    /// ++/-- 语句的目标发射（S6.29）。名字**已消费**；目标 = 局部或
+    /// `name.member`（this 须带成员）。恒等脱糖 `target += 1` / `-= 1`：
+    /// **语句位无值产生**，前缀后缀语义等价 —— C 的求值序坑在本语言不存在。
+    fn incdec_target(
+        &mut self,
+        ops: &mut Vec<Op>,
+        name: String,
+        op: Op,
+    ) -> Result<(), ParseError> {
+        if name == "this" && !matches!(self.peek().tok, Tok::Sym('.')) {
+            return Err(self.err_here("this 的 ++/-- 需要成员"));
+        }
+        if matches!(self.peek().tok, Tok::Sym('.')) {
+            self.pos += 1;
+            let member = match self.next().tok {
+                Tok::Ident(m) => m,
+                _ => return Err(self.err_here("期望属性名或 `pos`")),
+            };
+            self.emit_member_incdec(ops, &name, &member, op);
+        } else {
+            ops.push(Op::Local(name.clone()));
+            ops.push(Op::Const(Value::I64(1)));
+            ops.push(op);
+            ops.push(Op::SetLocal(name));
+        }
+        Ok(())
+    }
+
+    /// 成员 ++/-- 发射：读侧双压 + Get + Const(1) + op + Set
+    ///（与 S6.28 复合成员赋值同构 —— Set 弹值在先，节点必须在值下）。
+    fn emit_member_incdec(
+        &self,
+        ops: &mut Vec<Op>,
+        name: &str,
+        member: &str,
+        op: Op,
+    ) {
+        for _ in 0..2 {
+            if name == "this" {
+                ops.push(Op::This);
+            } else {
+                ops.push(Op::NodeByName(name.to_string()));
+            }
+        }
+        if member == "pos" {
+            ops.push(Op::GetT);
+        } else {
+            ops.push(Op::GetProp(member.to_string()));
+        }
+        ops.push(Op::Const(Value::I64(1)));
+        ops.push(op);
+        if member == "pos" {
+            ops.push(Op::SetT);
+        } else {
+            ops.push(Op::SetProp(member.to_string()));
+        }
     }
 
     fn opt_label(&mut self) -> Option<String> {
@@ -1210,6 +1272,10 @@ impl TextParser {
             self.stmt(ops)?;
             match &self.peek().tok {
                 Tok::Newline | Tok::Sym(';') | Tok::Sym('}') | Tok::Eof => {}
+                // ++/-- 出现在语句尾部 = 表达式位滥用（`a = i++`）：指名而非误导。
+                Tok::Sym2(s) if s == "++" || s == "--" => {
+                    return Err(self.err_here("`{s}` 只能作独立语句（不产生值，无求值序）"))
+                }
                 _ => return Err(self.err_here("语句后期望换行、`;` 或 `}`")),
             }
         }
@@ -1254,6 +1320,19 @@ impl TextParser {
             Tok::Ident(k) if k == "for" => {
                 self.pos += 1;
                 self.for_body(ops, None)
+            }
+            // 前缀 ++/-- 语句（S6.29）：`++x` / `--x` —— 语句位与后缀**等价**
+            //（无值产生，求值序坑不存在）；目标与复合赋值同族。
+            Tok::Sym2(s) if s == "++" || s == "--" => {
+                self.pos += 1;
+                let op = if s == "++" { Op::Add } else { Op::Sub };
+                match self.peek().tok.clone() {
+                    Tok::Ident(name) if !RESERVED.contains(&name.as_str()) => {
+                        self.pos += 1;
+                        self.incdec_target(ops, name, op)
+                    }
+                    _ => Err(self.err_here("++/-- 目标必须是变量或成员")),
+                }
             }
             Tok::Ident(k) if k == "break" => {
                 self.pos += 1;
@@ -1313,6 +1392,15 @@ impl TextParser {
                         Tok::Ident(m) => m,
                         _ => return Err(self.err_here("期望属性名或 `pos`")),
                     };
+                    // 后缀 ++/--（S6.29）：`node.member++` —— 与复合同构（+/- 1）。
+                    if let Tok::Sym2(s) = self.peek().tok.clone() {
+                        if s == "++" || s == "--" {
+                            self.pos += 1;
+                            let op = if s == "++" { Op::Add } else { Op::Sub };
+                            self.emit_member_incdec(ops, &name, &member, op);
+                            return Ok(());
+                        }
+                    }
                     let bin = self.assign_op()?;
                     match bin {
                         Some(op) => {
@@ -1356,7 +1444,17 @@ impl TextParser {
                     self.expr(ops)?;
                     ops.push(Op::SetLocal(name));
                     Ok(())
-                } else if let Tok::Sym2(_) = self.peek().tok.clone() {
+                } else if let Tok::Sym2(s) = self.peek().tok.clone() {
+                    if s == "++" || s == "--" {
+                        // 后缀 ++/--（S6.29）：`x++` —— 与 `x += 1` 同构。
+                        self.pos += 1;
+                        let op = if s == "++" { Op::Add } else { Op::Sub };
+                        ops.push(Op::Local(name.clone()));
+                        ops.push(Op::Const(Value::I64(1)));
+                        ops.push(op);
+                        ops.push(Op::SetLocal(name));
+                        return Ok(());
+                    }
                     // 复合局部赋值（S6.28）：x OP= e -> Local(x), e, OP, SetLocal(x)。
                     let bin = self.assign_op()?;
                     match bin {

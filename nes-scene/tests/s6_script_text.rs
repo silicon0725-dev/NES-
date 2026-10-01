@@ -1080,3 +1080,83 @@ fn t_cmp_27_compound_assign_family() {
         "x += e 脱糖 = x = x + e"
     );
 }
+
+// ---------------------------------------------------------------- S6.29
+// ++ / --（独立语句；前后缀等价 —— 语句位无值产生，求值序坑不存在）。
+
+/// T-Cmp-29：前后缀等价 / 循环计数 / 成员后缀 / pos++ 运行时停机 /
+/// 表达式滥用编译错 / 产物同构。
+#[test]
+fn t_cmp_29_incdec() {
+    // ① 前后缀等价（语句位）：四种形式两两同效。
+    let l = run_locals(
+        "every {
+            a = 5
+            a++
+            ++a
+            b = 10
+            b--
+            --b
+            c = 0
+            for i in 0..3 {
+                c++
+            }
+            d = 0
+            while d < 2 {
+                ++d
+            }
+        }",
+    );
+    assert_eq!(l.get("a"), Some(&Value::I64(7)), "5 + ++ + ++ = 7");
+    assert_eq!(l.get("b"), Some(&Value::I64(8)), "10 - -- - -- = 8");
+    assert_eq!(l.get("c"), Some(&Value::I64(3)), "循环内 c++ 三次");
+    assert_eq!(l.get("d"), Some(&Value::I64(2)), "while 内 ++d");
+
+    // ② 成员后缀：hero.z_index++（0 -> 1）；this 语义留运行时。
+    let mut t = SceneTree::new("root");
+    let hero = t.add_node(t.root(), "hero", NodeKind::Sprite2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(hero, "z_index", Value::I64(0)).unwrap();
+    t.set_prop(brain, "registry_key", Value::Str("ic".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("ic", "on \"go\" { hero.z_index++; hero.z_index++ }")
+        .expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    // 批次语义（S6.21 §2.4）：同一次脚本运行里两条成员写读陈值 -> 末写覆盖（=1）；
+    // 发两次信号各跑一次脚本 -> 每次基于已落地的值递增（=2）。
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.prop(hero, "z_index"), Some(&Value::I64(1)), "单次 ++");
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.prop(hero, "z_index"), Some(&Value::I64(2)), "两次信号各 ++（跨脚本读新值）");
+
+    // ③ pos++ 诚实停机：Vec2 + I64 是类型错（++ 定义为 += 1，走 Add 家法）。
+    let mut t2 = SceneTree::new("root");
+    let _sp = t2.add_node(t2.root(), "sp", NodeKind::Node2D); // pos++ 目标（读侧只引用名字）
+    let b2 = t2.add_node(t2.root(), "b", NodeKind::Script);
+    t2.apply_pending();
+    t2.set_prop(b2, "registry_key", Value::Str("ip".into())).unwrap();
+    let mut vm2 = ScriptVm::new();
+    vm2.register_text("ip", "on \"go\" { sp.pos++ }").expect("编译");
+    assert!(vm2.attach(&mut t2, b2).is_ok());
+    t2.emit_signal("go", Value::I64(0));
+    t2.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(
+        vm2.locals(b2).unwrap().get(HALT_LOCAL),
+        Some(&Value::Str("Add 类型不符".into())),
+        "pos++ 运行时停机（Vec2+I64）—— 不是静默"
+    );
+
+    // ④ 表达式滥用编译错（指名 ++，不误导为"期望换行"）。
+    let e1 = compile_script("on \"x\" { a = i++ }").expect_err("表达式位 ++");
+    assert!(format!("{e1}").contains("只能作独立语句"), "{e1}");
+    let e2 = compile_script("on \"x\" { ++5 }").expect_err("++ 字面量");
+    assert!(format!("{e2}").contains("目标必须是变量或成员"), "{e2}");
+
+    // ⑤ 产物同构：i++ 与 i += 1 逐指令相等。
+    let s1 = compile_script("on \"x\" { i++ }").unwrap();
+    let s2 = compile_script("on \"x\" { i += 1 }").unwrap();
+    assert_eq!(s1.ops, s2.ops, "i++ === i += 1（脱糖同构）");
+}
