@@ -887,6 +887,9 @@ pub struct CommandConsumer {
 /// 字体登记项（默认字体与自定义字体同构：字形表纹理 + 排版参数）。
 #[derive(Copy, Clone)]
 struct FontEntry {
+    /// 字形表纹理尺寸（像素，S8.2 补存 —— 字格 UV 按实际纹理折算，
+    /// 紧排表与留白表都成立）。
+    tex: (f32, f32),
     /// 单字格尺寸（像素）。
     cell: (f32, f32),
     /// 字形表每行列数。
@@ -1066,6 +1069,7 @@ impl CommandConsumer {
         self.fonts.insert(
             key,
             FontEntry {
+                tex: (width as f32, height as f32),
                 cell: (cell_w as f32, cell_h as f32),
                 cols,
                 first_char,
@@ -1273,9 +1277,14 @@ impl CommandConsumer {
                 if let Some((font_key, font)) = resolved_font {
                     if let Some((tile, sheet_uv)) = self.registry.sample_info(font_key) {
                         let world = item.world_transform();
-                        let rows = font.count.div_ceil(font.cols);
-                        let cell_us = sheet_uv[2] / font.cols as f32;
-                        let cell_vs = sheet_uv[3] / rows as f32;
+                        // 字格 UV 按**纹理实际尺寸**折算（S8.2 实证修复）：
+                        // 按列数/行数除只在"紧排表"（tex == cols*cell ×
+                        // rows*cell）成立 —— 真实烘焙图集 256x256 只占顶部
+                        // 96px，按 rows 除会每格采样 2.67 倍高度再压进 16px
+                        // 四边形，字形竖向压扁成 ~3px（面板/HUD 文字一直
+                        // 过小的根因）。紧排表两式等价，行为不变。
+                        let cell_us = sheet_uv[2] * font.cell.0 / font.tex.0;
+                        let cell_vs = sheet_uv[3] * font.cell.1 / font.tex.1;
                         for (line_index, line) in label.text.split('\n').enumerate() {
                             let line_y =
                                 line_index as f32 * (font.line_height + label.line_spacing);

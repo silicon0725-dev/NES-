@@ -565,3 +565,80 @@ fn t_text_14_font_anomalies_and_registry_growth() {
     assert_eq!(image.pixel(16, 0), Some(char_color(b'B' as u32)));
     assert_eq!(outcome.stats.driver_errors, 0);
 }
+
+/// T-Text-09（S8.2 实证修复）：**非紧排字形表**（纹理高 > rows*cell ——
+/// 真实烘焙图集 256x256 只占顶部 96px）的字格 UV 按纹理实际尺寸折算。
+/// 旧算法按 rows 除 → 每格采样 2.67 倍高度压进四边形，字形竖向压扁
+/// 成 ~3px（面板/HUD 文字一直过小的根因）。断言：留白表墨高 >= 6px
+/// 且字格横距正确（紧排表行为不变的对照在 T-Text-01..08）。
+#[test]
+fn t_text_09_padded_sheet_glyph_height() {
+    let guard = gpu_lock();
+    let consumer = match GpuContext::open() {
+        Ok(ctx) => {
+            let target = RenderTarget::with_size(&ctx, 256, 128).expect("256x128 目标");
+            let atlas = SpriteAtlas::new(&ctx).expect("图集");
+            CommandConsumer::new(ctx, target, atlas).expect("消费器")
+        }
+        Err(BackendError::NoLibraryCandidates(tried)) => {
+            eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库，已尝试：{tried}");
+            return;
+        }
+        Err(err) => panic!("GPU 装配失败（应如实暴露）：{err}"),
+    };
+    let mut consumer = consumer;
+
+    // 留白表：字形只画在顶部 rows*cell 高（96px），纹理 256 高 —— 与
+    // 真实烘焙图集同形态。字形格内上半 8px 实心（有墨可量）。
+    const CELL: u32 = 16;
+    const COLS: u32 = 16;
+    const COUNT: u32 = 95;
+    let (w, h) = (COLS * CELL, 256u32); // 留白：h > 紧排高（rows*cell = 96px）
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for i in 0..COUNT {
+        if 32 + i == b' ' as u32 {
+            continue;
+        }
+        let (cx, cy) = ((i % COLS) * CELL, (i / COLS) * CELL);
+        for y in 2..10u32 {
+            for x in 3..13u32 {
+                let at = (((cy + y) * w + cx + x) * 4) as usize;
+                rgba[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    let params = FontParams {
+        width: w,
+        height: h,
+        cell_w: CELL,
+        cell_h: CELL,
+        cols: COLS,
+        first_char: 32,
+        count: COUNT,
+        advance: CELL as f32,
+        line_height: CELL as f32,
+    };
+    consumer.set_default_font(params, &rgba).expect("设置默认字体");
+
+    let mut server = WgpuRenderServer::new();
+    let label = new_label(&mut server, "AJ", 20.0, 40.0);
+    let _ = label;
+    let outcome = render_one(&mut consumer, &mut server);
+    let mut miny = u32::MAX;
+    let mut maxy = 0;
+    let mut ink = 0u32;
+    for y in 0..128u32 {
+        for x in 0..256u32 {
+            if outcome.image.pixel(x, y) == Some([255, 255, 255, 255]) {
+                ink += 1;
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+            }
+        }
+    }
+    let height = maxy.saturating_sub(miny) + 1;
+    assert!(ink > 0, "应有墨迹");
+    assert!(height >= 6, "留白表字形墨高 {height}px（压扁回归：旧算法 ~3px）");
+    assert_eq!(miny, 42, "墨迹起点 = 字格顶 + 2px（旧算法起点在格顶即被压扁）");
+    drop(guard);
+}
