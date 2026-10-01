@@ -597,6 +597,19 @@ cargo run --example s41_visual_closure
 > t_h_04/t_a_05 改"同 uid 场景双实例"确定性 —— **两次独立构造的树
 > 身份本就不同**是内容无关性的正面表现）。scene 升至 195（全仓
 > 合计 457，wgpu 89 复核）。
+> **v1.66 注记（S9-2 事务与撤销/重做落地）**：`TransactionLog` ——
+> **操作级双向记录**（Created/Removed 记子树快照 uid 锚定；Modified
+> 记新旧两份设计数据；Reparented 记新旧拓扑），begin/commit 事务边
+> 界（线性历史，undo 后新提交清 redo 尾）；undo = 逆序走 undo 方向
+>（**原 uid 复活**经 add_node_with_uid）；redo = 正序**重放**原始
+> 写入（不缓存，身份自然回归）。**部分应用失败推回栈顶**（历史不丢，
+> 已应用的逆保留效果 —— 身份冲突如实报错）。**T-TX-01..07 全过**
+>（身份连续性七问）：Create/Modify/Delete 的 uid 不变与值版本对应、
+> 子树删除整集合恢复（含兄弟序与孙辈数据）、Reparent 回原位、
+> A→B→C 逐级往返、**两规则兼容实证**（新建不占死 uid；ad-hoc 显式
+> 复用死 uid 机械可行但 undo 时身份冲突被如实检测 —— 无静默双身份；
+> 移除复用者后合法恢复继续）。scene 升至 202（全仓合计 464）。
+> VM 状态不随 undo 恢复（脚本 locals 非设计数据，S9-3 裁决口径）。
 
 | 事项 | 状态 |
 |---|---|
