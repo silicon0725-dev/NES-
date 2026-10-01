@@ -149,6 +149,10 @@ pub enum Op {
     MouseDY,
     Button,
     TextLen,
+    /// 弹 y、x（f32），对可见 Sprite2D 做命中检测（S10-1/F-3）：
+    /// 最高 z_index 优先，世界包围盒含点即命中，压 NodeHandle；
+    /// 无命中压 Bool(false)。
+    Hit,
 }
 
 /// 脚本入口。
@@ -684,6 +688,48 @@ fn run<'a, 'b>(
                 items.pop();
                 stack.push(StackVal::V(Value::Array(items)));
             }
+            Op::Hit => {
+                let y = pop_val!();
+                let x = pop_val!();
+                let (Some(x), Some(y)) = (num_of(&x), num_of(&y)) else {
+                    halt!("hit(..) 需要 f32 坐标");
+                };
+                let mut cands: Vec<(i64, NodeId)> = ctx
+                    .tree()
+                    .preorder()
+                    .into_iter()
+                    .filter(|&n| {
+                        ctx.tree().kind_tag(n)
+                            .is_some_and(|t| t == crate::node::NodeKindTag::Sprite2D)
+                    })
+                    .filter(|&n| {
+                        !matches!(ctx.tree().prop(n, "visible"), Some(Value::Bool(false)))
+                    })
+                    .map(|n| {
+                        let z = ctx
+                            .tree()
+                            .prop(n, "z_index")
+                            .and_then(|v| if let Value::I64(i) = v { Some(*i) } else { None })
+                            .unwrap_or(0);
+                        (z, n)
+                    })
+                    .collect();
+                cands.sort_by_key(|(z, _)| std::cmp::Reverse(*z));
+                let mut hit_node: Option<NodeId> = None;
+                for (_, n) in cands {
+                    let w = ctx.tree().world(n).unwrap_or_default();
+                    let (wx, wy) = (w.tx, w.ty);
+                    if x >= wx && x < wx + 16.0 && y >= wy && y < wy + 16.0 {
+                        hit_node = Some(n);
+                        break;
+                    }
+                }
+                match hit_node {
+                    Some(n) => stack.push(StackVal::N(n)),
+                    None => stack.push(StackVal::V(Value::Bool(false))),
+                }
+            }
+
             Op::Children => {
                 let a = pop_val!();
                 let id = match a {
@@ -2614,6 +2660,28 @@ impl TextParser {
                 self.pos += 2; // array (
                 self.expect_sym(')')?;
                 ops.push(Op::ArrNew);
+                return Ok(());
+            }
+            if name == "hit" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // hit (
+                self.expr(ops)?; // x
+                self.expect_sym(',')?;
+                self.expr(ops)?; // y
+                self.expect_sym(')')?;
+                ops.push(Op::Hit);
+                if matches!(self.peek().tok, Tok::Sym('.')) {
+                    self.pos += 1;
+                    let member = match self.next().tok {
+                        Tok::Ident(m) => m,
+                        _ => return Err(self.err_here("期望属性名或 `pos`")),
+                    };
+                    if member == "pos" {
+                        ops.push(Op::GetT);
+                        self.pos_component(ops)?;
+                    } else {
+                        ops.push(Op::GetProp(member));
+                    }
+                }
                 return Ok(());
             }
             if name == "children" && matches!(self.peek2().tok, Tok::Sym('(')) {

@@ -203,3 +203,56 @@ fn t_hier_02_sibling_order_roundtrip() {
         assert!(t2.find_by_uid(u).is_some(), "uid {} 重载命中", u.to_hex());
     }
 }
+
+/// T-HIT-01（S10-1/F-3）：**命中检测** —— hit(x, y) 对可见 Sprite2D
+/// 按最高 z_index 优先做世界包围盒检测；无命中 = Bool(false)（非停机）；
+/// 后缀 .member 直接读命中节点。
+#[test]
+fn t_hit_01_spatial_query() {
+    let mut t = SceneTree::new("root");
+    t.apply_pending();
+    let cam = t.add_node(t.root(), "cam", NodeKind::Camera2D);
+    t.set_local(cam, Transform2D::from_pos(32.0, 32.0));
+    // 两个重叠精灵：a 在下（z=0），b 在上（z=5）。
+    let a = t.add_node(t.root(), "a", NodeKind::Sprite2D);
+    t.set_local(a, Transform2D::from_pos(10.0, 10.0));
+    let b = t.add_node(t.root(), "b", NodeKind::Sprite2D);
+    t.set_local(b, Transform2D::from_pos(12.0, 12.0));
+    t.set_prop(b, "z_index", Value::I64(5)).unwrap();
+    // c 在远处不可见。
+    let c = t.add_node(t.root(), "c", NodeKind::Sprite2D);
+    t.set_local(c, Transform2D::from_pos(200.0, 200.0));
+    t.set_prop(c, "visible", Value::Bool(false)).unwrap();
+    t.apply_pending();
+    t.refresh_transforms();
+
+    let script = t.add_node(t.root(), "hit_test", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(
+        script,
+        "source",
+        Value::Str(
+            "on \"go\" { h1 = hit(14.0, 14.0)\n  h2 = hit(200.0, 200.0)\n  h3 = hit(300.0, 300.0)\n  bx = hit(14.0, 14.0).pos.x }".to_string(),
+        ),
+    )
+    .unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    assert!(vm.attach_all(&mut t).is_empty());
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    let l = vm.locals(script).unwrap();
+    // 重叠区域：b（z=5）优先于 a。
+    let uid_b = t.uid_of(b).unwrap();
+    let uid_a = t.uid_of(a).unwrap();
+    assert!(
+        matches!(l.get("h1"), Some(nes_scene::Value::Node(_))),
+        "重叠区命中（Node 句柄入局部）"
+    );
+    // 不可见精灵不命中。
+    assert_eq!(l.get("h2"), Some(&Value::Bool(false)), "visible=false 不命中");
+    // 空白区。
+    assert_eq!(l.get("h3"), Some(&Value::Bool(false)), "空白区 false");
+    // 后缀 .pos 直接读命中节点。
+    assert_eq!(l.get("bx"), Some(&Value::F32(12.0)), "hit().pos.x");
+    let _ = (uid_a, uid_b);
+}
