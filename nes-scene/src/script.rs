@@ -84,6 +84,13 @@ pub enum Op {
     JumpIfNot(usize),
     /// 弹载荷，发射命名信号。
     Emit(String),
+    /// 弹 b、a（均须 Bool），压 a && b（**按值 eager** —— 表达式层无副作用，
+    /// 短路无可观测收益，见 S6.21 文档 §2.1）。
+    And,
+    /// 弹 b、a（均须 Bool），压 a || b（eager，同上）。
+    Or,
+    /// 弹 Bool，压非。
+    Not,
 }
 
 /// 脚本入口。
@@ -327,6 +334,29 @@ fn run<'a, 'b>(
             Op::Emit(name) => {
                 let payload = pop_val!();
                 ctx.emit(name, payload);
+            }
+            Op::And => {
+                let b = pop_val!();
+                let a = pop_val!();
+                stack.push(StackVal::V(match (a, b) {
+                    (Value::Bool(x), Value::Bool(y)) => Value::Bool(x && y),
+                    _ => halt!("And 需要 Bool"),
+                }));
+            }
+            Op::Or => {
+                let b = pop_val!();
+                let a = pop_val!();
+                stack.push(StackVal::V(match (a, b) {
+                    (Value::Bool(x), Value::Bool(y)) => Value::Bool(x || y),
+                    _ => halt!("Or 需要 Bool"),
+                }));
+            }
+            Op::Not => {
+                let a = pop_val!();
+                stack.push(StackVal::V(match a {
+                    Value::Bool(x) => Value::Bool(!x),
+                    _ => halt!("Not 需要 Bool"),
+                }));
             }
         }
         pc += 1;
@@ -599,16 +629,23 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 });
                 col += i - start;
             }
-            '=' | '<' if i + 1 < n && chars[i + 1] == '=' => {
+            // 双字符符号族（S6.21 扩到 == <= >= != && ||）。
+            _ if i + 1 < n
+                && matches!(
+                    (c, chars[i + 1]),
+                    ('=', '=') | ('<', '=') | ('>', '=') | ('!', '=') | ('&', '&') | ('|', '|')
+                ) =>
+            {
+                let pair: String = [c, chars[i + 1]].iter().collect();
                 out.push(Spanned {
-                    tok: Tok::Sym2("==".into()),
+                    tok: Tok::Sym2(pair),
                     line,
                     col,
                 });
                 i += 2;
                 col += 2;
             }
-            '{' | '}' | '(' | ')' | ',' | '.' | '=' | '+' | '-' | '*' | '<' | ';' => {
+            '{' | '}' | '(' | ')' | ',' | '.' | '=' | '+' | '-' | '*' | '<' | '>' | '!' | ';' => {
                 out.push(Spanned {
                     tok: Tok::Sym(c),
                     line,
@@ -665,7 +702,9 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 8] = ["on", "every", "if", "emit", "arg", "this", "true", "false"];
+const RESERVED: [&str; 10] = [
+    "on", "every", "if", "else", "while", "emit", "arg", "this", "true", "false",
+];
 
 struct TextParser {
     toks: Vec<Spanned>,
@@ -761,12 +800,44 @@ impl TextParser {
                 self.pos += 1;
                 self.expr(ops)?; // 条件（Bool）
                 let jif = ops.len();
-                ops.push(Op::JumpIfNot(0)); // 占位，块结束后回填
+                ops.push(Op::JumpIfNot(0)); // 占位，假分支起点回填
                 self.expect_sym('{')?;
                 self.stmts(ops)?;
                 self.expect_sym('}')?;
+                if matches!(&self.peek().tok, Tok::Ident(k2) if k2 == "else") {
+                    // else / else if（链式：else if 递归为 else 体里的 if 语句）。
+                    self.pos += 1;
+                    let jend = ops.len();
+                    ops.push(Op::Jump(0)); // 真分支跳出，结尾回填
+                    let else_start = ops.len();
+                    ops[jif] = Op::JumpIfNot(else_start);
+                    if matches!(&self.peek().tok, Tok::Ident(k2) if k2 == "if") {
+                        self.stmt(ops)?; // else if —— 递归
+                    } else {
+                        self.expect_sym('{')?;
+                        self.stmts(ops)?;
+                        self.expect_sym('}')?;
+                    }
+                    let end = ops.len();
+                    ops[jend] = Op::Jump(end);
+                } else {
+                    let end = ops.len();
+                    ops[jif] = Op::JumpIfNot(end);
+                }
+                Ok(())
+            }
+            Tok::Ident(k) if k == "while" => {
+                self.pos += 1;
+                let top = ops.len();
+                self.expr(ops)?; // 条件（Bool）
+                let jexit = ops.len();
+                ops.push(Op::JumpIfNot(0)); // 占位，循环出口回填
+                self.expect_sym('{')?;
+                self.stmts(ops)?;
+                self.expect_sym('}')?;
+                ops.push(Op::Jump(top)); // 回到条件
                 let end = ops.len();
-                ops[jif] = Op::JumpIfNot(end);
+                ops[jexit] = Op::JumpIfNot(end);
                 Ok(())
             }
             Tok::Ident(k) if k == "emit" => {
@@ -818,21 +889,92 @@ impl TextParser {
         }
     }
 
-    /// expr := add (("=="|"<") add)?（比较单级、不可链）。
+    /// expr := or（逻辑或 <= 逻辑与 <= 比较 <= 加减 <= 乘 <= 一元，S6.21 全链）。
     fn expr(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
-        self.add(ops)?;
-        match self.peek().tok.clone() {
-            Tok::Sym2(s) if s == "==" => {
-                self.pos += 1;
-                self.add(ops)?;
+        self.or(ops)
+    }
+
+    /// or := and ("||" and)*（按值 eager，见 Op::And 文档）。
+    fn or(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.and(ops)?;
+        while matches!(&self.peek().tok, Tok::Sym2(s) if s == "||") {
+            self.pos += 1;
+            self.and(ops)?;
+            ops.push(Op::Or);
+        }
+        Ok(())
+    }
+
+    /// and := cmp ("&&" cmp)*（eager）。
+    fn and(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.cmp(ops)?;
+        while matches!(&self.peek().tok, Tok::Sym2(s) if s == "&&") {
+            self.pos += 1;
+            self.cmp(ops)?;
+            ops.push(Op::And);
+        }
+        Ok(())
+    }
+
+    /// cmp := add (OP add)?（单级不可链）。五族里 `<`/`==` 原生；
+    /// 其余**组合编译**（零新指令）：`>`＝[b,a,Lt]、`>=`＝[a,b,Lt,Not]、
+    /// `<=`＝[b,a,Lt,Not]、`!=`＝[a,b,Eq,Not]。两操作数各编进**临时缓冲**
+    /// 再按序拼回 —— 交换族不得 take 主缓冲（会把整个程序前缀卷走重排，
+    /// S6.21 调试实证）。
+    fn cmp(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        let mut a_code = Vec::new();
+        self.add(&mut a_code)?; // a（源序，先入临时）
+        let op = match self.peek().tok.clone() {
+            Tok::Sym2(s) if s == "==" => Some("=="),
+            Tok::Sym2(s) if s == "!=" => Some("!="),
+            Tok::Sym2(s) if s == "<=" => Some("<="),
+            Tok::Sym2(s) if s == ">=" => Some(">="),
+            Tok::Sym('<') => Some("<"),
+            Tok::Sym('>') => Some(">"),
+            _ => None,
+        };
+        let Some(op) = op else {
+            ops.extend(a_code);
+            return Ok(());
+        };
+        self.pos += 1;
+        let mut b_code = Vec::new();
+        self.add(&mut b_code)?; // b
+        match op {
+            "==" => {
+                ops.extend(a_code);
+                ops.extend(b_code);
                 ops.push(Op::Eq);
             }
-            Tok::Sym('<') => {
-                self.pos += 1;
-                self.add(ops)?;
+            "<" => {
+                ops.extend(a_code);
+                ops.extend(b_code);
                 ops.push(Op::Lt);
             }
-            _ => {}
+            ">=" => {
+                ops.extend(a_code);
+                ops.extend(b_code);
+                ops.push(Op::Lt);
+                ops.push(Op::Not);
+            }
+            "!=" => {
+                ops.extend(a_code);
+                ops.extend(b_code);
+                ops.push(Op::Eq);
+                ops.push(Op::Not);
+            }
+            ">" => {
+                ops.extend(b_code);
+                ops.extend(a_code);
+                ops.push(Op::Lt);
+            }
+            "<=" => {
+                ops.extend(b_code);
+                ops.extend(a_code);
+                ops.push(Op::Lt);
+                ops.push(Op::Not);
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }
@@ -873,6 +1015,13 @@ impl TextParser {
             ops.push(Op::Const(Value::I64(0)));
             self.primary(ops)?;
             ops.push(Op::Sub);
+            return Ok(());
+        }
+        // 一元非：`!x` -> [x, Not]。
+        if matches!(self.peek().tok, Tok::Sym('!')) {
+            self.pos += 1;
+            self.primary(ops)?;
+            ops.push(Op::Not);
             return Ok(());
         }
         let sp = self.peek().clone();

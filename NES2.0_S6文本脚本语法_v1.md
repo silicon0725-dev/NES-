@@ -90,7 +90,7 @@ primary := NUMBER | STRING | "true" | "false" | "arg" | "this"
 
 | 事项 | 状态 |
 |---|---|
-| `else` / 循环（while）/ 逻辑运算符（and/or/not） | 未启动（Jump 族已备） |
+| `else` / 循环（while）/ 逻辑运算符 | ✅ S6.21（见 `NES2.0_S6控制流与逻辑_v1.md`） |
 | Vec2 任意表达式（Pack 指令）、`<=`/`>`/`!=` | 未启动 |
 | 脚本文本进场景文件（Script 节点内嵌源码或外置 .nes 资产） | 未启动 |
 | 编译期警告（未使用局部、可疑比较类型） | 未启动 |
