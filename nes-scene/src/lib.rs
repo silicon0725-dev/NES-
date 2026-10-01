@@ -68,6 +68,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod determinism;
+pub mod editor;
 pub mod transaction;
 pub mod identity;
 pub mod node;
@@ -102,6 +103,7 @@ pub use script::{
 };
 pub use transform::{Affine, Transform2D, Vec2};
 pub use determinism::scene_fingerprint;
+pub use editor::{Hierarchy, Inspector, Selection};
 pub use transaction::{NodeData2, SceneTransaction, SubtreeSnapshot, TransactionLog, TxCapture};
 pub use tree::{Uid,
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, Observers, ProcessMode, SceneObserver,

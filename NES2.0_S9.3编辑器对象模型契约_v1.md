@@ -36,6 +36,17 @@ Selection = Persistent uid 的有序集合
 | reload | 集合里 uid 与新树的派生/落盘 uid 比对命中 —— 旧文件迁移派生的幂等性（T-ID-02）保证同文件同 uid |
 | 多选 | 有序集（首元素 = 主选 —— Inspector 显示目标） |
 
+### Selection 不属于 Transaction（评审补充裁决）
+
+```text
+选择 A → 移动 A → 选择 B → Undo
+```
+
+Undo 恢复的是 **A 的位置**，不是"选择回到 A"。选择是编辑器会话态
+（与 hover/展开同级），**不进事务历史** —— 否则编辑操作与 UI 操作
+混在同一历史里。二者可以观察事务变化（宿主轮询 live()/primary()），
+但事务不知道选择的存在。
+
 ### API 面（nes-scene，v1）
 
 ```rust
