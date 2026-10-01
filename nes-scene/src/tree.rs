@@ -655,7 +655,18 @@ pub struct SignalConnection {
     pub src: Option<NodeId>,
     /// 路由交付的目标节点（交付上下文）。
     pub dst: NodeId,
+    /// 方法级分发（S6.18）：`Some(m)` = 命中时引擎直接调用目标节点的
+    /// 处理器表 `m`（[`SceneTree::set_signal_handler`] 注册），**不经观察
+    /// 者**；`None` = 观察者交付（S6.17 语义）。草案 connect 的 method 位。
+    pub method: Option<String>,
 }
+
+/// 节点信号处理器：与观察者回调同一形状的可装箱闭包。
+///
+/// 这是**方法级分发的落点**：行为代码把处理逻辑挂到具体节点上，连接命中
+/// 时引擎直接调用（观察者无需按 dst 分支）。脚本 VM 将来在这里注册解释器
+/// 闭包 —— `Script` 节点的 `registry_key` 语义由此承接，无需第二套机制。
+pub type SignalHandler = Box<dyn FnMut(&mut SignalCtx<'_>, &Signal)>;
 
 impl SceneObserver for NoObserver {
     /// 无行为代码 = 对任何信号都不感兴趣（泵跳过全部回调，只记账）。
@@ -714,6 +725,9 @@ pub struct SceneTree {
     signal_connections: Vec<SignalConnection>,
     /// 连接句柄计数器（只增不减，不复用）。
     next_connection_id: u64,
+    /// 节点处理器表（S6.18 方法级分发）：NodeId -> 方法名 -> 闭包。
+    /// 与订阅册同一修剪（节点销毁 -> 表项随之清理）。
+    signal_handlers: HashMap<NodeId, HashMap<String, SignalHandler>>,
     /// 全局暂停位（草案 §9）。影响 [`ProcessMode::Pausable`]（含 `Inherit`
     /// 解析结果）的 `process` 派发；生命周期与结构变更**不受影响**。
     paused: bool,
@@ -757,6 +771,7 @@ impl SceneTree {
             signal_queue: Vec::new(),
             signal_connections: Vec::new(),
             next_connection_id: 0,
+            signal_handlers: HashMap::new(),
             paused: false,
             time_scale: 1.0,
         }
@@ -934,6 +949,7 @@ impl SceneTree {
             name: name.to_string(),
             src,
             dst,
+            method: None,
         });
         Some(id)
     }
@@ -945,19 +961,86 @@ impl SceneTree {
         self.signal_connections.len() != before
     }
 
+    /// 方法级连接（草案 connect 的 method 位，S6.18）：命中时引擎直接调用
+    /// `dst` 节点处理器表里的 `method`（[`Self::set_signal_handler`] 注册），
+    /// 不经观察者。目标节点上未注册该方法则该连接静默跳过（接线期缺口
+    /// 不崩帧，与 `NodeCtx::set_prop` 同口径 —— 想可见就在处理器表侧对账）。
+    pub fn connect_signal_to(
+        &mut self,
+        name: &str,
+        src: Option<NodeId>,
+        dst: NodeId,
+        method: &str,
+    ) -> Option<SignalConnectionId> {
+        if name.is_empty() || method.is_empty() || self.nodes.get(dst).is_none() {
+            return None;
+        }
+        let id = SignalConnectionId(self.next_connection_id);
+        self.next_connection_id += 1;
+        self.signal_connections.push(SignalConnection {
+            id,
+            name: name.to_string(),
+            src,
+            dst,
+            method: Some(method.to_string()),
+        });
+        Some(id)
+    }
+
+    /// 在节点上注册/替换一个信号处理器（方法级分发）。节点不存在返回
+    /// `false`。同名替换（后注册者生效）。
+    pub fn set_signal_handler(
+        &mut self,
+        node: NodeId,
+        method: &str,
+        handler: SignalHandler,
+    ) -> bool {
+        if self.nodes.get(node).is_none() || method.is_empty() {
+            return false;
+        }
+        self.signal_handlers
+            .entry(node)
+            .or_default()
+            .insert(method.to_string(), handler);
+        true
+    }
+
+    /// 移除节点上的一个处理器：存在并移除返回 `true`。
+    pub fn remove_signal_handler(&mut self, node: NodeId, method: &str) -> bool {
+        match self.signal_handlers.get_mut(&node) {
+            Some(map) => map.remove(method).is_some(),
+            None => false,
+        }
+    }
+
+    /// 取出处理器（调用期暂离处理器表，避免与只读树借用冲突）。
+    fn take_signal_handler(&mut self, node: NodeId, method: &str) -> Option<SignalHandler> {
+        self.signal_handlers.get_mut(&node)?.remove(method)
+    }
+
+    /// 归还处理器（take 的逆）。
+    fn put_signal_handler(&mut self, node: NodeId, method: &str, handler: SignalHandler) {
+        self.signal_handlers
+            .entry(node)
+            .or_default()
+            .insert(method.to_string(), handler);
+    }
+
     /// 订阅册只读视图（注册序；宿主/编辑器检视用）。
     pub fn signal_connections(&self) -> &[SignalConnection] {
         &self.signal_connections
     }
 
-    /// 修剪死连接：源或目标节点已销毁（arena 查无，代际即身份）的连接
-    /// 移除。tick 阶段 1 调用 —— 节点销毁自动清理（草案 §12）。
+    /// 修剪死连接与死处理器表：源或目标节点已销毁（arena 查无，代际即
+    /// 身份）的移除。tick 阶段 1 调用 —— 节点销毁自动清理（草案 §12）。
     fn prune_dead_connections(&mut self) {
         self.signal_connections.retain(|c| {
             let src_alive = c.src.map_or(true, |n| self.nodes.get(n).is_some());
             let dst_alive = self.nodes.get(c.dst).is_some();
             src_alive && dst_alive
         });
+        self.signal_handlers
+            .retain(|node, _| self.nodes.get(*node).is_some());
     }
 
     // ---------- 暂停与时间缩放（草案 §9） ----------
@@ -1540,29 +1623,52 @@ impl SceneTree {
             inflight.append(&mut re_emitted);
             stats.signals_delivered += 1;
 
-            // 路由交付（订阅册，S6.17）：广播后按注册序，每条命中连接一次，
-            // 目标节点作交付上下文；与广播同守 CAP（每次调用都是真实处理器）。
-            let routed_dsts: Vec<NodeId> = self
+            // 路由交付（订阅册，S6.17/S6.18）：广播后按注册序，每条命中连接
+            // 一次，目标节点作交付上下文；与广播同守 CAP（每次调用都是真实
+            // 处理器）。双路：method=None -> 观察者交付；method=Some(m) ->
+            // 引擎直接调用目标节点处理器表的 m（不经观察者；未注册则该连接
+            // 静默跳过 —— 接线期缺口不崩帧）。
+            let routed: Vec<(NodeId, Option<String>)> = self
                 .signal_connections
                 .iter()
                 .filter(|c| c.name == sig.name && c.src.map_or(true, |s| Some(s) == sig.src))
-                .map(|c| c.dst)
+                .map(|c| (c.dst, c.method.clone()))
                 .collect();
-            for dst in routed_dsts {
+            for (dst, method) in routed {
                 if stats.signals_delivered >= SIGNAL_DELIVERY_CAP {
                     stats.signals_dropped += 1; // 该信号剩余路由被截断
                     continue;
                 }
                 let mut cmds: Vec<Cmd> = Vec::new();
                 let mut re_emitted: Vec<Signal> = Vec::new();
-                {
-                    let mut ctx = SignalCtx {
-                        dst: Some(dst),
-                        tree: &*self,
-                        cmds: &mut cmds,
-                        signals: &mut re_emitted,
-                    };
-                    obs.on_signal(&mut ctx, &sig);
+                match &method {
+                    None => {
+                        let mut ctx = SignalCtx {
+                            dst: Some(dst),
+                            tree: &*self,
+                            cmds: &mut cmds,
+                            signals: &mut re_emitted,
+                        };
+                        obs.on_signal(&mut ctx, &sig);
+                    }
+                    Some(m) => {
+                        // take/put：处理器暂离表，避开与只读树借用的别名冲突。
+                        if let Some(mut handler) = self.take_signal_handler(dst, m) {
+                            let mut ctx = SignalCtx {
+                                dst: Some(dst),
+                                tree: &*self,
+                                cmds: &mut cmds,
+                                signals: &mut re_emitted,
+                            };
+                            handler(&mut ctx, &sig);
+                            // ctx 在下一行前离开作用域：树借用结束，处理器归还。
+                            let SignalCtx { dst: _, tree: _, cmds: _, signals: _ } = ctx;
+                            self.put_signal_handler(dst, m, handler);
+                        } else {
+                            // 未注册处理器：静默跳过（不计数 —— 没有发生调用）。
+                            continue;
+                        }
+                    }
                 }
                 for c in cmds {
                     self.apply_cmd(c);

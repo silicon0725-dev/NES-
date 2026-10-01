@@ -76,7 +76,7 @@ nes-runtime 零改动。
 
 | 事项 | 状态 |
 |---|---|
-| 方法级分发（`method` 属性 -> 脚本 VM 回调） | 未启动（§1.1，挂载点已备） |
+| 方法级分发（`method` -> 处理器表） | ✅ S6.18（见 `NES2.0_S6方法级分发_v1.md`；脚本 VM 将在处理器表注册解释器闭包） |
 | 行为代码侧 connect/disconnect（`SignalCtx` 目前只读册） | 未启动（编辑器/宿主侧优先） |
 | 连接载荷/优先级/一次性订阅（once） | 未启动 |
 | WM_SIZE / DPI / headless Linux | 沿各文档遗留表 |

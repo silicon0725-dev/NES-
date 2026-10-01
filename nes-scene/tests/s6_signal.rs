@@ -585,3 +585,136 @@ fn t_sig_16_dead_nodes_pruned_automatically() {
     let s2 = t.tick(0.016, &mut obs);
     assert_eq!(s2.signals_routed, 0);
 }
+
+// ---------------------------------------------------------------- 方法级分发
+// S6.18：节点处理器表 + connect_signal_to —— 引擎直接调闭包，不经观察者。
+
+/// T-Sig-17：方法级分发 —— 连接带 method，命中时目标节点的处理器闭包被
+/// 调用（dst 上下文 + 载荷可读 + 可再发射），**观察者不收到该次路由**。
+#[test]
+fn t_sig_17_method_dispatch_to_node_handler() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+
+    // 处理器：记录 (名字, dst, 载荷)，再发射一条 echo。
+    type Log = Vec<(String, Option<NodeId>, Value)>;
+    let log: std::rc::Rc<std::cell::RefCell<Log>> = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log_in = log.clone();
+    t.set_signal_handler(
+        b,
+        "on_hit",
+        Box::new(move |ctx: &mut SignalCtx<'_>, sig: &Signal| {
+            log_in
+                .borrow_mut()
+                .push((sig.name.clone(), ctx.dst(), sig.payload.clone()));
+            ctx.emit("echo", Value::I64(42));
+        }),
+    )
+    .then_some(())
+    .expect("注册处理器");
+
+    let _conn = t.connect_signal_to("hit", Some(a), b, "on_hit").expect("方法连接");
+
+    // 观察者只记广播（方法路由不经它）。
+    let mut quiet = Quiet::default();
+    let stats = t.tick(0.016, &mut quiet); // 帧 1：a 未发（Quiet 不发）
+    let _ = stats;
+
+    // 让 a 发射：借 Router（它发 hit）。
+    let mut router = Router { got: Vec::new(), a, b };
+    let stats2 = t.tick(0.016, &mut router);
+    // 帧 2：hit 广播 + 方法路由（on_hit 闭包）+ 闭包再发射 echo（广播）。
+    assert_eq!(stats2.signals_routed, 1, "方法路由恰好一次");
+    assert_eq!(stats2.signals_delivered, 3, "hit 广播 + on_hit 路由 + echo 广播");
+    let borrowed = log.borrow();
+    assert_eq!(borrowed.len(), 1, "处理器被调用一次");
+    assert_eq!(borrowed[0].0, "hit");
+    assert_eq!(borrowed[0].1, Some(b), "dst 上下文");
+    assert_eq!(borrowed[0].2, Value::I64(1), "载荷可读");
+}
+
+/// T-Sig-18：未注册处理器的方法连接静默跳过（无路由计数、不崩帧）；
+/// 注册后即通；方法连接与观察者连接可并存（各交付各的）。
+#[test]
+fn t_sig_18_missing_handler_skips_then_parallel_connections() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+
+    // 先连接、后注册处理器：首帧（a 未发，无事）；这里直接验证未注册路径 ——
+    // 连接一个没人处理的 method（Router 发的是 "hit" —— 名字对齐）。
+    let _ghost = t.connect_signal_to("hit", Some(a), b, "nope").expect("连接");
+    let _obs_conn = t.connect_signal("hit", Some(a), b).expect("观察者连接");
+    let mut router = Router { got: Vec::new(), a, b };
+    let stats = t.tick(0.016, &mut router); // router 让 a 发 hit
+    assert_eq!(stats.signals_routed, 1, "只有观察者连接路由（nope 静默跳过）");
+    assert_eq!(stats.signals_delivered, 2, "广播 + 观察者路由");
+
+    // 注册 nope 后即通（并存：两条连接各自交付；对齐 hit）。
+    let hits: std::rc::Rc<std::cell::RefCell<usize>> = std::rc::Rc::new(std::cell::RefCell::new(0));
+    let hits_in = hits.clone();
+    t.set_signal_handler(
+        b,
+        "nope",
+        Box::new(move |_ctx: &mut SignalCtx<'_>, _sig: &Signal| {
+            *hits_in.borrow_mut() += 1;
+        }),
+    )
+    .then_some(())
+    .expect("补注册");
+    let mut router2 = Router { got: Vec::new(), a, b };
+    let stats2 = t.tick(0.016, &mut router2);
+    assert_eq!(stats2.signals_routed, 2, "方法路由 + 观察者路由并存");
+    assert_eq!(*hits.borrow(), 1, "补注册后处理器被调");
+}
+
+/// T-Sig-19：处理器替换（后注册者生效）与销毁清理（表随节点走、册同步）。
+#[test]
+fn t_sig_19_handler_replace_and_cleanup_on_destroy() {
+    let mut t = SceneTree::new("root");
+    let a = t.add_node(t.root(), "a", NodeKind::Node2D);
+    let b = t.add_node(t.root(), "b", NodeKind::Node2D);
+    t.apply_pending();
+
+    let tag: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let first = tag.clone();
+    t.set_signal_handler(
+        b,
+        "m",
+        Box::new(move |_: &mut SignalCtx<'_>, _: &Signal| {
+            first.borrow_mut().push("first");
+        }),
+    )
+    .then_some(())
+    .expect("第一处理器");
+    let second = tag.clone();
+    let replaced = t.set_signal_handler(
+        b,
+        "m",
+        Box::new(move |_: &mut SignalCtx<'_>, _: &Signal| {
+            second.borrow_mut().push("second");
+        }),
+    );
+    assert!(replaced, "同名替换");
+
+    let _ = t.connect_signal_to("hit", Some(a), b, "m").expect("连接");
+    let mut router = Router { got: Vec::new(), a, b };
+    let _ = t.tick(0.016, &mut router); // a 发 hit -> 方法路由
+    assert_eq!(*tag.borrow(), vec!["second"], "后注册者生效");
+    assert!(t.remove_signal_handler(b, "m"), "显式移除");
+    assert!(!t.remove_signal_handler(b, "m"), "再移除 false");
+
+    // 销毁清理：删 a（源）与 b（目标+处理器表）。
+    t.queue(nes_scene::TreeOp::Remove { node: b, keep_children: false });
+    let _ = t.tick(0.016, &mut nes_scene::NoObserver);
+    assert!(t.signal_connections().is_empty(), "连接随节点清理");
+    // 处理器表不可直接检视 —— 行为断言：再发 hit（宿主源）无路由不崩。
+    t.emit_signal("hit", Value::I64(0));
+    let mut router2 = Router { got: Vec::new(), a, b };
+    let s = t.tick(0.016, &mut router2);
+    assert_eq!(s.signals_routed, 0);
+}
