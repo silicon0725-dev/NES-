@@ -296,3 +296,32 @@ fn t_gp_01_dodge_gameplay_and_determinism() {
     assert_eq!(a.frame_hashes, b.frame_hashes, "游戏逐帧全等");
     assert_eq!(a.trace_hash, b.trace_hash);
 }
+
+/// T-ABI-01（S8.0 兼容压力基线）：**游戏级 ABI** —— 仓库冻结的
+/// Dodge 基线（场景 + 轨迹 + 期望哈希）跑 600 帧比对指纹。VM/Scene/
+/// Signal 的任何语义变更都会在此炸响 —— 这是"改引擎必过"的游戏级
+/// 回归（区别于单元契约：它压的是**合取语义**）。
+///
+/// 基线更新流程（有意变更语义时）：重跑 CLI 生成新哈希 -> 人工确认
+/// diff 合理（评审对应里程碑文档）-> 更新 expected_hash.txt。
+#[test]
+fn t_abi_01_dodge_baseline() {
+    let _g = lock();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/regression/dodge");
+    let trace_text = std::fs::read_to_string(dir.join("trace.txt")).expect("读轨迹");
+    let trace = nes_render_api::input::parse_trace(&trace_text).expect("轨迹");
+    let expected: String = std::fs::read_to_string(dir.join("expected_hash.txt"))
+        .expect("读期望哈希")
+        .trim()
+        .to_string();
+    let report = nes_runtime::headless::run(&dir, "scene.ron", &trace, 600, 1.0 / 60.0)
+        .expect("基线运行");
+    let actual = format!("trace hash {:016x}", report.trace_hash);
+    assert_eq!(
+        actual, expected,
+        "Dodge 基线指纹漂移 —— VM/Scene/Signal 语义变了？\
+         若为有意变更：评审里程碑文档后更新 expected_hash.txt"
+    );
+    assert_eq!(report.frame_hashes.len(), 600);
+}

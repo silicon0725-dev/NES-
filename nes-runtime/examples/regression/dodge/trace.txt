@@ -1,0 +1,8 @@
+# 闪避走位：左-右-上-下交错
+20 key_down ArrowRight
+80 key_up ArrowRight key_down ArrowLeft
+140 key_up ArrowLeft key_down ArrowUp
+200 key_up ArrowUp key_down ArrowRight
+260 key_up ArrowRight
+320 key_down ArrowDown
+380 key_up ArrowDown

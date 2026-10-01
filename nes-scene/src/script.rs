@@ -44,6 +44,9 @@ pub const SCRIPT_MAX_STEPS: usize = 10_000;
 
 /// 停机原因的局部变量名（可观测，配合 [`ScriptVm::locals`]）。
 pub const HALT_LOCAL: &str = "__halt";
+/// init 已执行哨兵（S8.0）：init 块跑完即写入局部 —— "已初始化"由此
+/// 可观测（`vm.locals` / 语义指纹都看得见），且天然随重挂载复位。
+pub const INIT_LOCAL: &str = "__initialized";
 
 /// 一条指令。栈式：大多数指令消费栈顶、产出新值压回。
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +120,10 @@ pub enum Op {
     GetX,
     /// 弹 Vec2，压 y 分量（F32）。S7.4：`node.pos.y`。
     GetY,
+    /// 弹数值（I64/F32），压十进制 Str（S8.2 第一块板：Script→Text
+    /// 闭环 —— HUD 显示数值）。F32 用最短往返表示（Rust Display 口径，
+    /// 跨版本稳定）。
+    NumStr,
 }
 
 /// 脚本入口。
@@ -137,15 +144,30 @@ pub struct Script {
     pub ops: Vec<Op>,
     /// 初始局部变量（attach 时注入；重挂载复位）。
     pub locals: BTreeMap<String, Value>,
+    /// **init 块**（S8.0）：挂载后**首次派发前**执行一次的指令序列
+    ///（与入口共享局部）。重挂载 = 局部复位 + 重跑 init（与 S6.32
+    /// "换程序不打补丁"同一条语义）。`None` = 无 init（存量脚本不变）。
+    pub init: Option<Vec<Op>>,
 }
 
 impl Script {
-    /// 便捷构造。
+    /// 便捷构造（无 init 块）。
     pub fn new(entry: ScriptEntry, ops: Vec<Op>) -> Self {
         Script {
             entry,
             ops,
             locals: BTreeMap::new(),
+            init: None,
+        }
+    }
+
+    /// 带 init 块构造（S8.0）。
+    pub fn with_init(entry: ScriptEntry, ops: Vec<Op>, init: Vec<Op>) -> Self {
+        Script {
+            entry,
+            ops,
+            locals: BTreeMap::new(),
+            init: Some(init),
         }
     }
 }
@@ -501,6 +523,15 @@ fn run<'a, 'b>(
                 };
                 stack.push(StackVal::V(Value::F32(v.y)));
             }
+            Op::NumStr => {
+                let a = pop_val!();
+                let text = match a {
+                    Value::I64(i) => i.to_string(),
+                    Value::F32(f) => f.to_string(),
+                    _ => halt!("num_to_str 需要数值"),
+                };
+                stack.push(StackVal::V(Value::Str(text)));
+            }
         }
         pc += 1;
     }
@@ -694,6 +725,12 @@ impl ScriptVm {
                     "run",
                     Box::new(move |ctx: &mut SignalCtx<'_>, sig: &Signal| {
                         let mut locals = states.borrow_mut().remove(&node).unwrap_or_default();
+                        if let Some(init) = &script.init {
+                            if !locals.contains_key(INIT_LOCAL) {
+                                run(init, node, &mut locals, &mut VmCtx::Signal(ctx), Value::I64(0), &probe);
+                                locals.insert(INIT_LOCAL.to_string(), Value::Bool(true));
+                            }
+                        }
                         run(
                             &script.ops,
                             node,
@@ -952,6 +989,12 @@ impl SceneObserver for ScriptVm {
             return;
         };
         let mut locals = self.states.borrow_mut().remove(&node).unwrap_or_default();
+        if let Some(init) = &script.init {
+            if !locals.contains_key(INIT_LOCAL) {
+                run(init, node, &mut locals, &mut VmCtx::Node(ctx), Value::I64(0), &self.probe);
+                locals.insert(INIT_LOCAL.to_string(), Value::Bool(true));
+            }
+        }
         run(
             &script.ops,
             node,
@@ -1329,13 +1372,27 @@ impl TextParser {
         }
     }
 
-    /// script := ("on" STRING | "every") "{" stmts "}"
+    /// script := ["init" "{" stmts "}"] ("on" STRING | "every") "{" stmts "}"
+    ///
+    /// init 块（S8.0）：可选、在前、每脚本至多一个 —— 首次派发前执行
+    /// 一次（重挂载重跑）。与入口共享局部变量。
     fn script(&mut self) -> Result<Script, ParseError> {
         self.skip_newlines();
+        let mut init = None;
+        if matches!(self.peek().tok, Tok::Ident(ref k) if k == "init")
+            && matches!(self.peek2().tok, Tok::Sym('{'))
+        {
+            self.pos += 2; // init {
+            let mut iops = Vec::new();
+            self.stmts(&mut iops)?;
+            self.expect_sym('}')?;
+            self.skip_newlines();
+            init = Some(iops);
+        }
         let entry = match self.next().tok {
             Tok::Ident(k) if k == "on" => ScriptEntry::Signal(self.expect_str()?),
             Tok::Ident(k) if k == "every" => ScriptEntry::Process,
-            _ => return Err(self.err_here("期望 `on \"信号名\"` 或 `every`")),
+            _ => return Err(self.err_here("期望 `init`、`on \"信号名\"` 或 `every`")),
         };
         self.expect_sym('{')?;
         let mut ops = Vec::new();
@@ -1345,7 +1402,10 @@ impl TextParser {
         if !matches!(self.peek().tok, Tok::Eof) {
             return Err(self.err_here("脚本结尾后有多余内容"));
         }
-        Ok(Script::new(entry, ops))
+        Ok(match init {
+            Some(iops) => Script::with_init(entry, ops, iops),
+            None => Script::new(entry, ops),
+        })
     }
 
     /// `break`/`continue` 后的可选标签（后随标识符即视为标签）。
@@ -2138,6 +2198,13 @@ impl TextParser {
                 self.expr(ops)?;
                 self.expect_sym(')')?;
                 ops.push(Op::Key);
+                return Ok(());
+            }
+            if name == "num_to_str" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // num_to_str (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::NumStr);
                 return Ok(());
             }
             if name == "xy" && matches!(self.peek2().tok, Tok::Sym('(')) {

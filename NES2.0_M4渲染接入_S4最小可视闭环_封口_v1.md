@@ -390,6 +390,16 @@ cargo run --example s41_visual_closure
 > 无集合迭代 / 无 sqrt）—— 不修，攒作 S8 输入。scene 升至 175、
 > runtime 至 43（全仓合计 426，文档见
 > `NES2.0_S7.4首个真实项目_压力图_v1.md`）。
+> **v1.47 注记（S8.0 脚本生命周期状态）**：`init` 块（可选、入口前、
+> 每脚本一个；**挂载后首次派发前**执行一次；重挂载 = 局部复位 +
+> 重跑；哨兵局部 `__initialized` 可观测且进语义指纹）+ `num_to_str()`
+> 内建（I64/F32→十进制 Str，最短往返口径；Script→Text 闭环 —— Dodge
+> HUD 显示 `HP: n/3`，`s == 0` 手同步全部删除）+ **Dodge 兼容压力
+> 基线**（examples/regression/dodge/ 三件套入库，T-ABI-01 每次改
+> VM/Scene/Signal 自动比对 600 帧指纹 —— 游戏级 ABI，压合取语义）。
+> S7.4 压力图对账：#2/#4 已解除。新增 T-LC-01..05 与 T-ABI-01，
+> scene 升至 180、runtime 至 44（全仓合计 432，文档见
+> `NES2.0_S8.0脚本生命周期状态_v1.md`）。
 
 | 事项 | 状态 |
 |---|---|

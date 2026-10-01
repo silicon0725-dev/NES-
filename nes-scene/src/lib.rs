@@ -96,7 +96,8 @@ pub use scene_io::{
 };
 pub use schema::{EditorHint, NodeSchema, PropDesc};
 pub use script::{
-    compile_script, Op, Script, ScriptEntry, ScriptVm, StackVal, HALT_LOCAL, SCRIPT_MAX_STEPS,
+    compile_script, Op, Script, ScriptEntry, ScriptVm, StackVal, HALT_LOCAL, INIT_LOCAL,
+    SCRIPT_MAX_STEPS,
 };
 pub use transform::{Affine, Transform2D, Vec2};
 pub use determinism::scene_fingerprint;
