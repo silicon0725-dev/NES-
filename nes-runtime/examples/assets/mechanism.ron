@@ -1,0 +1,49 @@
+// S8.3 Preflight：**机关系统**压力演示 —— 刻意零战斗同构的实体关系
+//（开关/门/移动平台/触发区；无 Bullet/Enemy/HP/Collision-combat）。
+// 验证 S8.2b 抽象在异构关系下的自然度：实体发现（children）、分组、
+// 句柄保存、嵌套遍历、属性即状态、结构顺序。
+//
+// 玩法（演示）：踩开关 A/B（z_index 1=开）；双开后两扇门可见并放行；
+// 平台恒速巡逻；走到右侧目标区 -> WIN。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/player.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/heart.bmp", kind: "Texture"),
+        Res(id: 3, path: "Textures/door.bmp", kind: "Texture"),
+        Res(id: 4, path: "Textures/enemy.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            Node(name: "player", kind: "Sprite2D", local: (x: 30.0, y: 170.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), }, children: [],),
+            // 开关组：z_index 即状态（0=关 1=开 —— schema 属性，实体自持）。
+            Node(name: "switches", kind: "Node", children: [
+                Node(name: "sw_a", kind: "Sprite2D", local: (x: 80.0, y: 60.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 0, }, children: [],),
+                Node(name: "sw_b", kind: "Sprite2D", local: (x: 200.0, y: 60.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 0, }, children: [],),
+            ],),
+            // 门组：双开关全开才放行（visible 即通行态）。
+            Node(name: "doors", kind: "Node", children: [
+                Node(name: "door_a", kind: "Sprite2D", local: (x: 280.0, y: 100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), "visible": false, }, children: [],),
+                Node(name: "door_b", kind: "Sprite2D", local: (x: 280.0, y: 150.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), "visible": false, }, children: [],),
+            ],),
+            // 平台组：恒速巡逻（结构序 = 巡逻相位差的来源之一）。
+            Node(name: "platforms", kind: "Node", children: [
+                Node(name: "pf_1", kind: "Sprite2D", local: (x: 50.0, y: 120.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(4), }, children: [],),
+                Node(name: "pf_2", kind: "Sprite2D", local: (x: 250.0, y: 40.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(4), }, children: [],),
+            ],),
+            Node(name: "goal", kind: "Sprite2D", local: (x: 350.0, y: 170.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [],),
+            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "STEP ON BOTH SWITCHES", }, children: [],),
+            // 开关：踩到切换（冷却防抖），广播 "switch"。
+            Node(name: "sw_ctl", kind: "Script", props: { "source": "init { cd = 0 }\non \"tick\" { if cd > 0 { cd = cd - 1 }; for_each(children(node(\"switches\"))) { dx = player.pos.x - it.pos.x; dy = player.pos.y - it.pos.y; if dx * dx + dy * dy < 144.0 { if cd <= 0 { cd = 40; if it.z_index == 0 { it.z_index = 1 } else { it.z_index = 0 }; emit \"switch\" 0 } } } }" }, children: [],),
+            // 门：收到 "switch" 后重新数开关（嵌套遍历实体发现）。
+            Node(name: "door_ctl", kind: "Script", props: { "source": "on \"switch\" { n = 0; total = 0; for_each(children(node(\"switches\"))) { total = total + 1; if it.z_index == 1 { n = n + 1 } }; for_each(children(node(\"doors\"))) { it.visible = n >= total }; if n >= total { hud.text = \"DOORS OPEN - REACH GOAL\" } else { hud.text = \"SWITCHES \" + num_to_str(n) + \"/\" + num_to_str(total) } }" }, children: [],),
+            // 平台：恒速巡逻（折返）。
+            Node(name: "pf_ctl", kind: "Script", props: { "source": "on \"tick\" { for_each(children(node(\"platforms\"))) { it.pos = xy(it.pos.x + 1.0, it.pos.y); if it.pos.x > 330.0 { it.pos = xy(30.0, it.pos.y) } } }" }, children: [],),
+            // 玩家移动 + 胜利判定（门未全开不放行到目标）。
+            Node(name: "player_ctl", kind: "Script", props: { "source": "init { x = 30.0; y = 170.0 }\non \"tick\" { if key(\"ArrowLeft\") { x = x - 2.0 }; if key(\"ArrowRight\") { x = x + 2.0 }; if key(\"ArrowUp\") { y = y - 2.0 }; if key(\"ArrowDown\") { y = y + 2.0 }; if x < 8.0 { x = 8.0 }; if x > 376.0 { x = 376.0 }; if y < 8.0 { y = 8.0 }; if y > 208.0 { y = 208.0 }; player.pos = xy(x, y); open = 0; for_each(children(node(\"doors\"))) { if it.visible { open = 1 } }; dx = player.pos.x - goal.pos.x; dy = player.pos.y - goal.pos.y; if open == 1 { if dx * dx + dy * dy < 256.0 { hud.text = \"WIN\"; emit \"win\" 0 } } }" }, children: [],),
+        ],
+    ),
+)

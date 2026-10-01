@@ -23,10 +23,10 @@ clippy 零**，游戏级 ABI（Dodge 基线）+ 双实测修复回归网在档�
 | I2 | Cmd 微批次：回调返回即落地；级联读新值、自读旧值、末写胜；结构（Spawn/Tree）跨帧 | S7.1 | T-RS-04 |
 | I3 | 信号：BFS 级联禁递归、上限 1024、注册序路由、路由处理器按目标生效模式门控（Disabled 永不、Pausable 暂停中跳过）；广播不受暂停影响 | S7.1/S6.x | T-RS-02、T-Sig 系 |
 | I4 | 输入：平台→中性事件→折叠器（闩锁边缘/首帧基准）→快照；四路分立；WM_CHAR 非引擎 API | S7.2 | T-In-C/In/In-R 系 |
-| I5 | 确定性：语义状态白名单指纹（前序身份/变换位形/属性/局部含句柄 resolve 结果）；句柄/数组/gen/布局**不进**指纹；逐帧→轨迹哈希 | S7.3/S8.2b | T-HR、T-H-04、T-A-05 |
+| I5 | 确定性：语义状态白名单指纹（**当前实现以 SceneTree preorder position 作为临时 canonical semantic identity —— 它不是 Persistent NodeId，后者建立后由其替换**；变换位形/属性/局部含句柄 resolve 结果）；句柄/数组/gen/布局**不进**指纹（T-H-04 实证 allocator history 免疫）；逐帧→轨迹哈希 | S7.3/S8.2b | T-HR、T-H-04、T-A-05 |
 | I6 | headless = 同一运行时（GPU 装配缺席非语义分支）；CLI 与测试共用 run | S7.3 | T-HR 系 |
 | I7 | init：首派发前执行一次；重挂载重跑；哨兵可观测 | S8.0 | T-LC 系 |
-| I8 | 节拍：every=固定步长模拟步（蓄步器/钳制）；内建 tick 每帧一次载荷帧号；第二脚本率不引入 | S8.1 | T-LP 系 |
+| I8 | 节拍：`every` 按固定模拟步执行（蓄步器/钳制）；内建 tick 每帧一次载荷帧号；**同一节点的第二脚本不得因 `every` 产生独立或额外的调度频率**（组件化 guardrail：一个实体挂 N 个脚本组件，`every` 调度次数仍 = 每模拟步一次/脚本，不多 tick） | S8.1 | T-LP 系 |
 | I9 | 实体：NodeHandle 弱引用**可持有不保证存活**，两条 handle→N 通道（node()/Local 物化）统一过 resolve gen 校验；Name=查找/Handle=运行引用/NodeId=未来语义身份三层分离 | S8.2b | T-H 系 |
 | I10 | 集合：Array 纯拥有（赋值深拷贝）；push/pop 变异局部绑定；for_each 快照迭代（禁改表允许改 it 实体）；children=结构序 | S8.2b | T-A 系 |
 | I11 | 输入读面：同帧只读快照经共享视图到内建，零信号中转 | S8.2b-3 | T-IR 系 |
@@ -77,8 +77,8 @@ hack：     状态所有权不存在 → 偷偷编码进另一个可观察字段
 
 | # | 问题 | 当前口径 |
 |---|---|---|
-| D1 | Array 是否永远 VM-local，还是未来进可持久化 Schema | 冻结为 VM-local（v1.2）；进存档前须先裁 NodeHandle 持久化表示（路径？）—— 属 Persistent NodeId 里程碑 |
-| D2 | Script Owner/Host/Entity 与 `this` 的最终语义契约 | P2 已立原则；正式契约文本（含组件化预留）待 S8.3 裁决时与 D1 一并定 |
+| D1 | Array 是否永远运行时值，还是未来进可持久化 Schema | 升级为强约束：**Array 是运行时值，不是 Project Model 类型**（即使未来跨脚本传递也仍是 VM runtime value）；Project Model 侧只有持久标量/属性与持久 NodeId，两域经显式转换边界；**不 为 NodeHandle 提前设计路径序列化** —— Persistent NodeId 先成立，才谈 Handle→持久身份 |
+| D2 | Script Instance / Script Owner / Script Host / Semantic Entity / `this` 五术语的一次性定义（各是什么、生命周期、删除谁影响谁、`this` 可否转 NodeHandle） | P2 已立原则；D2 裁决时五术语边界先冻结再谈实现（不提前设计，但术语不得漂移） |
 
 ## 4. 封口令（明确不做）
 
@@ -108,8 +108,11 @@ hack：     状态所有权不存在 → 偷偷编码进另一个可观察字段
 ## 6. 复盘结论
 
 - 九里程碑无回退项；三条新原则、两条待裁、两道封口令入档；
-- 本链的元方法成立并延续：**真实项目反向验证运行时语义**
-  （Dodge→缺口→b-1/2/3→v3→新缺口→回归网）；
+- **元不变量（M1，长期工程原则）**：运行时语义必须经至少一个
+  非平凡真实项目验证；真实项目暴露的语义缺口必须**先进入回归网**，
+  再继续扩展下游能力。本链完整跑过一轮：Dodge→缺口→S7.x 修复/
+  冻结→Mini Dungeon v2→S8.2b→v3→发现 nested for_each/this→回归
+  测试→架构原则升格。这个闭环比 450 测试本身更值得保留；
 - 风险登记：450 测试的增长曲线本身不是目标 —— 下阶段的验收
   语言是"第二个项目里 API 是否自然"，不是测试数量。
 

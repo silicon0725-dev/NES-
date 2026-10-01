@@ -492,3 +492,63 @@ fn t_gp_02_dungeon_gameplay_and_determinism() {
         nes_runtime::headless::run(&root, "dungeon.ron", &[], 900, 1.0 / 60.0).unwrap();
     assert_ne!(a.trace_hash, static_run.trace_hash, "输入真的影响状态");
 }
+
+/// T-EM-01（S8.3 Preflight）：**机关系统** —— 零战斗同构的实体关系
+///（开关/门/平台/目标；无 Bullet/Enemy/HP）。验证 S8.2b 抽象在异构
+/// 关系下的自然度：children 发现、for_each 分组遍历、属性即状态
+///（z_index/visible）、信号重查、确定性。轨迹：走向并踩双开关 ->
+/// 门开 -> 走到目标 -> WIN。
+#[test]
+fn t_em_01_mechanism_entity_model() {
+    let _g = lock();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    let trace_text = "# 沿 y=60 右移踩双开关，下移右移到目标
+0 key_down ArrowUp
+55 key_up ArrowUp key_down ArrowRight
+150 key_up ArrowRight key_down ArrowDown
+210 key_up ArrowDown key_down ArrowRight
+280 key_up ArrowRight
+";
+    let trace = nes_render_api::input::parse_trace(trace_text).expect("轨迹");
+
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene("mechanism.ron").unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    rt.mount_input_view(&mut vm);
+    let mut win_at = None;
+    for f in 0..600u64 {
+        for t in trace.iter().filter(|t| t.frame == f) {
+            for ev in &t.events {
+                nes_render_wgpu::window::inject_input(*ev);
+            }
+        }
+        let snap = rt.collect_input();
+        let _ = rt.emit_input_signals(&snap);
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+        if f % 20 == 0 {
+            let hud = {
+                let tree = rt.tree_mut();
+                tree.find(&nes_scene::NodePath::parse("/main/hud").unwrap())
+                    .and_then(|n| tree.prop(n, "text").cloned())
+            };
+            if let Some(nes_scene::Value::Str(s)) = hud {
+                if s.contains("WIN") {
+                    win_at = Some(f);
+                    break;
+                }
+            }
+        }
+    }
+    assert!(win_at.is_some(), "机关链路（双开关->门->目标）在 600 帧内达 WIN");
+
+    // 确定性：同一轨迹双跑全等。
+    let a = nes_runtime::headless::run(&root, "mechanism.ron", &trace, 300, 1.0 / 60.0).unwrap();
+    let b = nes_runtime::headless::run(&root, "mechanism.ron", &trace, 300, 1.0 / 60.0).unwrap();
+    assert_eq!(a.frame_hashes, b.frame_hashes);
+    assert_eq!(a.trace_hash, b.trace_hash);
+}
