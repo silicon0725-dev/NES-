@@ -339,3 +339,102 @@ fn t_script_r3_hot_reload_reaches_pixels() {
     assert_eq!(g2.stats.driver_errors, 0);
     let _ = (sprite, f2);
 }
+
+/// T-Script-R4：外置 .nes 脚本资产端到端 —— 场景资源表声明 kind:Script
+/// 条目，Script 节点 `script` 属性引用槽位；加载 -> attach_all_with_sources
+///（注入磁盘读取器）-> 信号 -> 像素；**改 .nes 文件 -> vm 热重载轮询 ->
+/// 新像素（不整树重载）**；save/load 往返 script 属性。
+#[test]
+fn t_script_r4_external_nes_asset_end_to_end() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_script")
+        .join("r4");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Textures")).unwrap();
+    std::fs::create_dir_all(root.join("Scripts")).unwrap();
+    write_bmp_rgba(&root.join("Textures").join("demo.bmp"), 16, 16, &quadrant_rgba(&V1))
+        .expect("写纹理");
+    std::fs::write(
+        root.join("Scripts").join("mover.nes"),
+        "on \"go\" { sprite.pos = sprite.pos + (16.0, 0.0) }\n",
+    )
+    .expect("写 .nes v1");
+
+    // 场景：纹理 + 外置脚本（kind:Script）双资源。
+    let scene = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+        Res(id: 2, path: "Scripts/mover.nes", kind: "Script"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "sprite",
+                kind: "Sprite2D",
+                local: (x: 10.0, y: 10.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "brain",
+                kind: "Script",
+                props: { "script": Resource(2), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root.join("scene.ron"), scene).expect("写场景");
+
+    let mut rt = NesRuntime::open_with_root(&root, 64, 64).expect("装配");
+    let report = rt.load_scene("scene.ron").expect("加载");
+    assert!(report.is_clean(), "{report:?}");
+    let bound = rt.bind_assets();
+    assert_eq!(bound.loaded.len(), 2, "纹理 + 脚本字节都加载（内容戳入注册表）");
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 1);
+
+    // 外置装载：宿主注入磁盘读取器（root 相对路径）。
+    let script_root = root.clone();
+    let mut read = |rel: &str| {
+        std::fs::read_to_string(script_root.join(rel)).map_err(|e| e.to_string())
+    };
+    let mut vm = ScriptVm::new();
+    // 表克隆快照：tree_mut 与表借用分开（ResourceTable: Clone）。
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut read);
+    assert!(issues.is_empty(), "{issues:?}");
+
+    rt.tree_mut().emit_signal("go", Value::I64(0));
+    let f1 = rt.frame_with(&frame(0), &mut vm).expect("帧 1");
+    assert_eq!(f1.image.pixel(28, 12), Some(V1[0]), "v1：+16 -> (26,10)");
+
+    // 改 .nes 文件 -> VM 热重载（不整树重载 —— 对比 S6.7 的 Scene 资产流）。
+    std::fs::write(
+        root.join("Scripts").join("mover.nes"),
+        "on \"go\" { sprite.pos = sprite.pos - (8.0, 0.0) }\n",
+    )
+    .expect("写 .nes v2");
+    let table2 = rt.resources_mut().clone();
+    let (re, fa) = vm.poll_reloads_with_sources(rt.tree_mut(), &table2, &mut read);
+    assert_eq!(re.len(), 1);
+    assert!(fa.is_empty());
+    rt.tree_mut().emit_signal("go", Value::I64(0));
+    let f2 = rt.frame_with(&frame(1), &mut vm).expect("帧 2");
+    assert_eq!(f2.image.pixel(20, 12), Some(V1[0]), "v2：-8 -> 18（探 (20,12)）");
+    assert_eq!(f2.stats.driver_errors, 0);
+
+    // 往返：script 属性（Resource 槽位）随场景存取。
+    rt.save_scene("scene_saved.ron").expect("存");
+    let saved = std::fs::read_to_string(root.join("scene_saved.ron")).unwrap();
+    assert!(saved.contains("\"script\": Resource(2)"), "槽位引用往返：\n{saved}");
+}

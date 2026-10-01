@@ -764,7 +764,7 @@ pub fn asset_kind_of_hint(hint: &str) -> Option<AssetKind> {
         "ogg" | "wav" | "mp3" | "flac" | "sound" | "sounds" | "sfx" => Some(AssetKind::Audio),
         "ttf" | "otf" | "fonts" => Some(AssetKind::Font),
         "ron" | "scenes" | "prefab" | "level" => Some(AssetKind::Scene),
-        "js" | "scripts" => Some(AssetKind::Script),
+        "js" | "nes" | "scripts" => Some(AssetKind::Script),
         "wgsl" | "shaders" => Some(AssetKind::Shader),
         "json" | "csv" | "toml" | "config" | "data" => Some(AssetKind::Data),
         _ => None,

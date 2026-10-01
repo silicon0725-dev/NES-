@@ -481,6 +481,9 @@ pub struct ScriptVm {
     /// [`Self::poll_reloads`] 的比对基准（S6.32）。编译失败不更新戳：
     /// 旧行为保留、下次 poll 重试，修好即生效。
     inline_stamp: HashMap<NodeId, String>,
+    /// 外置路径的**编译时戳**（节点 -> 上次成功编译的文件文本，S6.33）
+    /// —— poll_reloads_with_sources 的比对基准（last-good 同内嵌）。
+    file_stamp: HashMap<NodeId, String>,
     /// 节点 -> 该节点的信号连接句柄（S6.32）。重挂载**先断旧再接新**
     /// —— 否则每次 attach 叠加一条连接、信号命中多次（潜伏缺口实证修复）。
     node_conn: HashMap<NodeId, crate::tree::SignalConnectionId>,
@@ -499,6 +502,7 @@ impl ScriptVm {
             states: Rc::new(RefCell::new(HashMap::new())),
             process_scripts: Vec::new(),
             inline_stamp: HashMap::new(),
+            file_stamp: HashMap::new(),
             node_conn: HashMap::new(),
         }
     }
@@ -515,21 +519,23 @@ impl ScriptVm {
 
     /// 装载一个 `Script` 节点（读 `registry_key` -> 注册表查 -> 按入口挂载）。
     /// 返回缺口描述：非 Script 节点、空键、未知键（如实暴露，不静默哑挂）。
+    ///
+    /// 本方法只解析**内嵌**（source）与 **registry_key** 两路；外置
+    /// `script` 属性（.nes 文件）需要文件读取器，走
+    /// [`Self::attach_all_with_sources`] / [`Self::attach_external`]。
     pub fn attach(&mut self, tree: &mut SceneTree, node: NodeId) -> Result<(), String> {
         if tree.kind_tag(node) != Some(NodeKindTag::Script) {
             return Err("节点不是 Script 类型".to_string());
         }
-        // 双装载路径（S6.31）：内嵌 source 属性（场景文件自带行为）优先于
-        // registry_key（宿主注册表 —— 兼容层路径）。两者同设是接线错误：
-        // 一个节点一个事实来源，如实拒绝不猜。
+        // 三路挂载恰一非空（S6.33 收紧）：source（内嵌）/ script（外置）/
+        // registry_key（宿主注册表）。多路同设是接线错误：如实指名拒绝。
+        Self::check_exclusive(tree, node)?;
+        if matches!(tree.prop(node, "script"), Some(Value::Resource(n)) if *n != 0) {
+            return Err("外置脚本（script 属性）需要 attach_all_with_sources".to_string());
+        }
         let key_owned;
         let key: &str = if let Some(Value::Str(src)) = tree.prop(node, "source") {
             if !src.is_empty() {
-                if let Some(Value::Str(k)) = tree.prop(node, "registry_key") {
-                    if !k.is_empty() {
-                        return Err("source 与 registry_key 互斥（一个节点一个事实来源）".to_string());
-                    }
-                }
                 // 编译即装载：错误带脚本文本的行/列（attach 缺口如实上报）。
                 let script = compile_script(src)
                     .map_err(|e| format!("内嵌脚本编译失败：{e}"))?;
@@ -551,7 +557,60 @@ impl ScriptVm {
             .get(key)
             .cloned()
             .ok_or_else(|| format!("注册表无脚本 `{key}`"))?;
+        self.install(tree, node, script)
+    }
 
+    /// 外置脚本装载（S6.33）：`script` 属性（资源槽位）-> 表查路径 ->
+    /// 调用方已读好的文本 -> 编译 -> 安装。派生键 `__file__:{path}` ——
+    /// **同文件多节点共享同一编译产物**（scripts 表自然去重）；戳为文件
+    /// 文本（热重载比对基准，last-good 语义同内嵌）。
+    pub fn attach_external(
+        &mut self,
+        tree: &mut SceneTree,
+        node: NodeId,
+        path: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        if tree.kind_tag(node) != Some(NodeKindTag::Script) {
+            return Err("节点不是 Script 类型".to_string());
+        }
+        Self::check_exclusive(tree, node)?;
+        let script = compile_script(text).map_err(|e| format!("外置脚本 {path} 编译失败：{e}"))?;
+        let key = format!("__file__:{path}");
+        self.scripts.insert(key.clone(), script.clone());
+        self.file_stamp.insert(node, text.to_string());
+        self.install(tree, node, script)
+    }
+
+    /// 三路挂载互斥校验：恰好一路非空。多于一路指名全部违规路。
+    fn check_exclusive(tree: &SceneTree, node: NodeId) -> Result<(), String> {
+        let mut active: Vec<&str> = Vec::new();
+        if matches!(tree.prop(node, "source"), Some(Value::Str(s)) if !s.is_empty()) {
+            active.push("source");
+        }
+        if matches!(tree.prop(node, "script"), Some(Value::Resource(n)) if *n != 0) {
+            active.push("script");
+        }
+        if matches!(tree.prop(node, "registry_key"), Some(Value::Str(k)) if !k.is_empty()) {
+            active.push("registry_key");
+        }
+        match active.len() {
+            0 | 1 => Ok(()),
+            _ => Err(format!(
+                "挂载互斥（恰一非空）：同时设了 {}",
+                active.join("、")
+            )),
+        }
+    }
+
+    /// 装载尾段（三路共享）：状态复位 + 入口安装（处理器/连接，
+    /// 先断旧再接新）。
+    fn install(
+        &mut self,
+        tree: &mut SceneTree,
+        node: NodeId,
+        script: Script,
+    ) -> Result<(), String> {
         // 状态初始化（重挂载 = 复位初始局部 + __halt 清除）。
         let mut init = script.locals.clone();
         init.remove(HALT_LOCAL);
@@ -666,6 +725,132 @@ impl ScriptVm {
             }
         }
         (reloaded, failed)
+    }
+
+    /// **全路径装载**（S6.33）：内嵌 + registry_key + **外置 `script` 属性**
+    ///（.nes 文件）。外置解析：槽位 -> 资源表查路径 -> `read` 读文本 ->
+    /// [`Self::attach_external`]。返回缺口清单（读失败/编译失败如实指名，
+    /// 不挡其他节点）。
+    ///
+    /// `read` 是注入的文件读取器（路径相对资产根）—— 与子场景展开的
+    /// `expand_subscenes` 同一注入模式，VM 不碰文件系统。
+    pub fn attach_all_with_sources(
+        &mut self,
+        tree: &mut SceneTree,
+        table: &crate::resources::ResourceTable,
+        read: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Vec<(NodeId, String)> {
+        // 外置节点先解析（读文件 + 编译），再统一走 attach。
+        let nodes: Vec<NodeId> = tree
+            .preorder()
+            .into_iter()
+            .filter(|&n| tree.kind_tag(n) == Some(NodeKindTag::Script))
+            .collect();
+        let mut issues = Vec::new();
+        for node in nodes {
+            if let Some(Value::Resource(slot)) = tree.prop(node, "script") {
+                if *slot != 0 {
+                    let resolved = Self::external_path(table, *slot)
+                        .and_then(|path| read(&path).map(|text| (path, text)));
+                    match resolved {
+                        Ok((path, text)) => {
+                            if let Err(e) = self.attach_external(tree, node, &path, &text) {
+                                issues.push((node, e));
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            issues.push((node, e));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Err(e) = self.attach(tree, node) {
+                issues.push((node, e));
+            }
+        }
+        issues
+    }
+
+    /// **全路径热重载轮询**（S6.33）：内嵌戳比对（同 [`Self::poll_reloads`]）
+    /// 加外置文件重读比对（读到的文本 != 戳 -> 重编译重挂载，last-good）。
+    /// 语义同 S6.32：编译/读失败保留旧行为、错误进清单、修好下次即生效。
+    pub fn poll_reloads_with_sources(
+        &mut self,
+        tree: &mut SceneTree,
+        table: &crate::resources::ResourceTable,
+        read: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> (Vec<NodeId>, Vec<(NodeId, String)>) {
+        // 先清死节点（树整体替换后的残留）。
+        self.states.borrow_mut().retain(|n, _| tree.contains(*n));
+        self.process_scripts.retain(|(n, _)| tree.contains(*n));
+        self.inline_stamp.retain(|n, _| tree.contains(*n));
+        self.file_stamp.retain(|n, _| tree.contains(*n));
+        self.node_conn.retain(|n, _| tree.contains(*n));
+        let mut reloaded = Vec::new();
+        let mut failed = Vec::new();
+        let nodes: Vec<NodeId> = tree
+            .preorder()
+            .into_iter()
+            .filter(|&n| tree.kind_tag(n) == Some(NodeKindTag::Script))
+            .collect();
+        for node in nodes {
+            if let Some(Value::Resource(slot)) = tree.prop(node, "script") {
+                if *slot != 0 {
+                    let resolved = Self::external_path(table, *slot)
+                        .and_then(|path| read(&path).map(|text| (path, text)));
+                    match resolved {
+                        Ok((path, text)) => {
+                            if self.file_stamp.get(&node) == Some(&text) {
+                                continue; // 文件未变
+                            }
+                            match self.attach_external(tree, node, &path, &text) {
+                                Ok(()) => reloaded.push(node),
+                                Err(e) => failed.push((node, e)),
+                            }
+                        }
+                        Err(e) => failed.push((node, e)), // 读失败：旧行为保留
+                    }
+                    continue;
+                }
+            }
+            // 内嵌路径。
+            let Some(Value::Str(src)) = tree.prop(node, "source") else {
+                continue;
+            };
+            if src.is_empty() || self.inline_stamp.get(&node) == Some(src) {
+                continue;
+            }
+            match self.attach(tree, node) {
+                Ok(()) => reloaded.push(node),
+                Err(e) => failed.push((node, e)),
+            }
+        }
+        (reloaded, failed)
+    }
+
+    /// 资源槽位 -> 外置脚本路径（表声明缺位/非 Script 类如实报错）。
+    fn external_path(
+        table: &crate::resources::ResourceTable,
+        slot: u64,
+    ) -> Result<String, String> {
+        use nes_asset::AssetKind;
+        let entry = table
+            .iter()
+            .find(|e| e.id().get() as u64 == slot)
+            .ok_or_else(|| format!("外置脚本槽位 {slot} 未在资源表声明"))?;
+        if entry.kind() != Some(AssetKind::Script) {
+            return Err(format!(
+                "外置脚本槽位 {slot} 类别不是 Script（实际 {:?}）",
+                entry.kind()
+            ));
+        }
+        let path = entry
+            .path()
+            .map(|p| p.as_str().to_string())
+            .ok_or_else(|| format!("外置脚本槽位 {slot} 无路径"))?;
+        Ok(path)
     }
 }
 

@@ -386,3 +386,142 @@ fn t_vm_08_remount_does_not_stack_connections() {
     t.tick(0.016, &mut nes_scene::NoObserver);
     assert_eq!(t.local(sp).unwrap().pos.x, 4.0, "一次信号恰一次命中（连接未叠加）");
 }
+
+// ---------------------------------------------------------------- S6.33
+// 外置 .nes 脚本资产：script 属性（资源槽位）-> 表查路径 -> 读文本 -> 编译。
+
+/// T-VM-09：外置装载 + 三路互斥 + 读错/槽位缺口。
+#[test]
+fn t_vm_09_external_script_asset_mount() {
+    use nes_scene::ResourceTable;
+    use nes_asset::AssetKind;
+
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sp, Transform2D::from_pos(0.0, 0.0));
+
+    // 资源表声明外置脚本（槽位由 declare 分配 -> script 属性引用）。
+    let mut table = ResourceTable::new();
+    let res = table.declare("Scripts/mover.nes", AssetKind::Script).unwrap();
+    t.set_prop(brain, "script", Value::Resource(res.get() as u64)).unwrap();
+
+    // 内存源读取器（注入：VM 不碰文件系统）。RefCell 允许读闭包与后续改写共存。
+    let files: std::cell::RefCell<std::collections::BTreeMap<String, String>> = Default::default();
+    files.borrow_mut().insert(
+        "Scripts/mover.nes".into(),
+        "on \"go\" { sp.pos = sp.pos + (6.0, 0.0) }".into(),
+    );
+    let mut read = |p: &str| {
+        files
+            .borrow()
+            .get(p)
+            .cloned()
+            .ok_or_else(|| format!("文件不存在：{p}"))
+    };
+
+    let mut vm = ScriptVm::new();
+    let issues = vm.attach_all_with_sources(&mut t, &table, &mut read);
+    assert!(issues.is_empty(), "{issues:?}");
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 6.0, "外置脚本驱动");
+
+    // 三路互斥：script + source / script + registry_key / 三路同设。
+    t.set_prop(brain, "source", Value::Str("on \"x\" { }".into())).unwrap();
+    let mut vm2 = ScriptVm::new();
+    let issues2 = vm2.attach_all_with_sources(&mut t, &table, &mut read);
+    assert!(issues2.len() == 1 && issues2[0].1.contains("互斥"), "{issues2:?}");
+    t.set_prop(brain, "source", Value::Str(String::new())).unwrap();
+    t.set_prop(brain, "registry_key", Value::Str("k".into())).unwrap();
+    let issues3 = vm2.attach_all_with_sources(&mut t, &table, &mut read);
+    assert!(issues3.len() == 1 && issues3[0].1.contains("script、registry_key"), "{issues3:?}");
+    t.set_prop(brain, "source", Value::Str("on \"y\" { }".into())).unwrap();
+    let issues4 = vm2.attach_all_with_sources(&mut t, &table, &mut read);
+    assert!(issues4.len() == 1 && issues4[0].1.contains("source、script、registry_key"), "{issues4:?}");
+    t.set_prop(brain, "source", Value::Str(String::new())).unwrap();
+    t.set_prop(brain, "registry_key", Value::Str(String::new())).unwrap();
+
+    // 读失败指名（文件消失：旧行为保留、进清单）。
+    files.borrow_mut().remove("Scripts/mover.nes");
+    let (re, fa) = vm.poll_reloads_with_sources(&mut t, &table, &mut read);
+    assert!(re.is_empty());
+    assert!(fa.len() == 1 && fa[0].1.contains("文件不存在"), "{fa:?}");
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 12.0, "读失败：v1 旧行为保留（6+6）");
+
+    // 旧 attach_all 对外置节点如实报需 sources（不静默哑挂）。
+    let mut vm3 = ScriptVm::new();
+    let issues5 = vm3.attach_all(&mut t);
+    assert!(issues5.len() == 1 && issues5[0].1.contains("attach_all_with_sources"), "{issues5:?}");
+}
+
+/// T-VM-10：外置热重载 last-good —— 文件变好文本 -> poll 重编译 -> 新行为；
+/// 变坏文本 -> 旧行为保留 + 下次（修好）生效；同文件双节点共享。
+#[test]
+fn t_vm_10_external_hot_reload_last_good_and_sharing() {
+    use nes_scene::ResourceTable;
+    use nes_asset::AssetKind;
+
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    let other = t.add_node(t.root(), "ot", NodeKind::Node2D);
+    let b1 = t.add_node(t.root(), "b1", NodeKind::Script);
+    let b2 = t.add_node(t.root(), "b2", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sp, Transform2D::from_pos(0.0, 0.0));
+    t.set_local(other, Transform2D::from_pos(0.0, 0.0));
+    let mut table = ResourceTable::new();
+    let res = table.declare("Scripts/shared.nes", AssetKind::Script).unwrap();
+    let key = Value::Resource(res.get() as u64);
+    t.set_prop(b1, "script", key.clone()).unwrap();
+    t.set_prop(b2, "script", key).unwrap();
+    // b2 引用同文件：两个安装各自命中信号（共享编译产物）。
+    let files: std::cell::RefCell<std::collections::BTreeMap<String, String>> = Default::default();
+    files.borrow_mut().insert(
+        "Scripts/shared.nes".into(),
+        "on \"go\" { sp.pos = sp.pos + (6.0, 0.0) }".into(),
+    );
+    let mut read = |p: &str| {
+        files
+            .borrow()
+            .get(p)
+            .cloned()
+            .ok_or_else(|| format!("文件不存在：{p}"))
+    };
+
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all_with_sources(&mut t, &table, &mut read).is_empty());
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    // 同文件双节点 = 同一脚本的两个安装：信号命中两次（+6+6）。
+    assert_eq!(t.local(sp).unwrap().pos.x, 12.0, "共享：b1+b2 都命中");
+
+    // 变坏：编译错 -> 旧行为保留。
+    files.borrow_mut().insert("Scripts/shared.nes".into(), "on \"go\" { a = }".into());
+    let (re, fa) = vm.poll_reloads_with_sources(&mut t, &table, &mut read);
+    assert!(re.is_empty() && fa.len() == 2, "两个引用节点都进失败清单");
+    assert!(fa[0].1.contains("编译失败"), "{}", fa[0].1);
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 24.0, "坏文本：旧行为保留（再 +12）");
+
+    // 修好：新文本 -> 重编译 -> 新行为。
+    files.borrow_mut().insert(
+        "Scripts/shared.nes".into(),
+        "on \"go\" { sp.pos = sp.pos - (4.0, 0.0) }".into(),
+    );
+    let (re2, fa2) = vm.poll_reloads_with_sources(&mut t, &table, &mut read);
+    assert_eq!(re2.len(), 2, "双节点都重载");
+    assert!(fa2.is_empty());
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 16.0, "24-4-4（新行为双命中）");
+
+    // 未变 -> 不重载。
+    let (re3, fa3) = vm.poll_reloads_with_sources(&mut t, &table, &mut read);
+    assert!(re3.is_empty() && fa3.is_empty());
+    let _ = (other, b2);
+}

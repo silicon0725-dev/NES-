@@ -357,6 +357,15 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                  多行源码经 RON 字符串转义随场景文件往返。",
             ),
             PropDesc::new(
+                "script",
+                ValueType::Resource,
+                Value::Resource(0),
+                H::Resource { kind: "script" },
+                "外置脚本资产槽位（S6.33）：指向场景资源表 kind:Script 条目\
+                 （.nes 纯文本文件，与纹理/子场景的资产路径同构）。\
+                 三路挂载（source/script/registry_key）恰一非空。",
+            ),
+            PropDesc::new(
                 "enabled",
                 ValueType::Bool,
                 Value::Bool(true),

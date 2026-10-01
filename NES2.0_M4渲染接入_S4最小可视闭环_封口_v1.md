@@ -315,6 +315,13 @@ cargo run --example s41_visual_closure
 > 再接新）；attach_all 前置死节点清理；属性流 + 文件流（S6.7 搭配）双
 > 到像素（文档见 `NES2.0_S6脚本热重载_v1.md`）；新增 T-VM-06..08 与
 > T-Script-R3，scene 升至 163、runtime 至 29。
+> **v1.40 注记（S6.33 外置脚本资产）**：Script 节点第三路挂载 `script`
+> 属性（Resource 槽位 -> 资源表 kind:Script 的 .nes 文件，与纹理/子场景
+> 同构）；三路恰一非空；`attach_all_with_sources`（注入读取器，VM 不碰
+> 文件系统）+ `poll_reloads_with_sources`（改 .nes 文件 -> 重编译 ->
+> 新像素，**不整树重载**）；同文件多节点共享编译产物（`__file__:{path}`）；
+> `.nes` 入提示映射（文档见 `NES2.0_S6外置脚本资产_v1.md`）；新增
+> T-VM-09..10 与 T-Script-R4，scene 升至 165、runtime 至 30。
 
 | 事项 | 状态 |
 |---|---|
