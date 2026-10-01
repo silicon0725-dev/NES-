@@ -509,6 +509,19 @@ cargo run --example s41_visual_closure
 > 第二个**不同实体关系**项目（最重要，避 Player/Enemy/Bullet 同构）
 > > 同源多实例装载 > 脚本组件化。文档见
 > `NES2.0_S7.0至S8.2b全链架构复盘_v1.md`。
+> **v1.59 注记（复盘 v1.1 修订 + S8.3 Preflight：机关系统）**：五处
+> 文字修正落档 —— I5 前序身份明确为**临时 canonical semantic
+> identity**（非 Persistent NodeId，后者建立后替换）；I8 升为可验证
+> 语义（同一节点第二脚本不得因 every 多 tick —— 组件化 guardrail）；
+> P2/D2 扩为五术语一次性冻结（Instance/Owner/Host/Entity/this）；
+> D1 升强约束（**Array 是运行时值不是 Project Model 类型**；不为
+> NodeHandle 提前设计路径序列化）；新增**元不变量 M1**（真实项目
+> 验证 + 缺口先进回归网再扩下游）。Preflight 按评审建议落
+> **机关系统压力演示**（mechanism.ron：开关/门/巡逻平台/目标 ——
+> 刻意零战斗同构）：children 发现×3、for_each 分组遍历×4、属性即
+> 状态（z_index/visible）、信号重查嵌套遍历 —— **零新语言特性**
+> 表达异构实体关系；T-EM-01 断言机关全链（双开关→门→目标 WIN）
+> + 轨迹双跑全等。runtime 升至 50（全仓合计 451）。
 
 | 事项 | 状态 |
 |---|---|
