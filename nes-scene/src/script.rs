@@ -646,29 +646,72 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 col += 1 + adv;
             }
             '0'..='9' => {
-                let start = i;
-                let mut is_int = true;
-                while i < n && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                    if chars[i] == '.' {
-                        // 区间分隔符（S6.24）：`0..n` / `1.5..2` —— 数字遇 `..` 停扫。
-                        if i + 1 < n && chars[i + 1] == '.' {
-                            break;
-                        }
-                        if !is_int {
-                            err!("数字里多余的 `.`");
-                        }
-                        is_int = false;
+                // 进制字面量（S6.27）：0x/0X 十六进制、0b/0B 二进制、0o/0O 八进制
+                // —— **整型严格**（进制浮点不存在，`.` 会停扫交给后续符号）；
+                // 允许 `_` 分隔（0xFF_FF）；非法进制数字/前缀后无数字/溢出
+                // i64 在词法层如实报错（0b12 的 `2`、0xFFg 的 `g` 都当场指名）。
+                let radix = if c == '0' && i + 1 < n {
+                    match chars[i + 1] {
+                        'x' | 'X' => Some(16u32),
+                        'b' | 'B' => Some(2u32),
+                        'o' | 'O' => Some(8u32),
+                        _ => None,
                     }
-                    i += 1;
+                } else {
+                    None
+                };
+                if let Some(radix) = radix {
+                    let mut j = i + 2;
+                    let mut digits = String::new();
+                    while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                        let ch = chars[j];
+                        if ch != '_' {
+                            if ch.to_digit(radix).is_none() {
+                                err!(format!("进制字面量含非法数字 `{ch}`（基数 {radix}）"));
+                            }
+                            digits.push(ch);
+                        }
+                        j += 1;
+                    }
+                    if digits.is_empty() {
+                        err!("进制前缀后须有数字");
+                    }
+                    let v: i64 = i64::from_str_radix(&digits, radix)
+                        .map_err(|_| ParseError::new(line, col, "进制字面量超出 i64"))?;
+                    out.push(Spanned {
+                        tok: Tok::Num(v as f64, true),
+                        line,
+                        col,
+                    });
+                    col += j - i;
+                    i = j;
+                } else {
+                    // 十进制（含小数；`..` 停扫见下）。
+                    let start = i;
+                    let mut is_int = true;
+                    while i < n && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                        if chars[i] == '.' {
+                            // 区间分隔符（S6.24）：`0..n` / `1.5..2` —— 数字遇 `..` 停扫。
+                            if i + 1 < n && chars[i + 1] == '.' {
+                                break;
+                            }
+                            if !is_int {
+                                err!("数字里多余的 `.`");
+                            }
+                            is_int = false;
+                        }
+                        i += 1;
+                    }
+                    let text: String = chars[start..i].iter().collect();
+                    let v: f64 =
+                        text.parse().map_err(|_| ParseError::new(line, col, "非法数字"))?;
+                    out.push(Spanned {
+                        tok: Tok::Num(v, is_int),
+                        line,
+                        col,
+                    });
+                    col += i - start;
                 }
-                let text: String = chars[start..i].iter().collect();
-                let v: f64 = text.parse().map_err(|_| ParseError::new(line, col, "非法数字"))?;
-                out.push(Spanned {
-                    tok: Tok::Num(v, is_int),
-                    line,
-                    col,
-                });
-                col += i - start;
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;

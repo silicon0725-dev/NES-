@@ -912,3 +912,53 @@ fn t_cmp_24_string_concat() {
         "每帧覆写为拼接结果（此时只有常量部分）"
     );
 }
+
+// ---------------------------------------------------------------- S6.27
+// 进制字面量：0x/0b/0o（整型严格、_ 分隔、大小写前缀）。
+
+/// T-Cmp-25：三进制值 + 分隔符 + 位运算组合 + 十六进制区间 + 负号 + 三类错误。
+#[test]
+fn t_cmp_25_radix_literals() {
+    // 值族：三进制、分隔符、大小写前缀与大小写数字。
+    let l = run_locals(
+        "every {
+            h = 0xFF
+            hn = 0XfF
+            sep = 0xFF_FF
+            b = 0b1010
+            o = 0o777
+            neg = -0xFF
+        }",
+    );
+    assert_eq!(l.get("h"), Some(&Value::I64(255)), "0xFF");
+    assert_eq!(l.get("hn"), Some(&Value::I64(255)), "0XfF（前缀与数字大小写不敏感）");
+    assert_eq!(l.get("sep"), Some(&Value::I64(65535)), "0xFF_FF 分隔符");
+    assert_eq!(l.get("b"), Some(&Value::I64(10)), "0b1010");
+    assert_eq!(l.get("o"), Some(&Value::I64(511)), "0o777");
+    assert_eq!(l.get("neg"), Some(&Value::I64(-255)), "-0xFF（一元负号组合）");
+
+    // 位运算组合（S6.26 的天然搭配）+ 十六进制区间。
+    let l2 = run_locals(
+        "every {
+            mask = 0xF0 & 0x0F
+            full = 0xF0 | 0x0F
+            flip = 0xFF ^ 0x0F
+            s = 0
+            for i in 0x0..0x4 {
+                s = s + i
+            }
+        }",
+    );
+    assert_eq!(l2.get("mask"), Some(&Value::I64(0)), "0xF0 & 0x0F");
+    assert_eq!(l2.get("full"), Some(&Value::I64(255)), "0xF0 | 0x0F");
+    assert_eq!(l2.get("flip"), Some(&Value::I64(240)), "0xFF ^ 0x0F");
+    assert_eq!(l2.get("s"), Some(&Value::I64(6)), "0x0..0x4 十六进制区间（0+1+2+3）");
+
+    // 三类错误如实：前缀后无数字 / 非法进制数字 / 溢出 i64。
+    let e1 = compile_script("on \"x\" { a = 0x }").expect_err("无数字");
+    assert!(format!("{e1}").contains("进制前缀后须有数字"), "{e1}");
+    let e2 = compile_script("on \"x\" { a = 0b12 }").expect_err("非法数字");
+    assert!(format!("{e2}").contains("非法数字 `2`（基数 2）"), "{e2}");
+    let e3 = compile_script("on \"x\" { a = 0xFFFFFFFFFFFFFFFFFF }").expect_err("溢出");
+    assert!(format!("{e3}").contains("超出 i64"), "{e3}");
+}
