@@ -208,6 +208,12 @@ pub struct NodeDoc {
     pub overrides: Vec<InstanceOverride>,
     /// 属性（顺序由写入侧决定，读取侧不依赖顺序）。
     pub props: Vec<(String, Value)>,
+    /// **组件挂载**（S8.3-2，D2 契约）：`Resource(n)` 槽位列表 ——
+    /// 实例化时每个槽位在该节点下展开为一个 **Script Host 子节点**
+    ///（名 = 资产路径去扩展名的词干，唯一化如常），`script` 属性引用
+    /// 同一槽位。组件 = 便利挂载语法：只生成普通 Script Host，不引入
+    /// 第二套 Instance/Owner/调度协议（I7/I8 照常生效）。不写出即无。
+    pub components: Vec<u64>,
     /// 子节点，顺序即场景顺序。
     pub children: Vec<NodeDoc>,
 }
@@ -326,6 +332,9 @@ fn node_to_doc(tree: &SceneTree, id: NodeId, omit_defaults: bool) -> NodeDoc {
         process_mode: tree.process_mode(id).unwrap_or_default(),
         overrides: tree.instance_overrides(id).unwrap_or_default().to_vec(),
         props,
+        // 组件（S8.3-2）：装载时展开为显式 Host 子节点，回写恒空
+        //（展开是单向语法糖；再写会在下次装载双重展开）。
+        components: Vec::new(),
         // 子场景边界（草案 §10）：绑定了 `sub_scene` 引用的节点，其子树是
         // 加载时展开出来的**派生内容**，归子场景文件所有 —— 回写只留引用，
         // 否则编辑器无法把改动写回子场景文件。未绑定的引用（Resource(0)）
@@ -760,6 +769,13 @@ fn build_child(tree: &mut SceneTree, parent: NodeId, doc: &NodeDoc) -> Result<()
     tree.set_process_mode(id, doc.process_mode);
     apply_props(tree, id, &doc.props)?;
     tree.set_instance_overrides(id, doc.overrides.clone());
+    // 组件展开（S8.3-2，D2 契约）：每槽位一个 Script Host 子节点
+    //（名 = "comp{n}"，唯一化如常；script 属性引用同槽位）。零新协议：
+    // 生成的是普通 Script 节点，装载/调度/生命周期全部走既有路径。
+    for (i, slot) in doc.components.iter().enumerate() {
+        let host = tree.add_node(id, &format!("comp{i}"), NodeKindTag::Script.kind());
+        let _ = tree.set_prop(host, "script", Value::Resource(*slot));
+    }
     for child in &doc.children {
         build_child(tree, id, child)?;
     }
@@ -1727,6 +1743,37 @@ impl Parser {
     }
 
     /// `[ Node(...), ... ]`
+    /// `components: [Resource(n), ...]` 槽位列表（S8.3-2）。
+    fn component_list(&mut self) -> Result<Vec<u64>, ParseError> {
+        let mut out = Vec::new();
+        self.skip_trivia();
+        self.expect('[')?;
+        loop {
+            self.skip_trivia();
+            if self.peek() == Some(']') {
+                self.bump();
+                break;
+            }
+            let head = self.ident()?;
+            if head != "Resource" {
+                return Err(self.error(format!("组件项期望 `Resource(n)`，实际 `{head}`")));
+            }
+            self.expect('(')?;
+            self.skip_trivia();
+            let tok = self.number_token()?;
+            let n: u64 = tok
+                .parse()
+                .map_err(|_| self.error(format!("组件槽位号非整数 `{tok}`")))?;
+            self.expect(')')?;
+            out.push(n);
+            self.skip_trivia();
+            if self.peek() == Some(',') {
+                self.bump();
+            }
+        }
+        Ok(out)
+    }
+
     fn node_list(&mut self) -> Result<Vec<NodeDoc>, ParseError> {
         self.expect('[')?;
         let mut out = Vec::new();
@@ -1971,6 +2018,7 @@ impl Parser {
         let mut overrides: Vec<InstanceOverride> = Vec::new();
         let mut props: Vec<(String, Value)> = Vec::new();
         let mut children: Vec<NodeDoc> = Vec::new();
+        let mut components: Vec<u64> = Vec::new();
 
         loop {
             self.skip_trivia();
@@ -2030,6 +2078,10 @@ impl Parser {
                 "children" => {
                     children = self.node_list()?;
                 }
+                "components" => {
+                    // `[Resource(n), ...]` —— 展开为 Script Host 子节点。
+                    components = self.component_list()?;
+                }
                 other => {
                     return Err(self.error(format!("节点里未知字段 `{other}`")));
                 }
@@ -2061,6 +2113,7 @@ impl Parser {
             process_mode,
             overrides,
             props,
+            components,
             children,
         })
     }

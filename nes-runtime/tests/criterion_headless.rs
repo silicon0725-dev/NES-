@@ -650,3 +650,81 @@ fn t_smi_01_shared_source_independent_state() {
         assert_eq!(n, Some(nes_scene::Value::I64(want)), "{name}: {msg}");
     }
 }
+
+// ---------------------------------------------------------------- S8.3-2 组件
+
+/// T-C-01..03（S8.3-2，D2 契约验收）：组件 = 便利挂载语法 ——
+/// `components: [Resource(n), ...]` 展开为普通 Script Host 子节点；
+/// C-01 展开一致且状态独立；C-02 调度一致（N 实例 N process，无多调度）；
+/// C-03 删除/重挂走 D2 四象限。
+#[test]
+fn t_c_01_components_expand_and_isolate() {
+    let _g = lock();
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("nes_runtime_comp");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Scripts")).unwrap();
+    std::fs::write(dir.join("Scripts/tick.nes"), "every { n = n + 1 }").unwrap();
+    let scene = r#"Scene(
+    version: 1,
+    resources: [Res(id: 1, path: "Scripts/tick.nes", kind: "Script"),],
+    root: Node(
+        name: "main", kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            Node(name: "a", kind: "Node2D", components: [Resource(1),], children: [],),
+            Node(name: "b", kind: "Node2D", components: [Resource(1),], children: [],),
+            Node(name: "c", kind: "Node2D", components: [Resource(1),], children: [],),
+        ],
+    ),
+)
+"#;
+    std::fs::write(dir.join("main.ron"), scene).unwrap();
+
+    let mut rt = nes_runtime::NesRuntime::open_headless(&dir).unwrap();
+    rt.load_scene("main.ron").unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(dir.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+
+    // C-02：3 实例 -> 每帧 3 process（processed 含 cam/main 的跳过？——
+    // processed 只计实际派发：3 个 comp Host 恰 3）。
+    let st = rt.tick_headless(1.0 / 60.0, &mut vm);
+    assert_eq!(st.processed, 8, "3 组件实例 = 全树 8 process（5 节点 + 3 Host；无多调度）");
+    for _ in 0..4 {
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+    }
+    // C-01：状态独立 —— 各 comp 各自 n=5。
+    for name in ["a/comp0", "b/comp0", "c/comp0"] {
+        let n = {
+            let tree = rt.tree_mut();
+            tree.find(&nes_scene::NodePath::parse(&format!("/main/{name}")).unwrap())
+                .and_then(|id| vm.locals(id))
+                .and_then(|l| l.get("n").cloned())
+        };
+        assert_eq!(n, Some(nes_scene::Value::I64(5)), "{name} 独立累加");
+    }
+
+    // C-03：Host 删除（结构落地帧）-> 实例剪除；其余组件不受影响。
+    let b_host = {
+        let tree = rt.tree_mut();
+        tree.find(&nes_scene::NodePath::parse("/main/b/comp0").unwrap()).unwrap()
+    };
+    rt.tree_mut().remove_node(b_host, false);
+    let _ = rt.tick_headless(1.0 / 60.0, &mut vm); // 落地 + 其余继续
+    let st2 = rt.tick_headless(1.0 / 60.0, &mut vm);
+    assert_eq!(st2.processed, 7, "删一组件后 7 process（剪除恰一个 Host）");
+    let na = {
+        let tree = rt.tree_mut();
+        tree.find(&nes_scene::NodePath::parse("/main/a/comp0").unwrap())
+            .and_then(|id| vm.locals(id))
+            .and_then(|l| l.get("n").cloned())
+    };
+    assert_eq!(na, Some(nes_scene::Value::I64(7)), "存活组件继续独立累加");
+
+    // 回写幂等：展开是单向语法糖（to_doc 不写 components，不双重展开）。
+    let doc = nes_scene::to_doc(rt.tree_mut());
+    assert!(doc.root.children.iter().all(|c| c.components.is_empty()), "回写恒空");
+}
