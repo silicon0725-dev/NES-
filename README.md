@@ -32,7 +32,7 @@ cd nes-asset  && cargo test   # 34
 cd nes-scene  && cargo test   # 180
 cd nes-render-extract && cargo test  # 42
 cd nes-render-api    && cargo test  # 44
-cd nes-render-wgpu   && cargo test  # 88
+cd nes-render-wgpu   && cargo test  # 89
 cd nes-runtime && cargo test        # 49
 
 cargo clippy --all-targets   # 各 crate 零警告
