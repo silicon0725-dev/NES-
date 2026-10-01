@@ -265,6 +265,10 @@ cargo run --example s41_visual_closure
 > 上下文栈（continue 即时跳顶、break 占位收尾回填，嵌套绑最内层，
 > 循环外编译错；`while true`+break 惯用法不依赖步数兜底；文档见
 > `NES2.0_S6循环控制_v1.md`）；新增 T-Cmp-10..12，scene 升至 142。
+> **v1.30 注记（S6.23 标签跳转）**：`name: while` + `break name`/
+> `continue name` —— 标签由内向外匹配同名层（无标签层不参与），跨层
+> break 占位登记目标层、外层收尾统一回填；标签只能用于 while（文档见
+> `NES2.0_S6标签跳转_v1.md`）；新增 T-Cmp-13..15，scene 升至 145。
 
 | 事项 | 状态 |
 |---|---|

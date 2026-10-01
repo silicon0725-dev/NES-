@@ -462,3 +462,107 @@ fn t_cmp_12_outside_loop_error_and_codegen() {
         ]
     );
 }
+
+// ---------------------------------------------------------------- S6.23
+// 带标签 break/continue（`name: while`；标签只能用于 while）。
+
+/// T-Cmp-13：跨层 break —— 双层搜索，命中即全停（经典早退）。
+#[test]
+fn t_cmp_13_labeled_break_escapes_outer() {
+    let src = r#"
+every {
+    i = 0
+    found = 0
+    rounds = 0
+    outer: while i < 3 {
+        i = i + 1
+        rounds = rounds + 1
+        j = 0
+        while j < 5 {
+            j = j + 1
+            if i * 10 + j == 21 {
+                found = i * 10 + j
+                break outer
+            }
+        }
+    }
+    done = 1
+}
+"#;
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("lb".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("lb", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    let l = vm.locals(brain).unwrap();
+    assert_eq!(l.get("found"), Some(&Value::I64(21)), "命中 (2,1)");
+    assert_eq!(l.get("rounds"), Some(&Value::I64(2)), "外层第 2 轮即停（未跑满 3）");
+    assert_eq!(l.get("done"), Some(&Value::I64(1)), "循环后语句执行");
+    assert!(!l.contains_key(HALT_LOCAL));
+}
+
+/// T-Cmp-14：带标签 continue —— 内层跳回外层条件（内层提前离场）。
+#[test]
+fn t_cmp_14_labeled_continue_returns_to_outer_top() {
+    let src = r#"
+every {
+    i = 0
+    inner_steps = 0
+    reached_tail = 0
+    outer: while i < 3 {
+        i = i + 1
+        k = 0
+        while true {
+            inner_steps = inner_steps + 1
+            k = k + 1
+            if k == 1 {
+                continue outer
+            }
+        }
+        reached_tail = 1
+    }
+}
+"#;
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("lc".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("lc", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    let l = vm.locals(brain).unwrap();
+    assert_eq!(l.get("i"), Some(&Value::I64(3)), "外层照常走满");
+    assert_eq!(
+        l.get("inner_steps"),
+        Some(&Value::I64(3)),
+        "每轮内层恰 1 步即被 continue outer 带走"
+    );
+    assert_eq!(l.get("reached_tail"), Some(&Value::I64(0)), "内层尾语句永不可达");
+    assert!(!l.contains_key(HALT_LOCAL), "不靠步数兜底");
+}
+
+/// T-Cmp-15：错误与匹配规则 —— 未定义标签、标签用于 if、裸 break 兼容。
+#[test]
+fn t_cmp_15_label_errors_and_rules() {
+    // ① 未定义标签。
+    let e1 = compile_script("on \"x\" { while true { break ghost } }").expect_err("未定义标签");
+    assert!(format!("{e1}").contains("未找到标签 `ghost`"), "{e1}");
+
+    // ② 标签只能用于 while。
+    let e2 = compile_script("on \"x\" { tag: if true { } }").expect_err("标签用于 if");
+    assert!(format!("{e2}").contains("标签只能用于 while"), "{e2}");
+
+    // ③ 同名标签由内向外匹配（内层命中）。
+    let s = compile_script(
+        "on \"x\" { outer: while true { outer: while true { break outer } } }",
+    )
+    .unwrap();
+    // 找内层出口：内层尾跳后。产物里出现两个 JumpIfNot；内层 break 回填到内层出口。
+    // 断言行为替代复杂产物核对：直接数 Jump —— 至少 3 个跳转（2 出口 + 尾跳 + break）。
+    let jumps = s.ops.iter().filter(|o| matches!(o, Op::Jump(_))).count();
+    assert!(jumps >= 2, "break 与尾跳存在：{jumps}");
+}

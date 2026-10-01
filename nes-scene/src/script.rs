@@ -649,7 +649,7 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 i += 2;
                 col += 2;
             }
-            '{' | '}' | '(' | ')' | ',' | '.' | '=' | '+' | '-' | '*' | '<' | '>' | '!' | ';' => {
+            '{' | '}' | '(' | ')' | ',' | '.' | ':' | '=' | '+' | '-' | '*' | '<' | '>' | '!' | ';' => {
                 out.push(Spanned {
                     tok: Tok::Sym(c),
                     line,
@@ -716,8 +716,10 @@ const RESERVED: [&str; 12] = [
 struct LoopCtx {
     /// 循环顶（条件求值处）—— `continue` 目标。
     top: usize,
-    /// 循环体内 break 的 `Jump(0)` 占位下标清单。
+    /// 循环体内 break 的 `Jump(0)` 占位下标清单（含内层带标签登记的跨层占位）。
     breaks: Vec<usize>,
+    /// 标签（`name: while`；`None` = 无标签 —— 标签名不与无标签层匹配）。
+    label: Option<String>,
 }
 
 struct TextParser {
@@ -796,6 +798,71 @@ impl TextParser {
         Ok(Script::new(entry, ops))
     }
 
+    /// `break`/`continue` 后的可选标签（后随标识符即视为标签）。
+    fn opt_label(&mut self) -> Option<String> {
+        match self.peek().tok.clone() {
+            Tok::Ident(s) if !RESERVED.contains(&s.as_str()) => {
+                self.pos += 1;
+                Some(s)
+            }
+            _ => None,
+        }
+    }
+
+    /// 按标签解析目标循环层下标：`None` 标签 -> 最内层；`Some(l)` ->
+    /// 由内向外（rposition）找**同名标签**层（无标签层不参与匹配）。
+    fn loop_by_label(
+        &self,
+        label: &Option<String>,
+        what: &str,
+    ) -> Result<usize, ParseError> {
+        match label {
+            None => {
+                if self.loops.is_empty() {
+                    Err(self.err_here(format!("{what} 在循环外")))
+                } else {
+                    Ok(self.loops.len() - 1)
+                }
+            }
+            Some(l) => match self.loops.iter().rposition(|c| c.label.as_deref() == Some(l.as_str()))
+            {
+                Some(i) => Ok(i),
+                None => Err(self.err_here(format!("{what} 未找到标签 `{l}`"))),
+            },
+        }
+    }
+
+    /// while 体（S6.22 抽取；S6.23 增标签参数）。
+    fn while_body(
+        &mut self,
+        ops: &mut Vec<Op>,
+        label: Option<String>,
+    ) -> Result<(), ParseError> {
+        let top = ops.len();
+        self.expr(ops)?; // 条件（Bool）
+        let jexit = ops.len();
+        ops.push(Op::JumpIfNot(0)); // 占位，循环出口回填
+        self.expect_sym('{')?;
+        // 循环入栈：体内 break/continue 绑定此层（裸=最内层；带标签=同名层）。
+        self.loops.push(LoopCtx {
+            top,
+            breaks: Vec::new(),
+            label,
+        });
+        let body = self.stmts(ops);
+        let ctx = self.loops.pop().expect("循环栈配对");
+        body?;
+        self.expect_sym('}')?;
+        ops.push(Op::Jump(top)); // 回到条件
+        let end = ops.len();
+        ops[jexit] = Op::JumpIfNot(end);
+        // break 占位统一回填到出口（含内层带标签登记的跨层占位）。
+        for b in ctx.breaks {
+            ops[b] = Op::Jump(end);
+        }
+        Ok(())
+    }
+
     fn stmts(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
         loop {
             self.skip_newlines();
@@ -844,45 +911,24 @@ impl TextParser {
             }
             Tok::Ident(k) if k == "while" => {
                 self.pos += 1;
-                let top = ops.len();
-                self.expr(ops)?; // 条件（Bool）
-                let jexit = ops.len();
-                ops.push(Op::JumpIfNot(0)); // 占位，循环出口回填
-                self.expect_sym('{')?;
-                // 循环入栈：体内 break/continue 绑定此层（S6.22）。
-                self.loops.push(LoopCtx {
-                    top,
-                    breaks: Vec::new(),
-                });
-                let body = self.stmts(ops);
-                let ctx = self.loops.pop().expect("循环栈配对");
-                body?;
-                self.expect_sym('}')?;
-                ops.push(Op::Jump(top)); // 回到条件
-                let end = ops.len();
-                ops[jexit] = Op::JumpIfNot(end);
-                // break 占位统一回填到出口。
-                for b in ctx.breaks {
-                    ops[b] = Op::Jump(end);
-                }
-                Ok(())
+                self.while_body(ops, None)
             }
             Tok::Ident(k) if k == "break" => {
                 self.pos += 1;
-                let Some(ctx) = self.loops.last_mut() else {
-                    return Err(self.err_here("break 在循环外"));
-                };
-                ctx.breaks.push(ops.len());
-                ops.push(Op::Jump(0)); // 占位，循环收尾回填
+                // 可选标签：`break`（最内层）/ `break name`（由内向外找标签）。
+                let label = self.opt_label();
+                let pos = self.loop_by_label(&label, "break")?;
+                let target = &mut self.loops[pos];
+                target.breaks.push(ops.len());
+                ops.push(Op::Jump(0)); // 占位，目标循环收尾回填
                 Ok(())
             }
             Tok::Ident(k) if k == "continue" => {
                 self.pos += 1;
-                let Some(ctx) = self.loops.last() else {
-                    return Err(self.err_here("continue 在循环外"));
-                };
-                let top = ctx.top;
-                ops.push(Op::Jump(top)); // 目标即时可知
+                let label = self.opt_label();
+                let pos = self.loop_by_label(&label, "continue")?;
+                let top = self.loops[pos].top;
+                ops.push(Op::Jump(top)); // 目标循环顶，即时可知
                 Ok(())
             }
             Tok::Ident(k) if k == "emit" => {
@@ -893,6 +939,15 @@ impl TextParser {
                 Ok(())
             }
             Tok::Ident(name) => {
+                // 标签语句（S6.23）：`name: while ...` —— 标签只能用于 while。
+                if matches!(self.peek2().tok, Tok::Sym(':')) {
+                    self.pos += 2; // name ':'
+                    if !matches!(&self.peek().tok, Tok::Ident(k) if k == "while") {
+                        return Err(self.err_here("标签只能用于 while"));
+                    }
+                    self.pos += 1; // while
+                    return self.while_body(ops, Some(name));
+                }
                 // 保留字里只有 `this` 可作成员赋值目标（this.pos = ...）；
                 // 其余（arg = 1 之类）在裸局部路径拒绝。
                 let reserved = RESERVED.contains(&name.as_str());
