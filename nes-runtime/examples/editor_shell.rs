@@ -147,6 +147,7 @@ fn main() {
     let mut prev_y = false;
     let mut prev_del = false;
     let mut prev_tab = false;
+    let mut prev_click = false;
 
     let total: u64 = std::env::var("NES_EDIT_FRAMES")
         .ok()
@@ -166,8 +167,9 @@ fn main() {
             snap.pressed.contains(&nes_render_api::input::Key::Tab),
         );
         let _ = (z_now, y_now);
-        // Tab：循环选择（Viewport 里的 Sprite 节点）。
+        // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
         if tab_now && !prev_tab {
+            // Tab 保留（备用循环）— 但主要路径改为鼠标点击。
             let sprites: Vec<Uid> = {
                 let tree = rt.tree_mut();
                 tree.preorder()
@@ -188,6 +190,48 @@ fn main() {
                 sel.select(next);
             }
         }
+        // 鼠标点击选择：button down 沿 → hit(mouse) → uid → Selection。
+        // 按钮前沿检测（held 前后差）：down 沿 -> 一次点击。
+        let mouse_left_held = snap.is_down("left");
+        let mouse_shift = snap.is_down("LShift");
+        if mouse_left_held && !prev_click {
+            // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。
+            let (mx, my) = (snap.mouse.x, snap.mouse.y);
+            let hit_uid: Option<Uid> = {
+                let tree = rt.tree_mut();
+                let mut cands: Vec<(i64, nes_scene::NodeId)> = tree
+                    .preorder()
+                    .into_iter()
+                    .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
+                    .filter(|&n| !matches!(tree.prop(n, "visible"), Some(Value::Bool(false))))
+                    .map(|n| {
+                        let z = tree.prop(n, "z_index")
+                            .and_then(|v| if let Value::I64(i) = v { Some(*i) } else { None })
+                            .unwrap_or(0);
+                        (z, n)
+                    })
+                    .collect();
+                cands.sort_by_key(|(z, _)| std::cmp::Reverse(*z));
+                let mut found: Option<Uid> = None;
+                for (_, n) in cands {
+                    let w = tree.world(n).unwrap_or_default();
+                    if mx >= w.tx && mx < w.tx + 16.0 && my >= w.ty && my < w.ty + 16.0 {
+                        found = tree.uid_of(n);
+                        break;
+                    }
+                }
+                found
+            };
+            if let Some(uid) = hit_uid {
+                if mouse_shift {
+                    sel.toggle(uid);
+                } else {
+                    sel.select(uid);
+                }
+            }
+        }
+        prev_click = mouse_left_held;
+
         // 方向键：移动选中（Inspector 事务）。
         let (dx, dy) = {
             let s = &snap;
@@ -285,7 +329,7 @@ fn main() {
 
             // 状态栏。
             let st = format!(
-                "st> undo:{} redo:{} sel:{} | Tab=sel Arrows=move Del=del Ctrl+Z/Y=undo/redo",
+                "st> undo:{} redo:{} sel:{} | Click=sel Shift+Click=multi Arrows=move Del=del Ctrl+Z/Y=undo/redo",
                 if log.can_undo() { "Y" } else { "-" },
                 if log.can_redo() { "Y" } else { "-" },
                 sel.len(),

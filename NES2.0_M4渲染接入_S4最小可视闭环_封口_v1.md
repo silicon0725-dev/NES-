@@ -709,6 +709,11 @@ cargo run --example s41_visual_closure
 > 空间命中 + InputView mouse_x/y/button）；F-4（单控制器膨胀）缓解
 > （可分离关注点但仍受一脚本一入口约束）。runtime 升至 54（全仓
 > 合计 475）。
+> **v1.79 注记（S10-2 首项：编辑器点击选择落地）**：editor_shell
+> 升级——鼠标**点击选择**替代 Tab 循环（宿主侧 hit 逻辑：z_index
+> 降序 Sprite2D 世界包围盒 + held 前沿检测）+ **Shift+点击多选**
+>（Selection.toggle）。S10-1 的 hit() 与 S9-3a 的 Selection 在编辑
+> 器真实语境闭环。Tab 循环保留（备用）。状态栏提示更新。475 绿。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |
