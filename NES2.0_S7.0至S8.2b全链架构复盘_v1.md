@@ -141,6 +141,28 @@ hack：     状态所有权不存在 → 偷偷编码进另一个可观察字段
    .nes 路径已支持，缺的是场景侧引用同槽位的惯用法/示例）。
 3. **脚本组件化**（组织/复用模型 —— 最大的一步，须待 1 的结果）。
 
+## 5.5 S8 收官补记（S8.3-2..S8.4 评审后）
+
+S8 正式定名：**Runtime Entity Model & Behavior Organization
+Validation**（非"实体系统"）—— 验证了四件事：
+
+```text
+Entity Identity/Handle → Array/children/for_each → Script
+Instance/Asset → Component Expansion
+```
+
+三象限证据齐备（战斗 / 拓扑触发 / 编辑资源），**均零新 VM 原语**。
+`this`=Host 的**第四次实证**（编辑器组件）与 Tab 重按需先 key_up
+（闩锁边缘）作为边界证据保留（非 bug）。S8 = **FROZEN / CLOSED**
+（454 测试 / 11 守卫 / clippy 零 / wgpu 89 逐二进制 / D2·P5·
+G-COMP-01 冻结 / VM 语言封口）。
+
+**S9 裁决（评审定调）**：不做第二个完整游戏，先进 **S9-0
+Persistent Identity & Editor Mutation Contract**（编辑器拐点：
+preorder 身份在 delete/rename/undo 面前不稳定 —— Persistent
+NodeId 从"未来设计"变为"实际工程需求"）；路线 S9-0 契约 →
+S9-1 对象模型 → S9-2 变更/事务 → S9-3 Inspector/选择/层级。
+
 ## 6. 复盘结论
 
 - 九里程碑无回退项；三条新原则、两条待裁、两道封口令入档；
