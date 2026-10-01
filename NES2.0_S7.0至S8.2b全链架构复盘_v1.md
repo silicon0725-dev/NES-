@@ -69,6 +69,22 @@ Script Node = 执行上下文（this 的所指）
 Controller + for_each + `it.pos` 即可表达。`this` = 执行上下文、
 `node(h)` = 实体引用，两通道永不合流。
 
+### P5 表达层不得创造运行时真相（S8.3-2 升格）
+
+> 组件、快捷语法、编辑器便利结构，只能**展开为已有 Runtime
+> Primitive**；任何新表达能力必须证明不能由现有 Instance/Handle/
+> Collection 模型表达。
+
+来源：S8.3-2 Component Expansion / D1 / I8 / P2。这是防止"为了方便
+再造 ECS"的核心约束。
+
+### G-COMP-01 组件调度守卫（I8 的组件版）
+
+> 组件展开不得产生额外调度层；组件数量只增加 Script Instance 数，
+> 不改变单实例调度语义。**Host 数 = Instance 数 = 调度数**。
+
+T-C-02 钉死（3 组件 → 全树 process +3；删一 Host 恰 −1）。
+
 ### P4 复用的双形态裁决（S8.3-1 升格）
 
 > **"脚本复用"与"实体行为复用"不是同一个问题。**

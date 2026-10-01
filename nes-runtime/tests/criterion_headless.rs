@@ -728,3 +728,90 @@ fn t_c_01_components_expand_and_isolate() {
     let doc = nes_scene::to_doc(rt.tree_mut());
     assert!(doc.root.children.iter().all(|c| c.components.is_empty()), "回写恒空");
 }
+
+/// T-ED-01（S8.4：地图编辑器对象系统）—— 编辑/资源/长期状态象限的
+/// 异构验证：组件组合对象（spin/blink）、Tab 选中（z_index=5 即选态，
+/// P3 正当形态）、方向键移动**选中对象**（编辑器语义非玩家）、
+/// 回写无编辑态痕迹（D1：运行时值不进 Project Model）。
+#[test]
+fn t_ed_01_editor_object_system() {
+    let _g = lock();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    let trace_text = "# Tab 选 obj_chest 右移；Tab 抬-按二选 obj_lamp 上移
+0 key_down Tab
+10 key_down ArrowRight
+50 key_up ArrowRight key_up Tab
+60 key_down Tab
+70 key_down ArrowUp
+110 key_up ArrowUp
+";
+    let trace = nes_render_api::input::parse_trace(trace_text).expect("轨迹");
+
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene("editor.ron").unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    rt.mount_input_view(&mut vm);
+
+    let find_pos = |tree: &mut nes_scene::SceneTree, name: &str| {
+        tree.find(&nes_scene::NodePath::parse(&format!("/main/objects/{name}")).unwrap())
+            .and_then(|id| tree.local(id).map(|t| (t.pos.x, t.pos.y)))
+    };
+    let (x0, _) = {
+        let tree = rt.tree_mut();
+        find_pos(tree, "obj_chest").unwrap()
+    };
+    for f in 0..120u64 {
+        for t in trace.iter().filter(|t| t.frame == f) {
+            for ev in &t.events {
+                nes_render_wgpu::window::inject_input(*ev);
+            }
+        }
+        let snap = rt.collect_input();
+        let _ = rt.emit_input_signals(&snap);
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+    }
+    let (x1, _) = {
+        let tree = rt.tree_mut();
+        find_pos(tree, "obj_chest").unwrap()
+    };
+    assert!((x1 - x0 - 80.0).abs() < 0.5, "选中对象右移 80px（40帧×2）: {x0} -> {x1}");
+
+    // 二选 obj_lamp 后上移：150 - 40帧×2 = 70。
+    let (_, ly) = {
+        let tree = rt.tree_mut();
+        find_pos(tree, "obj_lamp").unwrap()
+    };
+    assert!((ly - 70.0).abs() < 0.5, "二次选中对象上移 80px: y={ly}");
+
+    // 未选中对象不动（编辑器语义：命令只作用于选中）。
+    // 注意（P2/D2 边界的如实记录）：spin 组件脚本的 `this.pos` 动的是
+    // 隐形 Host（comp0）而非实体 —— 组件引用实体需显式通道，这正是
+    // "组件不做自动实体发现"裁决的表现，不是 bug。
+    let (tx, _) = {
+        let tree = rt.tree_mut();
+        find_pos(tree, "obj_tree").unwrap()
+    };
+    assert!((tx - 60.0).abs() < 0.5, "未选中对象不动（spin 动 Host 不动实体，P2 边界）: {tx}");
+
+    // D1：回写无编辑态痕迹（selection 是运行时值）。
+    let doc = nes_scene::to_doc(rt.tree_mut());
+    let has_sel_prop = |d: &nes_scene::SceneDoc| -> bool {
+        fn walk(n: &nes_scene::NodeDoc) -> bool {
+            n.props.iter().any(|(k, _)| k.contains("sel"))
+                || n.children.iter().any(walk)
+                || !n.components.is_empty()
+        }
+        walk(&d.root)
+    };
+    assert!(!has_sel_prop(&doc), "编辑态（selection/组件展开）不落盘");
+
+    // 确定性。
+    let a = nes_runtime::headless::run(&root, "editor.ron", &trace, 100, 1.0 / 60.0).unwrap();
+    let b = nes_runtime::headless::run(&root, "editor.ron", &trace, 100, 1.0 / 60.0).unwrap();
+    assert_eq!(a.trace_hash, b.trace_hash);
+}

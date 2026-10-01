@@ -1,0 +1,37 @@
+// S8.4 第二项目验证：**地图编辑器对象系统**（评审排序第一候选）。
+// 刻意避开战斗/弹幕/机关 —— 验证"编辑/资源/长期状态"象限：
+// 对象 = Sprite + Trigger + Script 组件组合；选中/移动/属性面板
+//（编辑态）与 持久化回写（Project Model）分离。
+//
+// 演示口径（headless 可验证）：编辑器选一个对象（句柄保存在
+// selection 局部 = 编辑态运行时值，不进场景文件）；移动命令改
+// 对象 pos；回写时 selection 不落盘（D1：运行时值 ≠ Project
+// Model 类型）—— to_doc 后无 selection 痕迹。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/player.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/enemy.bmp", kind: "Texture"),
+        Res(id: 3, path: "Textures/heart.bmp", kind: "Texture"),
+        Res(id: 9, path: "Scripts/spin.nes", kind: "Script"),
+        Res(id: 10, path: "Scripts/blink.nes", kind: "Script"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            // 对象组：编辑器的"场景对象"。每个对象挂组件（行为组合）。
+            Node(name: "objects", kind: "Node", children: [
+                Node(name: "obj_tree", kind: "Sprite2D", local: (x: 60.0, y: 60.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), }, components: [Resource(9),], children: [],),
+                Node(name: "obj_chest", kind: "Sprite2D", local: (x: 160.0, y: 100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), }, components: [Resource(10),], children: [],),
+                Node(name: "obj_lamp", kind: "Sprite2D", local: (x: 260.0, y: 150.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, components: [Resource(9), Resource(10),], children: [],),
+            ],),
+            // 选择系统：Tab 循环选中（编辑态 = selection 局部里的句柄）。
+            Node(name: "sel_ctl", kind: "Script", props: { "source": "init { sel = 0; objs = children(node(\"objects\")) }\non \"input/key_down\" { if arg == \"Tab\" { sel = sel + 1; if sel >= len(objs) { sel = 0 }; for_each(objs) { it.z_index = 0 }; h = objs[sel]; node(h).z_index = 5; hud.text = \"SEL \" + num_to_str(sel) } }" }, children: [],),
+            // 移动命令：方向键移动**当前选中对象**（不是玩家 —— 编辑器语义）。
+            Node(name: "move_ctl", kind: "Script", props: { "source": "on \"tick\" { for_each(children(node(\"objects\"))) { if it.z_index == 5 { if key(\"ArrowLeft\") { it.pos = xy(it.pos.x - 2.0, it.pos.y) }; if key(\"ArrowRight\") { it.pos = xy(it.pos.x + 2.0, it.pos.y) }; if key(\"ArrowUp\") { it.pos = xy(it.pos.x, it.pos.y - 2.0) }; if key(\"ArrowDown\") { it.pos = xy(it.pos.x, it.pos.y + 2.0) } } } }" }, children: [],),
+            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "TAB=SELECT ARROWS=MOVE", }, children: [],),
+        ],
+    ),
+)
