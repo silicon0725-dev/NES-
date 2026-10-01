@@ -1601,33 +1601,39 @@ impl SceneTree {
                 break;
             }
             let sig = inflight.remove(0);
-            if !filter.matches(&sig.name) {
+            // 订阅过滤（S6.16）只管**广播**：连接是显式接线（S6.17/S6.18），
+            // 与观察者的订阅声明无关 —— NoObserver 宿主（如脚本 VM 挂载的
+            // 处理器）不能让显式连接静默失效（S6.19 实证修正）。
+            let broadcast = filter.matches(&sig.name);
+            if !broadcast {
                 stats.signals_filtered += 1;
-                continue;
             }
-            // 广播交付（无目标上下文）。
-            let mut cmds: Vec<Cmd> = Vec::new();
-            let mut re_emitted: Vec<Signal> = Vec::new();
-            {
-                let mut ctx = SignalCtx {
-                    dst: None,
-                    tree: &*self,
-                    cmds: &mut cmds,
-                    signals: &mut re_emitted,
-                };
-                obs.on_signal(&mut ctx, &sig);
+            if broadcast {
+                // 广播交付（无目标上下文）。
+                let mut cmds: Vec<Cmd> = Vec::new();
+                let mut re_emitted: Vec<Signal> = Vec::new();
+                {
+                    let mut ctx = SignalCtx {
+                        dst: None,
+                        tree: &*self,
+                        cmds: &mut cmds,
+                        signals: &mut re_emitted,
+                    };
+                    obs.on_signal(&mut ctx, &sig);
+                }
+                for c in cmds {
+                    self.apply_cmd(c);
+                }
+                inflight.append(&mut re_emitted);
+                stats.signals_delivered += 1;
             }
-            for c in cmds {
-                self.apply_cmd(c);
-            }
-            inflight.append(&mut re_emitted);
-            stats.signals_delivered += 1;
 
-            // 路由交付（订阅册，S6.17/S6.18）：广播后按注册序，每条命中连接
-            // 一次，目标节点作交付上下文；与广播同守 CAP（每次调用都是真实
+            // 路由交付（订阅册，S6.17/S6.18）：按注册序，每条命中连接一次，
+            // 目标节点作交付上下文；与广播同守 CAP（每次调用都是真实
             // 处理器）。双路：method=None -> 观察者交付；method=Some(m) ->
             // 引擎直接调用目标节点处理器表的 m（不经观察者；未注册则该连接
-            // 静默跳过 —— 接线期缺口不崩帧）。
+            // 静默跳过 —— 接线期缺口不崩帧）。路由不受观察者订阅过滤影响
+            //（显式接线，见上方广播处的修正注释）。
             let routed: Vec<(NodeId, Option<String>)> = self
                 .signal_connections
                 .iter()
