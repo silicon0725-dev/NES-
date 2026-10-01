@@ -720,6 +720,10 @@ cargo run --example s41_visual_closure
 > D1 口径）。与 S9-3a Selection 模型完全一致（select 就是 select，
 > 框选只是输入法）。475 绿。
 > **v1.81 注记（S10-2 第三项：选择指示器落地）**：editor_shell 新增
+> **v1.82 注记（S10-2 第四项：Gizmo 拖拽落地）**：选中对象直接鼠标
+> 拖拽移动 —— 点在已选对象上进入拖拽（记录偏移）；拖拽中 preview
+> 直写（会话态不入账）；松开 Inspector.modify_local 一次事务（100 帧
+> 拖拽 = 一条 undo 步，T-INS-02 口径实操兑现）。475 绿。
 > 选择指示器（Control 20x20 边框跟随主选位置，无选择移出视口）——
 > Gizmo 最小口径（视觉反馈，不是拖拽手柄）。Control 的 anchor/
 > offset/size 经提取层 `set_rect` 渲染边框（S4.2 既有件，编辑器
