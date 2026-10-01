@@ -16,12 +16,36 @@
 
 use core::ffi::c_void;
 use core::ptr;
+use std::sync::Mutex;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 const SW_SHOW: i32 = 5;
 const WM_DESTROY: u32 = 0x0002;
 const WM_QUIT: u32 = 0x0012;
 const PM_REMOVE: u32 = 0x0001;
+/// 字符输入（S6.34 编辑器面板的最小输入面）。
+const WM_CHAR: u32 = 0x0102;
+
+/// 进程级字符输入队列（`WM_CHAR` 落进 `wnd_proc` 时入队）。
+///
+/// **单窗口口径**：本引擎的帧循环一次驱动一个窗口，队列不区分来源
+/// （多窗口同时泵会串键 —— 编辑器面板是首个消费者，多窗口输入属后续）。
+/// [`inject_char`] 是同队列的程序化入口（自动化测试 / 辅助技术路径）。
+static TYPED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// 取走全部已入队的字符（按到达序）。
+pub fn drain_chars() -> Vec<u32> {
+    let mut guard = TYPED.lock().unwrap_or_else(|p| p.into_inner());
+    std::mem::take(&mut *guard)
+}
+
+/// 程序化注入一个字符（与真实按键同队列；自动化测试与示例演示用）。
+pub fn inject_char(code: u32) {
+    TYPED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(code);
+}
 
 #[repr(C)]
 struct Point {
@@ -107,6 +131,12 @@ unsafe extern "system" fn wnd_proc(
 ) -> isize {
     if msg == WM_DESTROY {
         unsafe { PostQuitMessage(0) };
+        return 0;
+    }
+    if msg == WM_CHAR {
+        // 键盘字符入队（回车 \r、退格 \x08 也在其中 —— 面板的编辑语义
+        // 由宿主解释，窗口层只投递事实）。wparam 是字符码（UTF-16 单元）。
+        TYPED.lock().unwrap_or_else(|p| p.into_inner()).push(wparam as u32);
         return 0;
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

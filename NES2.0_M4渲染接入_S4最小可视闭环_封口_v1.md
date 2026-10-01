@@ -322,6 +322,17 @@ cargo run --example s41_visual_closure
 > 新像素，**不整树重载**）；同文件多节点共享编译产物（`__file__:{path}`）；
 > `.nes` 入提示映射（文档见 `NES2.0_S6外置脚本资产_v1.md`）；新增
 > T-VM-09..10 与 T-Script-R4，scene 升至 165、runtime 至 30。
+> **v1.41 注记（S6.34 编辑器脚本面板）**：窗口 `wnd_proc` 增 WM_CHAR
+> 输入泵（进程级字符队列 + `drain_chars`/`inject_char` 双口，单窗口
+> 口径）；示例 `script_panel` 与 T-Panel-R1 组合已有件成编辑闭环 ——
+> 键入 → 宿主解释（回车提交/退格/可打印追加，编辑语义全在宿主）→
+> `set_prop source` + `poll_reloads` → **下一帧精灵像素换位**；坏脚本
+> last-good、状态行如实回显（`src>`/`in>`/`st>` 三行 Label + Control
+> 边框，引擎用自己的管线显示自己的编辑器）。实证两缺口：`open_windowed`
+> 资产根缺省当前目录（示例改 `open_windowed_with_root` + 绑定断言）、
+> 默认字体须宿主登记（无字体 Label 回落图集格）。场景/提取/渲染语义
+> 零改动（文档见 `NES2.0_S6编辑器脚本面板_v1.md`）；新增 T-In-01 与
+> T-Panel-R1，wgpu 升至 84、runtime 至 31（全仓合计 396）。
 
 | 事项 | 状态 |
 |---|---|

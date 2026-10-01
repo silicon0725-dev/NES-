@@ -29,11 +29,11 @@ python check_dependency_direction.py
 
 # 六 crate 测试（GPU 用例在无 DLL 环境自动跳过）
 cd nes-asset  && cargo test   # 34
-cd nes-scene  && cargo test   # 100
+cd nes-scene  && cargo test   # 165
 cd nes-render-extract && cargo test  # 42
 cd nes-render-api    && cargo test  # 40
-cd nes-render-wgpu   && cargo test  # 83
-cd nes-runtime && cargo test        # 22
+cd nes-render-wgpu   && cargo test  # 84
+cd nes-runtime && cargo test        # 31
 
 cargo clippy --all-targets   # 各 crate 零警告
 ```
@@ -43,6 +43,7 @@ cargo clippy --all-targets   # 各 crate 零警告
 ```bash
 cd nes-runtime
 cargo run --example engine_window      # 真窗口帧循环 + 动画（SceneObserver）+ 热重载
+cargo run --example script_panel       # 编辑器脚本面板（窗口键入 -> 提交 -> 热重载 -> 同帧像素）
 cargo run --example scene_disk         # 磁盘场景 -> 渲染 -> 回存
 cargo run --example subscene_reload    # 子场景热重载（改文件 -> 整树重载）
 ```
