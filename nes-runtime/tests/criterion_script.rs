@@ -438,3 +438,56 @@ fn t_script_r4_external_nes_asset_end_to_end() {
     let saved = std::fs::read_to_string(root.join("scene_saved.ron")).unwrap();
     assert!(saved.contains("\"script\": Resource(2)"), "槽位引用往返：\n{saved}");
 }
+
+/// T-Script-R5（S8.2 实证缺口回归）：**宿主装载顺序** —— 先 declare/bind/
+/// upload 再 `load_scene`（整表替换）后，场景里的纹理精灵**仍然入画**。
+/// 根因：instantiate_scene 替换的新表槽位无 AssetKey，提取层静默丢精灵
+/// （窗口实测：HUD 文字在、精灵不在）；修复 = 加载习语收口（load =
+/// 替换 + bind，与 poll_scene_reload 同口径）。离屏像素断言与窗口表面
+/// 共用同一条命令路径。
+#[test]
+fn t_script_r5_load_scene_keeps_textured_sprites() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_script")
+        .join("r5");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Textures")).unwrap();
+    write_bmp_rgba(&root.join("Textures").join("demo.bmp"), 16, 16, &quadrant_rgba(&V1))
+        .expect("写演示纹理");
+    // 场景文件：资源表 + 纹理精灵（纹理引用来自场景文件而非宿主代码）。
+    let scene = r#"Scene(
+    version: 1,
+    resources: [Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            Node(name: "sp", kind: "Sprite2D", local: (x: 24.0, y: 24.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), }, children: [],),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root.join("scene.ron"), scene).expect("写场景");
+
+    let Ok(mut rt) = NesRuntime::open_with_root(&root, 64, 64) else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+    // 陷阱顺序：先声明/绑定/上传，后 load_scene（整表替换）。
+    let _res = rt.declare_texture("Textures/demo.bmp").expect("声明纹理");
+    let report = rt.bind_assets();
+    assert_eq!(report.loaded.len(), 1);
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 1);
+    rt.load_scene("scene.ron").expect("加载（内部已收口 bind 习语）");
+
+    let out = rt.frame(&frame(0)).expect("帧");
+    // 精灵在 (24,24)：16x16 四象限纹理，左上格 = V1[0]（黄）。
+    assert_eq!(
+        out.image.pixel(26, 26),
+        Some(V1[0]),
+        "load_scene 后纹理精灵仍入画（加载习语收口）"
+    );
+    assert!(out.stats.drawn >= 1);
+    assert_eq!(out.stats.driver_errors, 0);
+}

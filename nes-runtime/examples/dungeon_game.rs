@@ -28,9 +28,21 @@ fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
 }
 
 fn main() {
-    // 资产根 = 仓库内的游戏目录（场景/轨迹/纹理都在这儿 —— headless
+    // 资产根：**exe 同目录的 assets/ 优先**（便携分发形态 —— 双击即玩），
+    // 没有则回落到仓库内开发目录（场景/轨迹/纹理都在那儿 —— headless
     // CLI 直接跑同一份场景文件）。
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let portable = exe_dir
+        .as_ref()
+        .map(|d| d.join("assets").join("dungeon.ron").is_file())
+        .unwrap_or(false);
+    let root = if portable {
+        exe_dir.unwrap().join("assets")
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets")
+    };
     let tex = root.join("Textures");
     std::fs::create_dir_all(&tex).unwrap();
     for (name, rgb) in [
@@ -56,9 +68,13 @@ fn main() {
     assert_eq!(report.loaded.len(), 5, "纹理绑定：{report:?}");
     assert_eq!(rt.upload_pending_textures().expect("上传"), 5);
     {
-        // 默认字体（HUD Label）。
-        let font_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../nes-render-wgpu/examples/assets");
+        // 默认字体（HUD Label）：便携包带字体则用包内，否则仓库开发目录。
+        let font_dir = if root.join("font_atlas.bmp").is_file() {
+            root.clone()
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../nes-render-wgpu/examples/assets")
+        };
         let (w, h, sheet) =
             bmp::load_rgba(&std::fs::read(font_dir.join("font_atlas.bmp")).expect("读字形表"))
                 .expect("解码字形表");

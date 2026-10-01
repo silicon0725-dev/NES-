@@ -325,6 +325,13 @@ impl NesRuntime {
         self.table = table;
         self.uploaded_version.clear();
         self.scene_source = None;
+        // 加载习语收口（S8.2 实证缺口）：整表替换后新表槽位**没有键** ——
+        // 不 bind 则提取层拿不到 RenderAssetKey，场景里的纹理精灵整个
+        // 静默消失（Mini Dungeon 窗口实测：HUD 文字在、精灵不在）。
+        // 与 `poll_scene_reload` 同一口径：load = 替换 + bind。GPU 侧键
+        // 按路径派生、同路径同键，早前上传仍有效（uploaded_version 清空
+        // 只影响热重载重传账目）。
+        let _ = self.bind_assets();
         Ok(report)
     }
 
