@@ -121,7 +121,7 @@ fn main() {
         });
         assert!(issues.is_empty(), "脚本装载：{issues:?}");
     }
-    rt.mount_key_probe(&mut vm);
+    rt.mount_input_view(&mut vm);
 
     let total: u64 = std::env::var("NES_GAME_FRAMES")
         .ok()

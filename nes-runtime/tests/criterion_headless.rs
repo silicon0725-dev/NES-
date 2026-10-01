@@ -262,7 +262,7 @@ fn t_gp_01_dodge_gameplay_and_determinism() {
         });
         assert!(issues.is_empty(), "{issues:?}");
     }
-    rt.mount_key_probe(&mut vm);
+    rt.mount_input_view(&mut vm);
     let mut lose_at = None;
     for f in 0..1500u64 {
         let snap = rt.collect_input();
@@ -460,7 +460,7 @@ fn t_gp_02_dungeon_gameplay_and_determinism() {
         std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
     });
     assert!(issues.is_empty(), "{issues:?}");
-    rt.mount_key_probe(&mut vm);
+    rt.mount_input_view(&mut vm);
     let mut lose_at = None;
     for f in 0..2000u64 {
         let _ = rt.collect_input();

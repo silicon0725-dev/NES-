@@ -3,7 +3,7 @@
 //! | 编号 | 契约 |
 //! |---|---|
 //! | T-In-R1 | `collect_input`：注入事件折叠成帧快照（边缘/按住/text/resize）；`emit_input_signals` 把边缘发成标准 `input/*` 信号，脚本 `on "input/key_down"` 当帧收到并写节点 |
-//! | T-In-R2 | `mount_key_probe` + `key("名")`：按住期间每帧驱动、松开后停 —— 全链（事件队列 -> 折叠 -> 共享快照 -> 探针 -> VM） |
+//! | T-In-R2 | `mount_input_view` + `key("名")`：按住期间每帧驱动、松开后停 —— 全链（事件队列 -> 折叠 -> 共享快照 -> 探针 -> VM） |
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -135,7 +135,7 @@ fn t_in_r2_key_probe_full_chain() {
     };
     let mut vm = ScriptVm::new();
     assert!(vm.attach_all(rt.tree_mut()).is_empty());
-    rt.mount_key_probe(&mut vm); // 装一次（共享槽）
+    rt.mount_input_view(&mut vm); // 装一次（共享槽）
 
     // 帧 1：按住 ArrowRight + 宿主节拍 go -> 移动。
     inject_input(InputEvent::Key { key: Key::ArrowRight, down: true });

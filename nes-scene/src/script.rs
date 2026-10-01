@@ -142,6 +142,13 @@ pub enum Op {
     /// `Array[NodeHandle]` = 该节点子节点（**child order**，S8.2b v1.1
     /// 冻结：结构序，不另造排序）。
     Children,
+    /// 输入读面（S8.2b-3，同帧只读快照）：鼠标位置/增量、按钮、文本长。
+    MouseX,
+    MouseY,
+    MouseDX,
+    MouseDY,
+    Button,
+    TextLen,
 }
 
 /// 脚本入口。
@@ -242,7 +249,7 @@ fn run<'a, 'b>(
     locals: &mut BTreeMap<String, Value>,
     ctx: &mut VmCtx<'a, 'b>,
     arg: Value,
-    probe: &ProbeSlot,
+    input: &InputSlot,
 ) {
     let mut stack: Vec<StackVal> = Vec::new();
     let mut pc = 0usize;
@@ -557,11 +564,51 @@ fn run<'a, 'b>(
                 let Value::Str(name) = a else {
                     halt!("key(..) 需要 Str 键名");
                 };
-                // 槽内克隆再调用：探针闭包只读快照，不回调进 VM（无重入）。
-                let Some(p) = probe.borrow().clone() else {
-                    halt!(format!("key(\"{name}\") 未接输入探针（宿主未注入）"));
+                // 槽内克隆再调用：视图只读快照，不回调进 VM（无重入）。
+                let Some(v) = input.borrow().clone() else {
+                    halt!(format!("key(\"{name}\") 未接输入读面（宿主未注入）"));
                 };
-                stack.push(StackVal::V(Value::Bool(p(&name))));
+                stack.push(StackVal::V(Value::Bool(v.key(&name))));
+            }
+            Op::MouseX => {
+                let Some(v) = input.borrow().clone() else {
+                    halt!("mouse_x() 未接输入读面（宿主未注入）");
+                };
+                stack.push(StackVal::V(Value::F32(v.mouse().0)));
+            }
+            Op::MouseY => {
+                let Some(v) = input.borrow().clone() else {
+                    halt!("mouse_y() 未接输入读面（宿主未注入）");
+                };
+                stack.push(StackVal::V(Value::F32(v.mouse().1)));
+            }
+            Op::MouseDX => {
+                let Some(v) = input.borrow().clone() else {
+                    halt!("mouse_dx() 未接输入读面（宿主未注入）");
+                };
+                stack.push(StackVal::V(Value::F32(v.mouse_delta().0)));
+            }
+            Op::MouseDY => {
+                let Some(v) = input.borrow().clone() else {
+                    halt!("mouse_dy() 未接输入读面（宿主未注入）");
+                };
+                stack.push(StackVal::V(Value::F32(v.mouse_delta().1)));
+            }
+            Op::Button => {
+                let a = pop_val!();
+                let Value::Str(name) = a else {
+                    halt!("button(..) 需要 Str 按钮名");
+                };
+                let Some(v) = input.borrow().clone() else {
+                    halt!(format!("button(\"{name}\") 未接输入读面（宿主未注入）"));
+                };
+                stack.push(StackVal::V(Value::Bool(v.button(&name))));
+            }
+            Op::TextLen => {
+                let Some(v) = input.borrow().clone() else {
+                    halt!("text_len() 未接输入读面（宿主未注入）");
+                };
+                stack.push(StackVal::V(Value::I64(v.text_len() as i64)));
             }
             Op::Pack => {
                 let y = pop_val!();
@@ -672,12 +719,26 @@ fn num_of(v: &Value) -> Option<f32> {
     }
 }
 
-/// 键探针（宿主注入的 `key("名") -> Bool` 求值源；VM 不碰平台）。
-pub type KeyProbe = Rc<dyn Fn(&str) -> bool>;
+/// 输入读面（S8.2b-3，v1.2 冻结链路）：同帧只读快照的脚本视图。
+/// `key()/mouse_x()/mouse_y()/mouse_dx()/mouse_dy()/button()/text_len()`
+/// 全部经此 —— 与 S7.2 快照同源、零信号消费、零宿主事件路由。
+/// VM 不碰平台（注入纪律同文件读取器/键探针）。
+pub trait InputView {
+    /// 键是否按住（held 口径）。
+    fn key(&self, name: &str) -> bool;
+    /// 鼠标位置（客户区像素）。
+    fn mouse(&self) -> (f32, f32);
+    /// 本帧鼠标位移。
+    fn mouse_delta(&self) -> (f32, f32);
+    /// 鼠标按钮是否按住。
+    fn button(&self, name: &str) -> bool;
+    /// 当前帧提交文本的元素数（== snapshot.text.len()，v1.1 冻结单位）。
+    fn text_len(&self) -> usize;
+}
 
-/// 探针共享槽：信号处理器闭包（装进树的处理器表）与 process 路径
-/// （留在 VM 里）共享同一份 —— attach 后 `set_key_probe` 也立即生效。
-type ProbeSlot = Rc<RefCell<Option<KeyProbe>>>;
+/// 读面共享槽：信号处理器闭包（装进树的处理器表）与 process 路径
+/// （留在 VM 里）共享同一份 —— attach 后 `set_input_view` 也立即生效。
+type InputSlot = Rc<RefCell<Option<Rc<dyn InputView>>>>;
 
 /// 脚本 VM：注册表 + 每脚本局部状态（跨调用持久 —— 计数器/累积器语义）。
 pub struct ScriptVm {    /// 键 -> 脚本（宿主登记 + 内嵌派生键）。
@@ -696,9 +757,10 @@ pub struct ScriptVm {    /// 键 -> 脚本（宿主登记 + 内嵌派生键）�
     /// 节点 -> 该节点的信号连接句柄（S6.32）。重挂载**先断旧再接新**
     /// —— 否则每次 attach 叠加一条连接、信号命中多次（潜伏缺口实证修复）。
     node_conn: HashMap<NodeId, crate::tree::SignalConnectionId>,
-    /// 键探针槽（S7.2）：宿主经 [`Self::set_key_probe`] 注入；信号处理器
-    /// 闭包与 process 路径共享同一份（attach 后改设也立即生效）。
-    probe: ProbeSlot,
+    /// 输入读面槽（S7.2 键探针 -> S8.2b-3 扩面）：宿主经
+    /// [`Self::set_input_view`] 注入；信号处理器闭包与 process 路径
+    /// 共享同一份（attach 后改设也立即生效）。
+    input: InputSlot,
 }
 
 impl Default for ScriptVm {
@@ -716,15 +778,15 @@ impl ScriptVm {
             inline_stamp: HashMap::new(),
             file_stamp: HashMap::new(),
             node_conn: HashMap::new(),
-            probe: Rc::new(RefCell::new(None)),
+            input: Rc::new(RefCell::new(None)),
         }
     }
 
-    /// 注入键探针（S7.2）：`key("名")` 的求值源 —— 运行时把
-    /// `InputSnapshot::is_down` 接进来（VM 不碰平台，与文件读取器
-    /// 同一注入纪律）。可在 attach 之前或之后设置。
-    pub fn set_key_probe(&mut self, probe: KeyProbe) {
-        *self.probe.borrow_mut() = Some(probe);
+    /// 注入输入读面（S8.2b-3；S7.2 键探针的扩面）：`key()/mouse_x()/
+    /// button()/text_len()` 的同帧只读求值源 —— 运行时把整份
+    /// `InputSnapshot` 接进来。可在 attach 之前或之后设置（共享槽）。
+    pub fn set_input_view(&mut self, view: Rc<dyn InputView>) {
+        *self.input.borrow_mut() = Some(view);
     }
 
     /// 登记一个脚本（键 = `registry_key` 引用值；同名替换）。
@@ -846,7 +908,7 @@ impl ScriptVm {
             ScriptEntry::Signal(name) => {
                 // 处理器表闭包 + 方法连接（S6.18 substrate）。
                 let states = self.states.clone();
-                let probe = self.probe.clone();
+                let input = self.input.clone();
                 let ok = tree.set_signal_handler(
                     node,
                     "run",
@@ -854,7 +916,7 @@ impl ScriptVm {
                         let mut locals = states.borrow_mut().remove(&node).unwrap_or_default();
                         if let Some(init) = &script.init {
                             if !locals.contains_key(INIT_LOCAL) {
-                                run(init, node, &mut locals, &mut VmCtx::Signal(ctx), Value::I64(0), &probe);
+                                run(init, node, &mut locals, &mut VmCtx::Signal(ctx), Value::I64(0), &input);
                                 locals.insert(INIT_LOCAL.to_string(), Value::Bool(true));
                             }
                         }
@@ -864,7 +926,7 @@ impl ScriptVm {
                             &mut locals,
                             &mut VmCtx::Signal(ctx),
                             sig.payload.clone(),
-                            &probe,
+                            &input,
                         );
                         states.borrow_mut().insert(node, locals);
                     }),
@@ -1118,7 +1180,7 @@ impl SceneObserver for ScriptVm {
         let mut locals = self.states.borrow_mut().remove(&node).unwrap_or_default();
         if let Some(init) = &script.init {
             if !locals.contains_key(INIT_LOCAL) {
-                run(init, node, &mut locals, &mut VmCtx::Node(ctx), Value::I64(0), &self.probe);
+                run(init, node, &mut locals, &mut VmCtx::Node(ctx), Value::I64(0), &self.input);
                 locals.insert(INIT_LOCAL.to_string(), Value::Bool(true));
             }
         }
@@ -1128,7 +1190,7 @@ impl SceneObserver for ScriptVm {
             &mut locals,
             &mut VmCtx::Node(ctx),
             Value::F32(delta),
-            &self.probe,
+            &self.input,
         );
         self.states.borrow_mut().insert(node, locals);
     }
@@ -2522,6 +2584,27 @@ impl TextParser {
                 self.expr(ops)?;
                 self.expect_sym(')')?;
                 ops.push(Op::NumStr);
+                return Ok(());
+            }
+            for (nm, op) in [
+                ("mouse_x", Op::MouseX),
+                ("mouse_y", Op::MouseY),
+                ("mouse_dx", Op::MouseDX),
+                ("mouse_dy", Op::MouseDY),
+                ("text_len", Op::TextLen),
+            ] {
+                if name == nm && matches!(self.peek2().tok, Tok::Sym('(')) {
+                    self.pos += 2; // nm (
+                    self.expect_sym(')')?;
+                    ops.push(op);
+                    return Ok(());
+                }
+            }
+            if name == "button" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // button (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::Button);
                 return Ok(());
             }
             if name == "array" && matches!(self.peek2().tok, Tok::Sym('(')) {

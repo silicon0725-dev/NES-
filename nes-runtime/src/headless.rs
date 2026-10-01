@@ -94,7 +94,7 @@ impl NesRuntime {
                 )));
             }
         }
-        self.mount_key_probe(&mut vm);
+        self.mount_input_view(&mut vm);
 
         let mut frame_hashes = Vec::with_capacity(frames as usize);
         for f in 0..frames {

@@ -591,13 +591,15 @@ impl NesRuntime {
         n
     }
 
-    /// 给脚本 VM 接键探针（`key("名")` -> 本帧快照 `is_down`）。
+    /// 给脚本 VM 接输入读面（S8.2b-3；S7.2 键探针的扩面）：`key()/
+    /// mouse_x()/mouse_y()/mouse_dx()/mouse_dy()/button()/text_len()`
+    /// 全部读同一份同帧快照 —— 只读、零信号消费（v1.2 冻结链路）。
     ///
     /// 装一次即可（共享槽：之后每帧 `collect_input` 自动刷新读数）。
     /// VM 不碰平台 —— 与文件读取器同一注入纪律（S6.33/S7.2）。
-    pub fn mount_key_probe(&self, vm: &mut ScriptVm) {
+    pub fn mount_input_view(&self, vm: &mut ScriptVm) {
         let state = self.input_state.clone();
-        vm.set_key_probe(Rc::new(move |name: &str| state.borrow().is_down(name)));
+        vm.set_input_view(Rc::new(SnapshotView(state)));
     }
 
     /// 轮询文件变化（内容戳判定）。变化后调用 [`Self::upload_pending_textures`] 重传。
@@ -736,6 +738,32 @@ pub fn write_bmp_rgba(
 }
 
 /// 从消费器借出 GPU 上下文引用（组装层内部用：表面创建需要 &GpuContext）。
+/// 输入快照的脚本只读视图（S8.2b-3）：`mount_input_view` 的注入体。
+struct SnapshotView(Rc<RefCell<InputSnapshot>>);
+
+impl nes_scene::InputView for SnapshotView {
+    fn key(&self, name: &str) -> bool {
+        self.0.borrow().is_down(name)
+    }
+    fn mouse(&self) -> (f32, f32) {
+        let s = self.0.borrow();
+        (s.mouse.x, s.mouse.y)
+    }
+    fn mouse_delta(&self) -> (f32, f32) {
+        let s = self.0.borrow();
+        (s.mouse_delta.x, s.mouse_delta.y)
+    }
+    fn button(&self, name: &str) -> bool {
+        let s = self.0.borrow();
+        nes_render_api::input::MouseButton::from_name(name)
+            .map(|b| s.buttons_held[b.index()])
+            .unwrap_or(false)
+    }
+    fn text_len(&self) -> usize {
+        self.0.borrow().text.len()
+    }
+}
+
 fn consumer_ctx(consumer: &CommandConsumer) -> &GpuContext {
     consumer.ctx()
 }

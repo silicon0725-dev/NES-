@@ -479,6 +479,15 @@ cargo run --example s41_visual_closure
 > **child order** + 索引/len 运行时类型分派（Str/Array）。`__fe` 前缀
 > 保留给脱糖隐藏局部。T-A-01..05（深拷贝/结构序/快照+流控/it 实体写/
 > 确定性指纹含句柄数组语义化）。scene 升至 189（全仓合计 447）。
+> **v1.56 注记（S8.2b-3 输入读面落地 + Array 持久化契约冻结）**：
+> `InputView` trait（key/mouse/mouse_delta/button/text_len —— 同帧
+> 只读快照的脚本视图）替换键探针单槽，`mount_input_view` 注入；
+> 链路 = 快照 -> 共享只读视图 -> 内建 -> 脚本（零信号、零隐藏局部
+> 中转，v1.2 冻结方向）。鼠标瞄准等"frame-global 只读状态"从此不
+> 再需要事件路由。Array 持久化契约冻结：VM 局部运行时值，不进
+> 属性表/序列化/持久身份（与 Node 同口径；进存档体系前须先裁决
+> NodeHandle 持久化表示）。新增 T-IR-01..02，scene 升至 191
+>（全仓合计 449）。
 
 | 事项 | 状态 |
 |---|---|
