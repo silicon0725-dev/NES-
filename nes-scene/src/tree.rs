@@ -505,6 +505,111 @@ pub trait SceneObserver {
     }
 }
 
+/// 观察者组合（S7.1.3 冻结）：**注册序稳定 Vec**，派发按注册序转发
+/// 给全部成员 —— 引擎侧永不引入优先级数值 / HashMap 排序。
+///
+/// 裁决口径：
+/// - **一个节点可以挂多少观察者？** 观察者是**宿主级**不是节点级：
+///   每个生命周期/帧回调对全部注册观察者各调一次（注册序）；
+/// - **同一节点回调内**，后注册成员看到先注册成员**落地前**的状态
+///   （Cmd 批次在整组回调返回后才落地 —— 与单观察者自身的批语义
+///   同一条屏障）；
+/// - **订阅过滤取并集**：任一成员订阅的广播都会送达组合（送达后
+///   各成员在 `on_signal` 里自行忽略不关心的名字）—— 一个成员的
+///   过滤器不能静默掐掉另一个成员的邮件；
+/// - 泵的统计口径不变：组合对引擎是**一个**观察者（`signals_delivered`
+///   按泵交付计，不按成员数放大）。
+pub struct Observers {
+    inner: Vec<Box<dyn SceneObserver>>,
+}
+
+impl Observers {
+    /// 空组合（零成员 —— 所有回调空转）。
+    pub fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+
+    /// 追加一个成员，返回其注册序号（从 0 起）。注册序即派发序，
+    /// 运行期不可重排（要换序就重建组合）。
+    pub fn push(&mut self, obs: Box<dyn SceneObserver>) -> usize {
+        self.inner.push(obs);
+        self.inner.len() - 1
+    }
+
+    /// 成员数。
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// 是否没有成员。
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl Default for Observers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SceneObserver for Observers {
+    fn on_tree_event(&mut self, tree: &SceneTree, ev: &TreeEvent) {
+        for o in &mut self.inner {
+            o.on_tree_event(tree, ev);
+        }
+    }
+
+    fn on_enter_tree(&mut self, ctx: &mut NodeCtx<'_>) {
+        for o in &mut self.inner {
+            o.on_enter_tree(ctx);
+        }
+    }
+
+    fn on_ready(&mut self, ctx: &mut NodeCtx<'_>) {
+        for o in &mut self.inner {
+            o.on_ready(ctx);
+        }
+    }
+
+    fn on_process(&mut self, ctx: &mut NodeCtx<'_>, delta: f32) {
+        for o in &mut self.inner {
+            o.on_process(ctx, delta);
+        }
+    }
+
+    fn on_exit_tree(&mut self, tree: &SceneTree, node: NodeId) {
+        for o in &mut self.inner {
+            o.on_exit_tree(tree, node);
+        }
+    }
+
+    fn on_signal(&mut self, ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        for o in &mut self.inner {
+            o.on_signal(ctx, sig);
+        }
+    }
+
+    fn signal_filter(&self) -> SignalFilter {
+        // 并集：任一成员 All 即 All；否则合并名/前缀集。
+        let mut names = Vec::new();
+        let mut prefixes = Vec::new();
+        for o in &self.inner {
+            match o.signal_filter() {
+                SignalFilter::All => return SignalFilter::All,
+                SignalFilter::Select {
+                    names: mut n,
+                    prefixes: mut p,
+                } => {
+                    names.append(&mut n);
+                    prefixes.append(&mut p);
+                }
+            }
+        }
+        SignalFilter::Select { names, prefixes }
+    }
+}
+
 /// 一条信号：名字键 + 值载荷 + 发射源（`None` = 宿主/无名源）。
 ///
 /// 载荷是 [`Value`]（值语义，交付即拷贝）。草案 §12：入队、帧末统一 flush、
@@ -705,6 +810,10 @@ pub struct TickStats {
     /// 其中经订阅册**路由交付**的次数（一条信号可路由多次：每条命中
     /// 连接一次；计入 `signals_delivered` 并单独在此可观测）。
     pub signals_routed: usize,
+    /// 因目标节点**生效模式被跳过的处理器调用**数（S7.1 冻结：路由
+    /// 交付与 process 同表门控 —— Disabled 永不调用、Pausable 暂停中
+    /// 跳过；跳过的调用不进 `signals_routed`）。
+    pub handlers_skipped: usize,
     /// 超出交付上限被丢弃的信号数（ runaway 级联的如实计数）。
     pub signals_dropped: usize,
 }
@@ -1644,6 +1753,26 @@ impl SceneTree {
                 if stats.signals_delivered >= SIGNAL_DELIVERY_CAP {
                     stats.signals_dropped += 1; // 该信号剩余路由被截断
                     continue;
+                }
+                // 生效模式门控（S7.1 冻结）：路由交付与 process 同表 ——
+                // **Disabled 永不调用**（行为完全惰性）、**Pausable 暂停中
+                // 跳过**（暂停冻结 Pausable 族的时间与事件两者）、
+                // Always / WhenPaused 照常。与 S6.4"信号仍然工作"不冲突：
+                // 那条口径覆盖的是**宿主广播路径**（obs.on_signal，下方
+                // 不受门控）—— 订阅册/处理器表是 S6.17/18 才有的面。
+                // 事件不排队：跳过即丢弃，如实计数。
+                match self.effective_process_mode(dst) {
+                    ProcessMode::Disabled => {
+                        stats.handlers_skipped += 1;
+                        continue;
+                    }
+                    ProcessMode::Pausable | ProcessMode::Inherit => {
+                        if paused {
+                            stats.handlers_skipped += 1;
+                            continue;
+                        }
+                    }
+                    ProcessMode::Always | ProcessMode::WhenPaused => {}
                 }
                 let mut cmds: Vec<Cmd> = Vec::new();
                 let mut re_emitted: Vec<Signal> = Vec::new();

@@ -346,6 +346,18 @@ cargo run --example s41_visual_closure
 > 前序）、NodeId 带代号、unsafe 逐块 SAFETY 注。新增 T-Stab-01..04，
 > scene 升至 166、wgpu 至 87（全仓合计 400，文档见
 > `NES2.0_S7引擎收束_stabilization_v1.md`）。
+> **v1.43 注记（S7.1 运行时语义冻结）**：四题裁决 + 契约测试固化 ——
+> ①黄金帧序（结构落地+桥 → enter → ready → process[五模式表] → 信号
+> 泵[宿主预发++帧内发射，桥最前] → 变换冲洗；每回调微批次即时落地）；
+> ②暂停矩阵补全：路由处理器与 process 同表门控（Disabled 永不调用、
+> Pausable 暂停中跳过、Always/WhenPaused 照常；广播不受暂停影响 ——
+> 本轮唯一行为变更，新增 `handlers_skipped` 观测）；③`Observers` 组合
+> （注册序稳定 Vec、同节点回调内后注册见先注册落地前状态、订阅过滤
+> 并集、组合对引擎是一个观察者）；④Cmd 可见性微批次屏障（级联读新值/
+> 自读旧值/末写胜/结构[Spawn]下一帧帧首落地/信号驱动 SetLocal 当帧
+> 冲洗入画；connect/disconnect 不是 Cmd —— 回调不可改接线）。
+> 新增 T-RS-01..04（含 02b/03b）与 T-RS-R1，scene 升至 172、runtime
+> 至 32（全仓合计 407，文档见 `NES2.0_S7.1运行时语义冻结_v1.md`）。
 
 | 事项 | 状态 |
 |---|---|
