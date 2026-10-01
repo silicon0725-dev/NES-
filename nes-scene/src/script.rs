@@ -33,7 +33,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use crate::identity::NodeId;
+use crate::identity::{NodeHandle, NodeId};
 use crate::node::NodeKindTag;
 use crate::transform::Vec2;
 use crate::tree::{NodeCtx, SceneObserver, SceneTree, Signal, SignalCtx};
@@ -124,6 +124,13 @@ pub enum Op {
     /// 闭环 —— HUD 显示数值）。F32 用最短往返表示（Rust Display 口径，
     /// 跨版本稳定）。
     NumStr,
+    /// `node(e)`（S8.2b-1）：弹值 —— Str 按名解析 / Node 句柄 resolve
+    ///（**统一 resolve 边界**：gen 校验在此），压 N。悬垂如实停机。
+    NodeRef,
+    /// 复制栈顶节点（S8.2b-1）：复合赋值 `node(h).m OP= e` 的读侧双压
+    ///（一个给读消费、一个留给写回收 —— 与既有 `name.member OP=` 的
+    /// 双 NodeByName 同构）。栈顶非节点停机。
+    DupN,
 }
 
 /// 脚本入口。
@@ -181,6 +188,18 @@ pub enum StackVal {
     N(NodeId),
 }
 
+/// **统一 resolve 边界**（S8.2b v1.1 冻结的不变量实现）：任何脚本获得
+/// 的句柄在进入实体操作（handle -> N）前必须经此处做 generation 校验。
+/// 悬垂返回 `None`（不会"撞上复用槽位的另一个节点"）。
+///
+/// 中期执行内 N 不会失效的证明：回调持有只读树、结构变更延迟到下一帧
+/// 帧首落地（S7.1）—— 校验点覆盖全部 handle->N 通道（NodeRef 与
+/// Local 物化）即覆盖全部实体访问。
+fn resolve_handle(tree: &SceneTree, h: NodeHandle) -> Option<NodeId> {
+    let id = h.to_id();
+    tree.contains(id).then_some(id)
+}
+
 /// VM 上下文适配：同一套 [`Op`] 在两种入口下运行，权限按入口收敛。
 enum VmCtx<'a, 'b> {
     /// process 入口：本节点的 NodeCtx（只能写自身）。
@@ -236,7 +255,10 @@ fn run<'a, 'b>(
         () => {
             match stack.pop() {
                 Some(StackVal::V(v)) => v,
-                Some(StackVal::N(_)) => halt!("栈顶不是值"),
+                // 节点作为一等值落地（S8.2b-1 边界转换：N -> V(Node)）——
+                // SetLocal/数组等值位由此自然持有句柄；类型敏感的指令
+                // （算术等）会在自己的类型检查处如实停机。
+                Some(StackVal::N(n)) => Value::Node(NodeHandle::of(n)),
                 None => halt!("stack underflow"),
             }
         };
@@ -248,9 +270,18 @@ fn run<'a, 'b>(
         }
         match &ops[pc] {
             Op::Const(v) => stack.push(StackVal::V(v.clone())),
-            Op::Local(name) => stack.push(StackVal::V(
-                locals.get(name).cloned().unwrap_or(Value::I64(0)),
-            )),
+            Op::Local(name) => {
+                // 局部读：句柄物化为 N（S8.2b-1 边界转换）。**handle->N
+                // 即校验点**（v1.1 不变量：每次实体访问前 generation 校验；
+                // Local 是句柄进入实体操作的主要通道）。
+                match locals.get(name).cloned().unwrap_or(Value::I64(0)) {
+                    Value::Node(h) => match resolve_handle(ctx.tree(), h) {
+                        Some(id) => stack.push(StackVal::N(id)),
+                        None => halt!("局部里的句柄已悬垂（节点已删除）"),
+                    },
+                    v => stack.push(StackVal::V(v)),
+                }
+            }
             Op::SetLocal(name) => {
                 let v = pop_val!();
                 locals.insert(name.clone(), v);
@@ -387,7 +418,11 @@ fn run<'a, 'b>(
                         _ => x == y,
                     },
                     (Some(StackVal::N(x)), Some(StackVal::N(y))) => x == y,
-                    _ => halt!("Eq 栈不足或混合"),
+                    // 节点 vs 非节点 = false（S8.2b-1：句柄与数值比较给
+                    // 确定的假，不炸 —— 引用等式只对引用有意义）。
+                    (Some(StackVal::N(_)), Some(StackVal::V(_)))
+                    | (Some(StackVal::V(_)), Some(StackVal::N(_))) => false,
+                    _ => halt!("Eq 栈不足"),
                 };
                 stack.push(StackVal::V(Value::Bool(eq)));
             }
@@ -532,6 +567,28 @@ fn run<'a, 'b>(
                 };
                 stack.push(StackVal::V(Value::Str(text)));
             }
+            Op::NodeRef => {
+                let a = pop_val!();
+                match a {
+                    Value::Str(name) => match ctx.tree().find_by_name(&name) {
+                        Some(n) => stack.push(StackVal::N(n)),
+                        None => halt!(format!("node(\"{name}\") 找不到该名节点")),
+                    },
+                    // **统一 resolve 边界**：句柄 -> N 的唯一另一通道。
+                    // gen 校验在此；成员读写指令（GetT/SetT/GetProp/SetProp）
+                    // 全部消费本边界的产物，不自行信任任何句柄。
+                    Value::Node(h) => match resolve_handle(ctx.tree(), h) {
+                        Some(id) => stack.push(StackVal::N(id)),
+                        None => halt!("句柄已悬垂（节点已删除）"),
+                    },
+                    _ => halt!("node(..) 需要 Str 或节点句柄"),
+                }
+            }
+            Op::DupN => match stack.last() {
+                Some(StackVal::N(n)) => stack.push(StackVal::N(*n)),
+                Some(StackVal::V(_)) => halt!("DupN 栈顶不是节点"),
+                None => halt!("stack underflow"),
+            },
         }
         pc += 1;
     }
@@ -1819,6 +1876,66 @@ impl TextParser {
                 ops.push(Op::Emit(name));
                 Ok(())
             }
+            // `node(...).member = expr`（S8.2b-1 赋值目标形态）：node 调用
+            // 前缀编译为 [expr, NodeRef]（实体压栈），后续与既有成员赋值
+            // 同构（纯 = / 复合 OP= / 后缀 ++/--）。
+            Tok::Ident(k) if k == "node" && matches!(self.peek2().tok, Tok::Sym('(')) => {
+                self.pos += 2; // node (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::NodeRef);
+                self.expect_sym('.')?;
+                let member = match self.next().tok {
+                    Tok::Ident(m) => m,
+                    _ => return Err(self.err_here("期望属性名或 `pos`")),
+                };
+                // 后缀 ++/--：`node(h).member++` —— 与复合同构。
+                if let Tok::Sym2(s2) = self.peek().tok.clone() {
+                    if s2 == "++" || s2 == "--" {
+                        self.pos += 1;
+                        let op = if s2 == "++" { Op::Add } else { Op::Sub };
+                        // 读侧双压：一个 NodeRef 给读、一个留给写。
+                        ops.push(Op::DupN);
+                        if member == "pos" {
+                            ops.push(Op::GetT);
+                        } else {
+                            ops.push(Op::GetProp(member.clone()));
+                        }
+                        ops.push(Op::Const(Value::I64(1)));
+                        ops.push(op);
+                        if member == "pos" {
+                            ops.push(Op::SetT);
+                        } else {
+                            ops.push(Op::SetProp(member));
+                        }
+                        return Ok(());
+                    }
+                }
+                let bin = self.assign_op()?;
+                match bin {
+                    Some(op) => {
+                        // 复合：读侧双压（一个给读消费、一个留给写回收）。
+                        ops.push(Op::DupN);
+                        if member == "pos" {
+                            ops.push(Op::GetT);
+                        } else {
+                            ops.push(Op::GetProp(member.clone()));
+                        }
+                        self.expr(ops)?;
+                        ops.push(op);
+                    }
+                    None => {
+                        // 纯赋值：实体先压 + expr（值压在实体上）。
+                        self.expr(ops)?;
+                    }
+                }
+                if member == "pos" {
+                    ops.push(Op::SetT);
+                } else {
+                    ops.push(Op::SetProp(member));
+                }
+                Ok(())
+            }
             Tok::Ident(name) => {
                 // 标签语句（S6.23/24）：`name: while/for ...`。
                 if matches!(self.peek2().tok, Tok::Sym(':')) {
@@ -2205,6 +2322,28 @@ impl TextParser {
                 self.expr(ops)?;
                 self.expect_sym(')')?;
                 ops.push(Op::NumStr);
+                return Ok(());
+            }
+            if name == "node" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // node (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::NodeRef);
+                // 后缀成员链（S8.2b-1 限定形态）：node(..).member —— 与
+                // `.pos` 后的 `.x/.y` 同一裁决（任意表达式后缀不支持）。
+                if matches!(self.peek().tok, Tok::Sym('.')) {
+                    self.pos += 1;
+                    let member = match self.next().tok {
+                        Tok::Ident(m) => m,
+                        _ => return Err(self.err_here("期望属性名或 `pos`")),
+                    };
+                    if member == "pos" {
+                        ops.push(Op::GetT);
+                        self.pos_component(ops)?;
+                    } else {
+                        ops.push(Op::GetProp(member));
+                    }
+                }
                 return Ok(());
             }
             if name == "xy" && matches!(self.peek2().tok, Tok::Sym('(')) {

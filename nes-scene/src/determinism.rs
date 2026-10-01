@@ -48,6 +48,11 @@ fn mix_value(h: u64, v: &Value) -> u64 {
             &[p.x.to_bits().to_le_bytes(), p.y.to_bits().to_le_bytes()].concat(),
         ),
         Value::Resource(slot) => mix(h, &slot.to_le_bytes()),
+        // 节点句柄的**语义**指纹在调用点做（S8.2b v1.1：哈希 resolve
+        // 结果 —— 活 -> 前序身份，悬垂 -> 规范 Dead 态；位形/gen 不进
+        // 指纹）。此臂只作防御：属性表按 schema 不含 Node（走到这里
+        // 说明口径被破坏，哈希标记形以便察觉）。
+        Value::Node(_) => mix(h, b"<handle:unresolved>"),
     }
 }
 
@@ -128,7 +133,23 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
                 h = mix(h, &locals.len().to_le_bytes());
                 for (name, v) in &locals {
                     h = mix(h, name.as_bytes());
-                    h = mix_value(h, v);
+                    // 句柄的语义指纹 = **resolve 结果**（S8.2b v1.1）：
+                    // 活 -> 所指节点的前序身份（v1 规范语义身份；Persistent
+                    // NodeId 引入时升格）；悬垂 -> 规范 Dead 态（-1）。
+                    // 位形/gen 是 allocator 历史，不进指纹 —— 换回收策略
+                    // 指纹不变。别名（两个句柄指同一节点）自然折叠。
+                    let v = match v {
+                        Value::Node(hd) => {
+                            let id = hd.to_id();
+                            if tree.contains(id) {
+                                Value::I64(index.get(&id).copied().map(|i| i as i64).unwrap_or(-2))
+                            } else {
+                                Value::I64(-1)
+                            }
+                        }
+                        other => other.clone(),
+                    };
+                    h = mix_value(h, &v);
                 }
             }
         }

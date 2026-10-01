@@ -30,6 +30,8 @@ pub enum ValueType {
     Vec2,
     /// 资源键（指向 `nes-asset` 注册表，M3 接入）。
     Resource,
+    /// 节点句柄（运行时引用；S8.2b-1）。
+    Node,
 }
 
 impl ValueType {
@@ -52,6 +54,7 @@ impl ValueType {
             Self::Str => "Str",
             Self::Vec2 => "Vec2",
             Self::Resource => "Resource",
+            Self::Node => "Node",
         }
     }
 
@@ -92,6 +95,10 @@ pub enum Value {
     Vec2(Vec2),
     /// 资源键。
     Resource(u64),
+    /// 节点句柄（S8.2b-1）：运行时实体引用 —— 可持有/可比较（引用等式），
+    /// 不序列化、不进属性表（schema 按 ValueType 校验，Node 不在设计时
+    /// 类型集）。语义身份见 resolve 口径（S8.2b v1.1）。
+    Node(crate::identity::NodeHandle),
 }
 
 impl Value {
@@ -104,6 +111,7 @@ impl Value {
             Self::Str(_) => ValueType::Str,
             Self::Vec2(_) => ValueType::Vec2,
             Self::Resource(_) => ValueType::Resource,
+            Self::Node(_) => ValueType::Node,
         }
     }
 
@@ -202,6 +210,7 @@ impl fmt::Display for Value {
             Self::Str(v) => write!(f, "{v}"),
             Self::Vec2(v) => write!(f, "({}, {})", v.x, v.y),
             Self::Resource(v) => write!(f, "resource#{v}"),
+            Self::Node(h) => write!(f, "node{h:?}"),
         }
     }
 }

@@ -458,6 +458,17 @@ cargo run --example s41_visual_closure
 > text_len=snapshot.text 元素数、指标补"管理器实体状态字段数"。
 > 架构结论：S7.3 回答"能否稳定运行"，S8.2b 回答"能否规模化运行"——
 > v3 重构即第二次架构跃迁的验证。
+> **v1.54 注记（S8.2b-1 实体句柄落地）**：按评审顺序实现 ——
+> `Value::Node(NodeHandle)`（引用等式；不序列化/不进属性表）→
+> 栈 N/V 边界转换（pop_val 的 N→V、Local 物化的 V→N）→ `node(e)`
+> 内建（**统一 resolve 边界**：Str 按名 / 句柄 gen 校验，两条 handle→N
+> 通道共用）→ 成员链与赋值目标（`node(h).pos.x` / `node(h).pos +=`
+> / 后缀 ++，DupN 双压与既有复合赋值同构）→ Eq 补 N×V 混合臂
+>（节点 vs 非节点 = 确定的假）→ **语义指纹哈希 resolve 结果**（活 →
+> 前序身份、悬垂 → Dead 态、别名折叠；T-H-04 实证 arena 历史/gen
+> 不进指纹）→ T-H-01..04。Mini Dungeon 第一轮迁移：player_brain/
+> referee 的弹丸访问全部改句柄驱动（init 持 `bh = node("bullet")`，
+> 读写经 `node(bh)`）。scene 升至 184（全仓合计 442）。
 
 | 事项 | 状态 |
 |---|---|

@@ -51,7 +51,11 @@ impl fmt::Debug for NodeId {
     }
 }
 
-/// 临时句柄。帧内有效，不序列化。
+/// 脚本可见的弱句柄（S8.2b-1，v1.1 口径）：**可跨帧持有；不保证目标
+/// 跨帧存活；每次解引用重新验证**（gen 防"悬垂撞上复用槽位的另一个
+/// 节点"）。gen 是 allocator 安全机制，**不是游戏语义** —— 语义指纹
+/// 哈希 resolve 的结果（规范语义身份 / 规范 Dead 态），不哈希位形。
+/// 不序列化（场景内节点引用 = 路径，两者不混）。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct NodeHandle(u64);
 

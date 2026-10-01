@@ -518,6 +518,8 @@ fn value_literal(v: &Value) -> String {
         Value::Str(s) => format!("Str({})", quote(s)),
         Value::Vec2(v) => format!("Vec2({}, {})", f32_literal(v.x), f32_literal(v.y)),
         Value::Resource(r) => format!("Resource({r})"),
+        // 节点句柄不序列化（S8.2b-1）：场景内节点引用 = 路径，两者不混。
+        Value::Node(_) => "Node(<运行时句柄不可序列化>)".to_string(),
     }
 }
 
