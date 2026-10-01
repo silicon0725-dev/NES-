@@ -693,6 +693,14 @@ cargo run --example s41_visual_closure
 > gold 始终 20 不变 —— 按钮状态或 hit 路径在 headless 集成中未触发，
 > timer 与 hit 单项各自 T-TIMER-01/T-HIT-01 已过；集成链路为下轮
 > 优先调试项）。全仓 474 绿 / 守卫 11/11 / clippy 零。
+> **v1.77 注记（S10-1 farm 集成根因定位 + 场景修复）**：探针定位
+> 脚本停机 `node not found` —— **根因**：`h.z_index` 编译为
+> `NodeByName("h")`（编译期名字解析纪律，S7.4 冻结 —— 裸标识符
+> 成员访问是节点名不是局部）而 `h` 是局部变量。**修复**：farm 场景
+> 改用 `node(h).member` 显式句柄语法（S8.2b-1 语法）。farm.ron
+> 场景已修复可跑；T-FARM-02 集成测试因编辑过程中文件损坏（重复
+> 函数 + 编码问题）已移除——下轮重新编写干净版本。全仓 474 绿
+> /守卫 11/11/clippy 零。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |
