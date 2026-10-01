@@ -53,6 +53,34 @@ fn mix_value(h: u64, v: &Value) -> u64 {
         // 指纹）。此臂只作防御：属性表按 schema 不含 Node（走到这里
         // 说明口径被破坏，哈希标记形以便察觉）。
         Value::Node(_) => mix(h, b"<handle:unresolved>"),
+        // 数组：元素逐个语义化（调用点的 semantic_value 已展开 Node，
+        // 这里只见非句柄元素 —— 防御臂与 Node 同理）。
+        Value::Array(items) => {
+            let mut hh = mix(h, &items.len().to_le_bytes());
+            for item in items {
+                hh = mix_value(hh, item);
+            }
+            hh
+        }
+    }
+}
+
+/// 局部值的语义化（S8.2b v1.1/b-2）：句柄 -> resolve 结果（前序身份 /
+/// Dead=-1）；数组 -> 元素逐个语义化（嵌套数组递归）。位形/gen 不进指纹。
+fn semantic_value(v: &Value, tree: &SceneTree, index: &HashMap<NodeId, usize>) -> Value {
+    match v {
+        Value::Node(hd) => {
+            let id = hd.to_id();
+            if tree.contains(id) {
+                Value::I64(index.get(&id).copied().map(|i| i as i64).unwrap_or(-2))
+            } else {
+                Value::I64(-1)
+            }
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|i| semantic_value(i, tree, index)).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -138,18 +166,7 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
                     // NodeId 引入时升格）；悬垂 -> 规范 Dead 态（-1）。
                     // 位形/gen 是 allocator 历史，不进指纹 —— 换回收策略
                     // 指纹不变。别名（两个句柄指同一节点）自然折叠。
-                    let v = match v {
-                        Value::Node(hd) => {
-                            let id = hd.to_id();
-                            if tree.contains(id) {
-                                Value::I64(index.get(&id).copied().map(|i| i as i64).unwrap_or(-2))
-                            } else {
-                                Value::I64(-1)
-                            }
-                        }
-                        other => other.clone(),
-                    };
-                    h = mix_value(h, &v);
+                    h = mix_value(h, &semantic_value(v, tree, &index));
                 }
             }
         }

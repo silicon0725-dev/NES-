@@ -1232,7 +1232,8 @@ fn t_cmp_30_string_ops() {
         l5.get(HALT_LOCAL)
     );
     let l6 = run_locals("every { x = 5[0] }");
-    assert_eq!(l6.get(HALT_LOCAL), Some(&Value::Str("索引需要 Str".into())), "非 Str 索引");
+    // S8.2b-2 起索引运行时分派 Str/Array —— 错误文案随口径扩面。
+    assert_eq!(l6.get(HALT_LOCAL), Some(&Value::Str("索引需要 Str 或 Array".into())), "非 Str/Array 索引");
 
     // ⑤ 组合实用例：循环 + 索引统计某字符出现次数（banana 中 a=3）。
     let l7 = run_locals(

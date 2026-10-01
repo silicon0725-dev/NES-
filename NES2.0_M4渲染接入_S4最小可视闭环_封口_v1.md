@@ -469,6 +469,16 @@ cargo run --example s41_visual_closure
 > 不进指纹）→ T-H-01..04。Mini Dungeon 第一轮迁移：player_brain/
 > referee 的弹丸访问全部改句柄驱动（init 持 `bh = node("bullet")`，
 > 读写经 `node(bh)`）。scene 升至 184（全仓合计 442）。
+> **v1.55 注记（S8.2b-2 实体集合落地）**：`Value::Array(Vec<Value>)`
+> 纯拥有式（**赋值 = 深拷贝免费成立**，零 Rc 零别名）+ `push/pop`
+> 编译为语句形态读-改-写**局部绑定** + `for_each(a) { }` 脱糖到既有
+> while/for 机器（**布局与 for_body 同构**：continue 目标 = inc、
+> break = end —— 嵌套/标签免费继承；快照 = 一次性深拷贝，体内变异
+> 对迭代不可见、循环后可见）+ `it.member` 直达语法（Local(it) 特例，
+> 物化即经 resolve 边界）+ `children()` 走统一 resolve 边界、返回
+> **child order** + 索引/len 运行时类型分派（Str/Array）。`__fe` 前缀
+> 保留给脱糖隐藏局部。T-A-01..05（深拷贝/结构序/快照+流控/it 实体写/
+> 确定性指纹含句柄数组语义化）。scene 升至 189（全仓合计 447）。
 
 | 事项 | 状态 |
 |---|---|

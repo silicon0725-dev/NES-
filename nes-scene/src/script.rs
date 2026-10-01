@@ -131,6 +131,17 @@ pub enum Op {
     ///（一个给读消费、一个留给写回收 —— 与既有 `name.member OP=` 的
     /// 双 NodeByName 同构）。栈顶非节点停机。
     DupN,
+    /// 空数组（S8.2b-2）：压 `Array([])`（`array()` 内建）。
+    ArrNew,
+    /// 弹值、弹数组，元素追加后压回（`push(a, e)` 语句的读-改-写核；
+    /// 编译器随后 SetLocal 回写 —— 变异的是局部绑定，v1.1 冻结）。
+    ArrPush,
+    /// 弹数组，移除末元素后压回（`pop(a)` 语句；空数组停机 —— 不静默）。
+    ArrPop,
+    /// 弹值（Str 名 / Node 句柄，经**统一 resolve 边界**），压
+    /// `Array[NodeHandle]` = 该节点子节点（**child order**，S8.2b v1.1
+    /// 冻结：结构序，不另造排序）。
+    Children,
 }
 
 /// 脚本入口。
@@ -504,16 +515,32 @@ fn run<'a, 'b>(
             }
             Op::StrLen => {
                 let a = pop_val!();
-                let Value::Str(s) = a else {
-                    halt!("len 需要 Str");
+                let n = match a {
+                    // 运行时分派（S8.2b-2）：字符串 = 字符数；数组 = 元素数。
+                    Value::Str(s) => s.chars().count() as i64,
+                    Value::Array(items) => items.len() as i64,
+                    _ => halt!("len 需要 Str 或 Array"),
                 };
-                stack.push(StackVal::V(Value::I64(s.chars().count() as i64)));
+                stack.push(StackVal::V(Value::I64(n)));
             }
             Op::StrIndex => {
                 let idx = pop_val!();
                 let a = pop_val!();
+                // 运行时类型分派（S8.2b-2）：Str -> 单字符；Array -> 元素。
+                //（编译器无类型推理，索引语义由运行时值型决定。）
+                if let Value::Array(items) = a {
+                    let Value::I64(i) = idx else {
+                        halt!("下标需要 I64");
+                    };
+                    if i < 0 || i >= items.len() as i64 {
+                        halt!(format!("数组索引越界 {i}（长度 {}）", items.len()));
+                    }
+                    stack.push(StackVal::V(items[i as usize].clone()));
+                    pc += 1;
+                    continue;
+                }
                 let Value::Str(s) = a else {
-                    halt!("索引需要 Str");
+                    halt!("索引需要 Str 或 Array");
                 };
                 let Value::I64(i) = idx else {
                     halt!("下标需要 I64");
@@ -589,6 +616,49 @@ fn run<'a, 'b>(
                 Some(StackVal::V(_)) => halt!("DupN 栈顶不是节点"),
                 None => halt!("stack underflow"),
             },
+            Op::ArrNew => stack.push(StackVal::V(Value::Array(Vec::new()))),
+            Op::ArrPush => {
+                let v = pop_val!();
+                let a = pop_val!();
+                let Value::Array(mut items) = a else {
+                    halt!("push 需要数组绑定");
+                };
+                items.push(v);
+                stack.push(StackVal::V(Value::Array(items)));
+            }
+            Op::ArrPop => {
+                let a = pop_val!();
+                let Value::Array(mut items) = a else {
+                    halt!("pop 需要数组绑定");
+                };
+                if items.is_empty() {
+                    halt!("pop 空数组");
+                }
+                items.pop();
+                stack.push(StackVal::V(Value::Array(items)));
+            }
+            Op::Children => {
+                let a = pop_val!();
+                let id = match a {
+                    Value::Str(name) => match ctx.tree().find_by_name(&name) {
+                        Some(n) => n,
+                        None => halt!(format!("children(\"{name}\") 找不到该名节点")),
+                    },
+                    // 统一 resolve 边界（与 node()/Local 同一纪律）。
+                    Value::Node(h) => match resolve_handle(ctx.tree(), h) {
+                        Some(id) => id,
+                        None => halt!("句柄已悬垂（节点已删除）"),
+                    },
+                    _ => halt!("children(..) 需要 Str 或节点句柄"),
+                };
+                let children: Vec<Value> = ctx
+                    .tree()
+                    .children(id)
+                    .iter()
+                    .map(|&c| Value::Node(NodeHandle::of(c)))
+                    .collect();
+                stack.push(StackVal::V(Value::Array(children)));
+            }
         }
         pc += 1;
     }
@@ -1093,6 +1163,7 @@ pub fn compile_script(src: &str) -> Result<Script, ParseError> {
         toks,
         pos: 0,
         loops: Vec::new(),
+        fe_depth: 0,
     };
     p.script()
 }
@@ -1377,6 +1448,8 @@ struct TextParser {
     pos: usize,
     /// 循环栈（嵌套时 `break`/`continue` 绑定最内层）。
     loops: Vec<LoopCtx>,
+    /// for_each 嵌套深度（S8.2b-2）：隐藏局部 `__feN_*` 的编号源。
+    fe_depth: usize,
 }
 
 impl TextParser {
@@ -1876,6 +1949,100 @@ impl TextParser {
                 ops.push(Op::Emit(name));
                 Ok(())
             }
+            // push/pop 语句（S8.2b-2）：读-改-写局部绑定（变异的是绑定，
+            // v1.1 冻结）。push(a, e) / pop(a)。
+            Tok::Ident(k) if k == "push" && matches!(self.peek2().tok, Tok::Sym('(')) => {
+                self.pos += 2; // push (
+                let Tok::Ident(binding) = self.peek().tok.clone() else {
+                    return Err(self.err_here("push 第一参数须是数组绑定名"));
+                };
+                if binding.starts_with("__fe") {
+                    return Err(self.err_here("push 不能作用于 for_each 迭代数组（快照语义）"));
+                }
+                self.pos += 1;
+                self.expect_sym(',')?;
+                ops.push(Op::Local(binding.clone()));
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::ArrPush);
+                ops.push(Op::SetLocal(binding));
+                Ok(())
+            }
+            Tok::Ident(k) if k == "pop" && matches!(self.peek2().tok, Tok::Sym('(')) => {
+                self.pos += 2; // pop (
+                let Tok::Ident(binding) = self.peek().tok.clone() else {
+                    return Err(self.err_here("pop 参数须是数组绑定名"));
+                };
+                if binding.starts_with("__fe") {
+                    return Err(self.err_here("pop 不能作用于 for_each 迭代数组（快照语义）"));
+                }
+                self.pos += 1;
+                self.expect_sym(')')?;
+                ops.push(Op::Local(binding.clone()));
+                ops.push(Op::ArrPop);
+                ops.push(Op::SetLocal(binding));
+                Ok(())
+            }
+            // for_each(a) { body }（S8.2b-2）：脱糖到既有 while 机器 ——
+            // 快照（__feN_src = a 深拷贝）+ 下标循环 + it 绑定。
+            // break/continue/标签经 while 编译路径免费继承。
+            Tok::Ident(k) if k == "for_each" && matches!(self.peek2().tok, Tok::Sym('(')) => {
+                self.pos += 2; // for_each (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                let depth = self.fe_depth;
+                self.fe_depth += 1;
+                let (src, iv, nv) = (
+                    format!("__fe{depth}_src"),
+                    format!("__fe{depth}_i"),
+                    format!("__fe{depth}_n"),
+                );
+                ops.push(Op::SetLocal(src.clone())); // 快照：一次性深拷贝
+                ops.push(Op::Local(src.clone()));
+                ops.push(Op::StrLen); // len（运行时分派：数组）
+                ops.push(Op::SetLocal(nv.clone()));
+                ops.push(Op::Const(Value::I64(0)));
+                ops.push(Op::SetLocal(iv.clone()));
+                // 布局与 for_body 同构（continue 目标 = inc，break = end）：
+                //   [init] Jump(cond) [inc: i+=1] [cond: i<n -> exit]
+                //   [it = src[i]] body Jump(inc) [end:]
+                let jinit = ops.len();
+                ops.push(Op::Jump(0)); // 占位 -> cond（下方回填）
+                let inc = ops.len();
+                ops.push(Op::Local(iv.clone()));
+                ops.push(Op::Const(Value::I64(1)));
+                ops.push(Op::Add);
+                ops.push(Op::SetLocal(iv.clone()));
+                let cond = ops.len();
+                ops[jinit] = Op::Jump(cond);
+                ops.push(Op::Local(iv.clone()));
+                ops.push(Op::Local(nv.clone()));
+                ops.push(Op::Lt);
+                let jexit = ops.len();
+                ops.push(Op::JumpIfNot(0));
+                ops.push(Op::Local(src.clone()));
+                ops.push(Op::Local(iv.clone()));
+                ops.push(Op::StrIndex); // 运行时分派：数组元素
+                ops.push(Op::SetLocal("it".to_string()));
+                self.expect_sym('{')?;
+                self.loops.push(LoopCtx {
+                    top: inc,
+                    breaks: Vec::new(),
+                    label: None,
+                });
+                let body = self.stmts(ops);
+                let ctx = self.loops.pop().expect("循环栈配对");
+                body?;
+                self.expect_sym('}')?;
+                ops.push(Op::Jump(inc));
+                let end = ops.len();
+                ops[jexit] = Op::JumpIfNot(end);
+                for b in ctx.breaks {
+                    ops[b] = Op::Jump(end);
+                }
+                self.fe_depth -= 1;
+                Ok(())
+            }
             // `node(...).member = expr`（S8.2b-1 赋值目标形态）：node 调用
             // 前缀编译为 [expr, NodeRef]（实体压栈），后续与既有成员赋值
             // 同构（纯 = / 复合 OP= / 后缀 ++/--）。
@@ -1957,6 +2124,39 @@ impl TextParser {
                 let reserved = RESERVED.contains(&name.as_str());
                 if reserved && !(name == "this" && matches!(self.peek2().tok, Tok::Sym('.'))) {
                     return Err(self.err_here(format!("`{name}` 是保留字")));
+                // `it.member`（S8.2b-2）：it 是局部绑定 —— 赋值目标走
+                // Local(it)（成员写全链复用；物化即校验）。
+                } else if name == "it" && matches!(self.peek2().tok, Tok::Sym('.')) {
+                    self.pos += 1; // it
+                    self.expect_sym('.')?;
+                    let member = match self.next().tok {
+                        Tok::Ident(m) => m,
+                        _ => return Err(self.err_here("期望属性名或 `pos`")),
+                    };
+                    let bin = self.assign_op()?;
+                    match bin {
+                        Some(op) => {
+                            ops.push(Op::Local("it".to_string()));
+                            ops.push(Op::Local("it".to_string())); // 读侧双压
+                            if member == "pos" {
+                                ops.push(Op::GetT);
+                            } else {
+                                ops.push(Op::GetProp(member.clone()));
+                            }
+                            self.expr(ops)?;
+                            ops.push(op);
+                        }
+                        None => {
+                            ops.push(Op::Local("it".to_string()));
+                            self.expr(ops)?;
+                        }
+                    }
+                    if member == "pos" {
+                        ops.push(Op::SetT);
+                    } else {
+                        ops.push(Op::SetProp(member));
+                    }
+                    return Ok(());
                 }
                 self.pos += 1;
                 if matches!(self.peek().tok, Tok::Sym('.')) {
@@ -2324,6 +2524,20 @@ impl TextParser {
                 ops.push(Op::NumStr);
                 return Ok(());
             }
+            if name == "array" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // array (
+                self.expect_sym(')')?;
+                ops.push(Op::ArrNew);
+                return Ok(());
+            }
+            if name == "children" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // children (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::Children);
+                // 与 node() 同款后缀成员链不适用（产物是数组）。
+                return Ok(());
+            }
             if name == "node" && matches!(self.peek2().tok, Tok::Sym('(')) {
                 self.pos += 2; // node (
                 self.expr(ops)?;
@@ -2384,9 +2598,34 @@ impl TextParser {
                         ops.push(Op::This);
                     }
                 }
+                // `it.member`（S8.2b-2 特例）：it 是 for_each 的循环绑定
+                //（普通局部）—— 成员访问压 Local(it) 而非 NodeByName，
+                // 物化即经 resolve 边界（悬垂句柄自然停机）。
+                "it" => {
+                    if matches!(self.peek().tok, Tok::Sym('.')) {
+                        self.pos += 1;
+                        let member = match self.next().tok {
+                            Tok::Ident(m) => m,
+                            _ => return Err(self.err_here("期望属性名或 `pos`")),
+                        };
+                        ops.push(Op::Local("it".to_string()));
+                        if member == "pos" {
+                            ops.push(Op::GetT);
+                            self.pos_component(ops)?;
+                        } else {
+                            ops.push(Op::GetProp(member));
+                        }
+                    } else {
+                        ops.push(Op::Local("it".to_string()));
+                    }
+                }
                 other => {
                     if RESERVED.contains(&other) {
                         return Err(ParseError::new(sp.line, sp.col, format!("`{other}` 是保留字")));
+                    }
+                    // `__fe` 前缀保留给 for_each 脱糖的隐藏局部（S8.2b-2）。
+                    if other.starts_with("__fe") {
+                        return Err(ParseError::new(sp.line, sp.col, format!("`{other}` 是编译器保留前缀")));
                     }
                     if matches!(self.peek().tok, Tok::Sym('.')) {
                         self.pos += 1;

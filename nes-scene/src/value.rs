@@ -32,6 +32,8 @@ pub enum ValueType {
     Resource,
     /// 节点句柄（运行时引用；S8.2b-1）。
     Node,
+    /// 数组（S8.2b-2）。
+    Array,
 }
 
 impl ValueType {
@@ -55,6 +57,7 @@ impl ValueType {
             Self::Vec2 => "Vec2",
             Self::Resource => "Resource",
             Self::Node => "Node",
+            Self::Array => "Array",
         }
     }
 
@@ -99,6 +102,10 @@ pub enum Value {
     /// 不序列化、不进属性表（schema 按 ValueType 校验，Node 不在设计时
     /// 类型集）。语义身份见 resolve 口径（S8.2b v1.1）。
     Node(crate::identity::NodeHandle),
+    /// 数组（S8.2b-2）：纯拥有式元素表 —— **赋值 = 深拷贝**（局部绑定
+    /// 语义，v1.1 冻结：`a2 = a` 后互不影响，无共享引用容器）；元素可含
+    /// 句柄。`push/pop` 变异的是**局部绑定**（读-改-写回写编译）。不序列化。
+    Array(Vec<Value>),
 }
 
 impl Value {
@@ -112,6 +119,7 @@ impl Value {
             Self::Vec2(_) => ValueType::Vec2,
             Self::Resource(_) => ValueType::Resource,
             Self::Node(_) => ValueType::Node,
+            Self::Array(_) => ValueType::Array,
         }
     }
 
@@ -211,6 +219,7 @@ impl fmt::Display for Value {
             Self::Vec2(v) => write!(f, "({}, {})", v.x, v.y),
             Self::Resource(v) => write!(f, "resource#{v}"),
             Self::Node(h) => write!(f, "node{h:?}"),
+            Self::Array(items) => write!(f, "array({})", items.len()),
         }
     }
 }

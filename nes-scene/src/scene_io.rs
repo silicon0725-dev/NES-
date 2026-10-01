@@ -520,6 +520,8 @@ fn value_literal(v: &Value) -> String {
         Value::Resource(r) => format!("Resource({r})"),
         // 节点句柄不序列化（S8.2b-1）：场景内节点引用 = 路径，两者不混。
         Value::Node(_) => "Node(<运行时句柄不可序列化>)".to_string(),
+        // 数组不序列化（S8.2b-2）：运行时脚本状态，落盘走宿主侧口径。
+        Value::Array(_) => "Array(<运行时数组不可序列化>)".to_string(),
     }
 }
 
