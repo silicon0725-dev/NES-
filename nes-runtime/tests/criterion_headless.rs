@@ -267,8 +267,7 @@ fn t_gp_01_dodge_gameplay_and_determinism() {
     for f in 0..1500u64 {
         let snap = rt.collect_input();
         let _ = rt.emit_input_signals(&snap);
-        rt.tree_mut().emit_signal("tick", nes_scene::Value::I64(0));
-        let _ = rt.tick_headless(1.0 / 60.0, &mut vm);
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm); // 内建 tick（S8.1）
         if f % 30 == 0 {
             let hud = {
                 let tree = rt.tree_mut();
@@ -324,4 +323,123 @@ fn t_abi_01_dodge_baseline() {
          若为有意变更：评审里程碑文档后更新 expected_hash.txt"
     );
     assert_eq!(report.frame_hashes.len(), 600);
+}
+
+// ---------------------------------------------------------------- S8.1 游戏节拍
+
+/// T-LP-01：**内建 tick** —— 每帧恰一次、载荷 = 树帧号（arg 可作帧计数，
+/// Dodge referee 已用）；宿主零手发。
+#[test]
+fn t_lp_01_builtin_tick_once_per_frame_with_frame_no() {
+    let _g = lock();
+    let (root, rel) = write_scene(
+        "lp01",
+        &scene_of(&[script(
+            "clock",
+            "init { last = -1; hits = 0 }\non \"tick\" { last = arg; hits = hits + 1 }",
+        )]),
+    );
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene(&rel).unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    for _ in 0..5 {
+        let _ = rt.collect_input();
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+    }
+    let clock = vm
+        .locals(
+            rt.tree_mut()
+                .find(&nes_scene::NodePath::parse("/main/clock").unwrap())
+                .unwrap(),
+        )
+        .expect("局部");
+    assert_eq!(clock.get("hits"), Some(&nes_scene::Value::I64(5)), "每帧恰一次");
+    assert_eq!(clock.get("last"), Some(&nes_scene::Value::I64(4)), "载荷 = 树帧号（0 基）");
+}
+
+/// T-LP-02：**固定步长蓄步器** —— 快帧 0 步（余量跨帧）、慢帧补步、
+/// `every` 的 arg 恒 = 固定步长（确定性模拟口径）、螺旋钳制如实计数。
+#[test]
+fn t_lp_02_fixed_step_accumulator() {
+    let _g = lock();
+    let (root, rel) = write_scene(
+        "lp02",
+        &scene_of(&[
+            node("sp", "Node2D"),
+            script("drift", "init { n = 0; d = 0.0 }\nevery { n = n + 1; d = arg; this.pos = xy(0.0, 0.0) }"),
+        ]),
+    );
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene(&rel).unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    let sp = rt
+        .tree_mut()
+        .find(&nes_scene::NodePath::parse("/main/drift").unwrap())
+        .unwrap();
+
+    rt.set_fixed_step(1.0 / 60.0);
+    // 帧序列（变帧率）：1/30（=2 步）、1/120（=0 步，余量进位）、
+    // 1/120 + 1/120（各 0 或合并出 1 步 —— 蓄步器数学决定）、大帧（钳制）。
+    let s1 = rt.step_headless(1.0 / 30.0, &mut vm);
+    assert_eq!(s1, 2, "慢帧补两步");
+    let s2 = rt.step_headless(1.0 / 120.0, &mut vm);
+    assert_eq!(s2, 0, "快帧零步（余量 1/120 进位）");
+    let s3 = rt.step_headless(1.0 / 120.0, &mut vm);
+    assert_eq!(s3, 1, "进位合并出一步");
+    let drift = vm.locals(sp).unwrap();
+    assert_eq!(drift.get("n"), Some(&nes_scene::Value::I64(3)), "恰三步");
+    assert_eq!(
+        drift.get("d"),
+        Some(&nes_scene::Value::F32(1.0 / 60.0)),
+        "every 的 arg 恒 = 固定步长"
+    );
+
+    // 螺旋钳制：一帧 2 秒（步长 0.25 —— 二进制精确整除得 8 步）->
+    // 钳到 5，丢弃 3 步并计数。（重设步长 = 清蓄步余量，断言不受
+    // 前段进位的浮点尾差影响；1/60 类步长的除法本身有尾差。）
+    rt.set_fixed_step(0.25);
+    let before = rt.steps_dropped();
+    let s4 = rt.step_headless(2.0, &mut vm);
+    assert_eq!(s4, 5, "钳制到 5 步");
+    assert_eq!(rt.steps_dropped() - before, 3, "丢弃 3 步如实计数");
+}
+
+/// T-LP-03：未设固定步长 = 宿主纪律模式（帧 delta 原样一步 —— 既有
+/// 语义不变；every 的 arg 跟随帧 delta）。
+#[test]
+fn t_lp_03_default_host_discipline_unchanged() {
+    let _g = lock();
+    let (root, rel) = write_scene(
+        "lp03",
+        &scene_of(&[script("drift", "init { d = 0.0 }\nevery { d = arg; this.pos = xy(0.0, 0.0) }")]),
+    );
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene(&rel).unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    let drift = rt
+        .tree_mut()
+        .find(&nes_scene::NodePath::parse("/main/drift").unwrap())
+        .unwrap();
+    let steps = rt.step_headless(0.25, &mut vm); // 任意帧 delta
+    assert_eq!(steps, 1, "原样一步");
+    assert_eq!(
+        vm.locals(drift).unwrap().get("d"),
+        Some(&nes_scene::Value::F32(0.25)),
+        "arg = 帧 delta（宿主纪律）"
+    );
 }

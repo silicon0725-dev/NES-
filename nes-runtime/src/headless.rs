@@ -105,7 +105,8 @@ impl NesRuntime {
             }
             let snap = self.collect_input();
             self.emit_input_signals(&snap);
-            let _stats = self.tick_headless(delta, &mut vm);
+            // 与窗口帧路径同一节拍实现（内建 tick + 蓄步 —— 宿主分支为零）。
+            let _steps = self.step_headless(delta, &mut vm);
             frame_hashes.push(self.state_fingerprint(Some(&vm)));
         }
         let mut h = fnv1a64(b"NES_TRACE_V1");

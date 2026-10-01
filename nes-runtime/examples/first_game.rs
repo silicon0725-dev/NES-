@@ -110,7 +110,7 @@ fn main() {
     for index in 0..total {
         let snap = rt.collect_input();
         let _ = rt.emit_input_signals(&snap);
-        rt.tree_mut().emit_signal("tick", nes_scene::Value::I64(0));
+        // tick 由引擎内建发射（S8.1）—— 宿主不再手发。
         let frame = FrameInfo::new(
             index,
             1.0 / 60.0,

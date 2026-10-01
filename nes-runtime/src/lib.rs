@@ -93,6 +93,12 @@ pub struct NesRuntime {
     input_collector: InputCollector,
     /// 输入快照共享槽（键探针读它 —— `mount_key_probe` 接线）。
     input_state: Rc<RefCell<InputSnapshot>>,
+    /// 固定模拟步长（S8.1；`None` = 宿主纪律模式：帧 delta 原样一步）。
+    fixed_step: Option<f32>,
+    /// 蓄步器余量（fixed_step 模式下跨帧携带）。
+    step_remainder: f32,
+    /// 螺旋钳制丢弃的模拟步累计数（S8.1 如实计数）。
+    steps_dropped: u64,
 }
 
 impl NesRuntime {
@@ -191,6 +197,9 @@ impl NesRuntime {
             scene_source: None,
             input_collector: InputCollector::new(),
             input_state: Rc::new(RefCell::new(InputSnapshot::default())),
+            fixed_step: None,
+            step_remainder: 0.0,
+            steps_dropped: 0,
         })
     }
 
@@ -221,10 +230,10 @@ impl NesRuntime {
         if !window.pump() {
             return Ok(None);
         }
-        let Some(surface) = &self.surface else {
+        if self.surface.is_none() {
             return Err(BackendError::ConfigMismatch("窗口模式缺少表面".to_string()));
-        };
-        self.tree.tick(frame.delta, obs);
+        }
+        let _steps = self.simulate(frame.delta, obs);
         self.extractor.extract_into(
             &mut self.tree,
             &self.table,
@@ -237,6 +246,8 @@ impl NesRuntime {
                 "headless 运行时没有渲染端（用 open_windowed 装配窗口模式）".into(),
             ));
         };
+        // 表面借用放在 simulate/extract 之后（整 self 可变借用的墙后面）。
+        let surface = self.surface.as_ref().expect("上面已判存在");
         let stats = consumer.consume_to_surface(&self.commands, surface)?;
         Ok(Some(stats))
     }
@@ -434,6 +445,66 @@ impl NesRuntime {
         self.table.bind(&mut self.registry)
     }
 
+    // ---------- 游戏节拍（S8.1：内建 tick + 固定步长蓄步）----------
+
+    /// 固定模拟步长上限保护（一帧至多补 5 步 —— 螺旋死亡钳制）。
+    const MAX_STEPS_PER_FRAME: usize = 5;
+
+    /// 设置固定模拟步长（S8.1）。设置后帧路径按蓄步器分步：
+    /// `every`（process）的 delta **恒等于 step**（确定性模拟口径），
+    /// 与渲染帧率解耦；未设置（缺省）保持宿主纪律模式（帧 delta 原样
+    /// 一步 —— 既有宿主都传固定 1/60，行为不变）。
+    pub fn set_fixed_step(&mut self, step: f32) {
+        assert!(step.is_finite() && step > 0.0, "固定步长须为正有限值");
+        self.fixed_step = Some(step);
+        self.step_remainder = 0.0;
+    }
+
+    /// 螺旋钳制累计丢弃的模拟步数（如实观测）。
+    pub fn steps_dropped(&self) -> u64 {
+        self.steps_dropped
+    }
+
+    /// 推进一帧的模拟（**帧路径与 headless 共用的唯一节拍实现**）：
+    ///
+    /// 1. 发射**内建 `tick` 信号**（每帧恰一次，载荷 = 树帧号 ——
+    ///    宿主级确定性事件；宿主不得再手发 `tick`，否则双交付）；
+    /// 2. 按 `fixed_step` 蓄步分步调用 `SceneTree::tick`（未设置则
+    ///    帧原样一步）：快帧可为 0 步（余量跨帧携带），慢帧补步
+    ///    （上限 5，超限丢弃并计数）。
+    ///
+    /// 返回本帧执行的模拟步数。`tick_headless` 是不含内建 tick 的
+    /// 裸单步（高级用途）；常规宿主走这里。
+    fn simulate(&mut self, frame_delta: f32, obs: &mut dyn SceneObserver) -> usize {
+        let (steps, delta) = match self.fixed_step {
+            None => (1, frame_delta),
+            Some(step) => {
+                self.step_remainder += frame_delta.max(0.0);
+                let n = (self.step_remainder / step).floor();
+                self.step_remainder -= n * step;
+                let n = n as usize;
+                if n > Self::MAX_STEPS_PER_FRAME {
+                    self.steps_dropped += (n - Self::MAX_STEPS_PER_FRAME) as u64;
+                    (Self::MAX_STEPS_PER_FRAME, step)
+                } else {
+                    (n, step)
+                }
+            }
+        };
+        let frame_no = self.tree.frame() as i64;
+        self.tree.emit_signal("tick", Value::I64(frame_no));
+        for _ in 0..steps {
+            self.tree.tick(delta, obs);
+        }
+        steps
+    }
+
+    /// headless 宿主的帧步进（含内建 tick 与蓄步；与窗口帧路径同一
+    /// `simulate` 实现 —— 节拍语义无宿主分支）。返回本帧模拟步数。
+    pub fn step_headless(&mut self, frame_delta: f32, obs: &mut dyn SceneObserver) -> usize {
+        self.simulate(frame_delta, obs)
+    }
+
     // ---------- 输入（S7.2：平台事件 -> 帧快照 -> 标准信号/探针）----------
 
     /// 收集本帧输入：排空平台事件队列 -> 折叠成快照（边缘 + 按住态）。
@@ -598,7 +669,7 @@ impl NesRuntime {
         frame: &FrameInfo,
         obs: &mut dyn SceneObserver,
     ) -> Result<FrameOutcome, BackendError> {
-        self.tree.tick(frame.delta, obs);
+        let _steps = self.simulate(frame.delta, obs);
         self.extractor.extract_into(
             &mut self.tree,
             &self.table,

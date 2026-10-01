@@ -95,7 +95,7 @@ Scene(
             Node(
                 name: "referee",
                 kind: "Script",
-                props: { "source": "on \"tick\" { t = t + 1; d1 = (player.pos.x - e1.pos.x) * (player.pos.x - e1.pos.x) + (player.pos.y - e1.pos.y) * (player.pos.y - e1.pos.y); if d1 < 144.0 { emit \"damage\" 0; e1.pos = (8.0, 8.0) }; d2 = (player.pos.x - e2.pos.x) * (player.pos.x - e2.pos.x) + (player.pos.y - e2.pos.y) * (player.pos.y - e2.pos.y); if d2 < 144.0 { emit \"damage\" 0; e2.pos = (376.0, 8.0) }; d3 = (player.pos.x - e3.pos.x) * (player.pos.x - e3.pos.x) + (player.pos.y - e3.pos.y) * (player.pos.y - e3.pos.y); if d3 < 144.0 { emit \"damage\" 0; e3.pos = (376.0, 208.0) }; if t == 1800 { hud.text = \"WIN\"; emit \"win\" 0 } }" },
+                props: { "source": "on \"tick\" { t = arg; d1 = (player.pos.x - e1.pos.x) * (player.pos.x - e1.pos.x) + (player.pos.y - e1.pos.y) * (player.pos.y - e1.pos.y); if d1 < 144.0 { emit \"damage\" 0; e1.pos = (8.0, 8.0) }; d2 = (player.pos.x - e2.pos.x) * (player.pos.x - e2.pos.x) + (player.pos.y - e2.pos.y) * (player.pos.y - e2.pos.y); if d2 < 144.0 { emit \"damage\" 0; e2.pos = (376.0, 8.0) }; d3 = (player.pos.x - e3.pos.x) * (player.pos.x - e3.pos.x) + (player.pos.y - e3.pos.y) * (player.pos.y - e3.pos.y); if d3 < 144.0 { emit \"damage\" 0; e3.pos = (376.0, 208.0) }; if t == 1799 { hud.text = \"WIN\"; emit \"win\" 0 } }" },
                 children: [],
             ),
         ],
