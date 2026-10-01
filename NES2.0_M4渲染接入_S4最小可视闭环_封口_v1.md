@@ -418,6 +418,14 @@ cargo run --example s41_visual_closure
 > S8.2b API 冻结清单五项入档待评审（实体句柄/集合/共享读面/动态
 > emit 名/数学）。runtime 升至 48（全仓合计 436，文档见
 > `NES2.0_S8.2移植压力测试_v1.md`）。
+> **v1.50 注记（S8.2 用户实测修复）**：Mini Dungeon 便携包实测发现
+> **纹理精灵静默消失**（HUD 文字在、精灵不在）—— 根因：宿主先
+> bind/upload 再 `load_scene`，`instantiate_scene` 整表替换后新表槽位
+> **无 AssetKey**，提取层拿不到渲染键直接丢精灵。修复 = **加载习语
+> 收口**（load = 替换 + bind，与 poll_scene_reload 同口径，一处覆盖
+> 所有宿主；GPU 键按路径派生同路径同键，早前上传仍有效）。
+> T-Script-R5 钉死宿主顺序（已验证：关掉修复该测试即红）。runtime
+> 升至 49（全仓合计 437）。
 
 | 事项 | 状态 |
 |---|---|
