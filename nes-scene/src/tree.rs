@@ -94,6 +94,88 @@ pub struct NodeData {
     pub overrides: Vec<InstanceOverride>,
     /// [`NodeFlags`] 位集。
     pub flags: u32,
+    /// **持久语义身份**（S9-0 契约，S9-1 实现）：128 位 UUID v4（十六进制
+    /// 32 字符）。新对象随机生成；旧文件迁移确定性派生（scene_io）。
+    /// **内容无关**（name/path/parent/pos/component/asset 不参与生成）；
+    /// 正常编辑不变；clone/duplicate 重新生成；delete 后禁止新对象复用
+    ///（undo 经 [`SceneTree::add_node_with_uid`] 恢复原身份 —— S9-2）。
+    /// 与 runtime NodeId(slot,gen) 严格分层：uid 是语义身份，不参与
+    /// arena 执行安全。
+    pub uid: Uid,
+}
+
+/// 持久语义身份（S9-0）：128 位 UUID v4 的十六进制 32 字符形态。
+/// 零依赖 —— 随机源用 `std::collections::hash_map::RandomState`
+///（进程级随机种子，非加密强度：编辑器会话内唯一性足够；跨会话
+/// 冲突由装载期检测兜底）。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Uid(pub [u8; 16]);
+
+impl Uid {
+    /// 随机生成（新对象）。
+    pub fn new_v4() -> Self {
+        // 进程内唯一熵链：计数器 + 双时间源（纳秒 + 性能计数器）+ 代码地址，
+        // FNV-1a 混合两条独立链（前后 8 字节）。跨进程/跨机器唯一性由
+        // 128 位空间 + 时间项保证（编辑器会话口径足够；装载期冲突检测兜底）。
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let perf = (c.wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ (nanos.rotate_left(13));
+        let mix = |salt: u64, mut vals: Vec<u64>| -> u64 {
+            let mut h = nes_asset::fnv1a64(&salt.to_le_bytes());
+            for v in vals.drain(..) {
+                h = nes_asset::fnv1a64(&[h.to_le_bytes(), v.to_le_bytes()].concat());
+            }
+            h
+        };
+        let a = mix(1, vec![c, nanos, perf]);
+        let b = mix(2, vec![perf.rotate_left(29), c.rotate_left(47), nanos.rotate_left(7)]);
+        let mut u = [0u8; 16];
+        u[..8].copy_from_slice(&a.to_le_bytes());
+        u[8..].copy_from_slice(&b.to_le_bytes());
+        u[6] = (u[6] & 0x0F) | 0x40;
+        u[8] = (u[8] & 0x3F) | 0x80;
+        Self(u)
+    }
+
+    /// 确定性派生（旧文件迁移专用；内容 = 派生种子，不是身份来源 ——
+    /// 与 new_v4 严格双机制，S9-0 v1.1）。
+    pub fn derive_legacy(seed: &str) -> Self {
+        let h1 = nes_asset::fnv1a64(format!("{seed}|1").as_bytes());
+        let h2 = nes_asset::fnv1a64(format!("{seed}|2").as_bytes());
+        let mut u = [0u8; 16];
+        u[..8].copy_from_slice(&h1.to_le_bytes());
+        u[8..].copy_from_slice(&h2.to_le_bytes());
+        u[6] = (u[6] & 0x0F) | 0x40;
+        u[8] = (u[8] & 0x3F) | 0x80;
+        Self(u)
+    }
+
+    /// 十六进制 32 字符（序列化形态）。
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 解析十六进制（32 字符）。非法如实报错。
+    pub fn from_hex(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("uid 非法（期望 32 位十六进制）：{s}"));
+        }
+        let mut u = [0u8; 16];
+        for i in 0..16 {
+            u[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        }
+        Ok(Self(u))
+    }
+
+    /// 位形（指纹用）。
+    pub fn bits(&self) -> [u8; 16] {
+        self.0
+    }
 }
 
 /// 节点的处理模式（草案 §9）：决定树处于 `paused` 时 `process` 的派发。
@@ -156,6 +238,7 @@ impl NodeData {
             process_mode: ProcessMode::default(),
             overrides: Vec::new(),
             flags: NodeFlags::DIRTY_XFORM,
+            uid: Uid::new_v4(),
         }
     }
 
@@ -868,6 +951,7 @@ impl SceneTree {
             props,
             process_mode: ProcessMode::default(),
             overrides: Vec::new(),
+            uid: Uid::new_v4(),
             flags: NodeFlags::IN_TREE | NodeFlags::DIRTY_XFORM,
         });
         Self {
@@ -1331,6 +1415,58 @@ impl SceneTree {
     /// 如果你需要它立刻可见（例如初始化代码里连续建树），连续调用后统一 `tick` 一次即可。
     pub fn add_node(&mut self, parent: NodeId, name: &str, kind: NodeKind) -> NodeId {
         self.add_node_at(parent, name, kind, None)
+    }
+
+    /// 指定 uid 建节点（S9-1）：装载（迁移派生）/ 粘贴 undo 恢复等
+    /// 显式身份路径。**同 uid 冲突如实报错**（S9-0 Q1：一个身份一个
+    /// 活对象）。
+    pub fn add_node_with_uid(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        kind: NodeKind,
+        uid: Uid,
+    ) -> Result<NodeId, String> {
+        if self.find_by_uid(&uid).is_some() {
+            return Err(format!("uid 冲突：{} 已有活节点", uid.to_hex()));
+        }
+        let id = self.add_node(parent, name, kind);
+        if let Some(nd) = self.nodes.get_mut(id) {
+            nd.uid = uid;
+        }
+        Ok(id)
+    }
+
+    /// 按持久身份查找（S9-0 Q7：uid -> Handle 的查找通道；与
+    /// NodeHandle 的 arena resolve 分层，互不替代）。
+    pub fn find_by_uid(&self, uid: &Uid) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .find(|(_, nd)| &nd.uid == uid)
+            .map(|(id, _)| id)
+    }
+
+    /// 显式改写节点 uid（装载/根节点迁移路径；冲突报错）。运行期
+    /// 编辑器改名等**不得**走此（身份不可变，S9-0）。
+    pub fn set_uid(&mut self, node: NodeId, uid: Uid) -> Result<(), String> {
+        let occupied = self
+            .nodes
+            .iter()
+            .any(|(id, nd)| id != node && nd.uid == uid);
+        if occupied {
+            return Err(format!("uid 冲突：{}", uid.to_hex()));
+        }
+        if let Some(nd) = self.nodes.get_mut(node) {
+            nd.uid = uid;
+            Ok(())
+        } else {
+            Err("节点不存在".to_string())
+        }
+    }
+
+    /// 读节点持久身份（uid_of(handle) 通道）。
+    pub fn uid_of(&self, node: NodeId) -> Option<Uid> {
+        self.nodes.get(node).map(|nd| nd.uid.clone())
     }
 
     /// 同 [`Self::add_node`]，但指定插入位置。

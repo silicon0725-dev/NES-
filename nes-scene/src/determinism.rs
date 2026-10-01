@@ -14,7 +14,6 @@
 //!
 //! 哈希函数：FNV-1a 64（与 nes-asset 内容戳同族），链式混合。
 
-use std::collections::HashMap;
 
 use nes_asset::fnv1a64;
 
@@ -67,18 +66,28 @@ fn mix_value(h: u64, v: &Value) -> u64 {
 
 /// 局部值的语义化（S8.2b v1.1/b-2）：句柄 -> resolve 结果（前序身份 /
 /// Dead=-1）；数组 -> 元素逐个语义化（嵌套数组递归）。位形/gen 不进指纹。
-fn semantic_value(v: &Value, tree: &SceneTree, index: &HashMap<NodeId, usize>) -> Value {
+fn semantic_value(v: &Value, tree: &SceneTree) -> Value {
     match v {
         Value::Node(hd) => {
+            // 句柄语义指纹 = resolve 的 **uid**（S9-1：与前序身份同步切换；
+            // 死句柄规范 Dead 态 = 全 1 位形 —— 与合法 uid 区分）。
             let id = hd.to_id();
             if tree.contains(id) {
-                Value::I64(index.get(&id).copied().map(|i| i as i64).unwrap_or(-2))
+                match tree.uid_of(id) {
+                    Some(u) => {
+                        let b = u.bits();
+                        let lo = i64::from_le_bytes(b[0..8].try_into().unwrap());
+                        let hi = i64::from_le_bytes(b[8..16].try_into().unwrap());
+                        Value::Array(vec![Value::I64(lo), Value::I64(hi)])
+                    }
+                    None => Value::I64(-2),
+                }
             } else {
                 Value::I64(-1)
             }
         }
         Value::Array(items) => {
-            Value::Array(items.iter().map(|i| semantic_value(i, tree, index)).collect())
+            Value::Array(items.iter().map(|i| semantic_value(i, tree)).collect())
         }
         other => other.clone(),
     }
@@ -112,22 +121,24 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
 
     let order: Vec<NodeId> = tree.preorder();
     // 节点 -> 前序下标（父的引用用下标表达；根的父 = usize::MAX）。
-    let index: HashMap<NodeId, usize> =
-        order.iter().enumerate().map(|(i, &n)| (n, i)).collect();
     h = mix(h, &order.len().to_le_bytes());
-    for (i, &node) in order.iter().enumerate() {
+    for &node in order.iter() {
         let name = tree.name(node).unwrap_or("");
-        h = mix(h, &(i as u64).to_le_bytes());
+        // **canonical semantic identity = Persistent uid**（S9-1 一次性
+        // 切换，S9-0 Q9：不留双轨）。前序 i 只作遍历序不再作身份。
+        h = mix(h, b"uid");
+        h = mix(h, &tree.uid_of(node).map(|u| u.bits()).unwrap_or([0u8; 16]));
         h = mix(h, name.as_bytes());
         if let Some(tag) = tree.kind_tag(node) {
             h = mix_kind(h, tag);
         }
-        // 父（前序下标）。
-        let parent_idx: u64 = match tree.parent(node) {
-            Some(p) => index.get(&p).copied().map(|i| i as u64).unwrap_or(u64::MAX),
-            None => u64::MAX,
+        // 父引用：父的 **uid**（canonical 身份切换的完整性 —— 结构引用
+        // 与节点身份同源；根的父 = 全 1 位形哨兵）。
+        let parent_uid: [u8; 16] = match tree.parent(node).and_then(|p| tree.uid_of(p)) {
+            Some(u) => u.bits(),
+            None => [0xFF; 16],
         };
-        h = mix(h, &parent_idx.to_le_bytes());
+        h = mix(h, &parent_uid);
         // 生命周期位。
         let flags = [tree.is_entered(node) as u8, tree.is_ready(node) as u8];
         h = mix(h, &flags);
@@ -166,7 +177,7 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
                     // NodeId 引入时升格）；悬垂 -> 规范 Dead 态（-1）。
                     // 位形/gen 是 allocator 历史，不进指纹 —— 换回收策略
                     // 指纹不变。别名（两个句柄指同一节点）自然折叠。
-                    h = mix_value(h, &semantic_value(v, tree, &index));
+                    h = mix_value(h, &semantic_value(v, tree));
                 }
             }
         }

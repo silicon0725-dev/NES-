@@ -165,9 +165,34 @@ fn t_h_04_fingerprint_resolve_semantics() {
         let _ = t.tick(1.0 / 60.0, &mut vm);
         (t, vm)
     };
-    let (ta, vma) = build(false);
-    let (tb, vmb) = build(true);
+    // S9-1 起 canonical 身份 = uid：两次**独立构造**的树身份本就不同
+    //（随机 v4）—— 本测试改为"同一语义场景（同 uid）双实例，其中一个
+    // 经历 arena churn（插入-删除）"：churn 改变 slot 分配与 gen 序列，
+    // 但不改任何存活节点的 uid/内容 → 指纹必须恒等。
+    let (t0, _) = build(false);
+    let doc = nes_scene::to_doc(&t0);
+    let text = nes_scene::doc_to_ron(&doc, &nes_scene::PackOptions::compact());
+    let rerun = |churn: bool| {
+        let mut t = nes_scene::instantiate(&text).unwrap();
+        if churn {
+            let junk = t.add_node(t.root(), "junk", NodeKind::Node);
+            t.apply_pending();
+            t.remove_node(junk, false);
+            let _ = t.tick(1.0 / 60.0, &mut nes_scene::NoObserver);
+        } else {
+            let _ = t.tick(1.0 / 60.0, &mut nes_scene::NoObserver);
+        }
+        let b = t.find_by_name("b").unwrap();
+        let mut vm = ScriptVm::new();
+        assert!(vm.attach_all(&mut t).is_empty());
+        t.emit_signal("go", Value::I64(0));
+        let _ = t.tick(1.0 / 60.0, &mut vm);
+        let _ = b;
+        (t, vm)
+    };
+    let (ta, vma) = rerun(false);
+    let (tb, vmb) = rerun(true);
     let fa = nes_scene::scene_fingerprint(&ta, Some(&vma));
     let fb = nes_scene::scene_fingerprint(&tb, Some(&vmb));
-    assert_eq!(fa, fb, "arena 历史（gen/槽位复用）不进语义指纹");
+    assert_eq!(fa, fb, "arena 历史（gen/槽位复用）不进语义指纹（同 uid 场景）");
 }

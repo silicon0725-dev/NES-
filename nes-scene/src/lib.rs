@@ -101,7 +101,7 @@ pub use script::{
 };
 pub use transform::{Affine, Transform2D, Vec2};
 pub use determinism::scene_fingerprint;
-pub use tree::{
+pub use tree::{Uid,
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, Observers, ProcessMode, SceneObserver,
     SceneTree, Signal, SignalConnection, SignalConnectionId, SignalCtx, SignalFilter,
     SignalHandler, TickStats, TreeEvent, TreeOp, SIGNAL_DELIVERY_CAP,

@@ -9,7 +9,7 @@
 //! | T-A-04 | `it.pos`/`it.属性` 直达语法：对每个实体写（实体规模化惯用形）；悬垂句柄元素经 resolve 停机 |
 //! | T-A-05 | 确定性：数组局部（含句柄）语义化进指纹，双跑恒等 |
 
-use nes_scene::{NodeKind, ScriptVm, SceneTree, Transform2D, Value};
+use nes_scene::{instantiate,NodeKind, ScriptVm, SceneTree, Transform2D, Value};
 
 fn src(t: &mut SceneTree, node: nes_scene::NodeId, text: &str) {
     t.set_prop(node, "source", Value::Str(text.to_string())).unwrap();
@@ -171,12 +171,25 @@ fn t_a_05_array_locals_deterministic_fingerprint() {
         let _ = t.tick(1.0 / 60.0, &mut vm);
         (t, vm)
     };
+    // S9-1 起 canonical 身份 = uid：两次**独立构造**的树身份本就不同
+    //（随机 v4，内容无关性 T-ID-03）—— 确定性口径改为"同一语义场景
+    // 双装载"：序列化 t1 → 重装载 t2 → 各自跑脚本 → 指纹恒等。
     let (t1, v1) = build();
-    let (t2, v2) = build();
+    let doc = nes_scene::to_doc(&t1);
+    let text = nes_scene::doc_to_ron(&doc, &nes_scene::PackOptions::compact());
+    let (mut t2, mut v2) = {
+        let mut t = instantiate(&text).unwrap();
+        let mut vm = ScriptVm::new();
+        assert!(vm.attach_all(&mut t).is_empty());
+        t.emit_signal("go", Value::I64(0));
+        let _ = t.tick(1.0 / 60.0, &mut vm);
+        (t, vm)
+    };
+    let _ = (&mut t2, &mut v2);
     assert_eq!(
         nes_scene::scene_fingerprint(&t1, Some(&v1)),
         nes_scene::scene_fingerprint(&t2, Some(&v2)),
-        "数组局部（句柄元素语义化）双跑恒等"
+        "数组局部（句柄元素语义化）同场景双装载恒等"
     );
 }
 

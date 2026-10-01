@@ -157,8 +157,14 @@ fn criterion_2_packing_is_byte_deterministic() {
 
     // 属性写入顺序不同、内容相同的两棵树，打包结果必须相同：
     // 输出顺序由 schema 与场景顺序决定，与构造过程无关。
+    //（S9-1 起 uid 是随机持久身份 —— 两棵**独立构造**的树身份本就
+    // 不同；等价断言剥离 uid 行后比较，身份稳定性由 T-ID 系钉死。）
     let twin = build_sample(true);
-    assert_eq!(scene_io::write_ron(&twin, &PackOptions::verbose()), a);
+    let strip = |s: &str| -> String {
+        s.lines().filter(|l| !l.trim_start().starts_with("uid:")).collect::<Vec<_>>().join("
+")
+    };
+    assert_eq!(strip(&scene_io::write_ron(&twin, &PackOptions::verbose())), strip(&a));
 
     // 头部元信息：版本与节点数。
     assert!(a.starts_with(&format!("// nes-scene packed v{FORMAT_VERSION}")));

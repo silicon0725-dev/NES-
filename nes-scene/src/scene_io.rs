@@ -208,6 +208,10 @@ pub struct NodeDoc {
     pub overrides: Vec<InstanceOverride>,
     /// 属性（顺序由写入侧决定，读取侧不依赖顺序）。
     pub props: Vec<(String, Value)>,
+    /// 持久语义身份（S9-0/S9-1）：32 位十六进制 UUID。**compact 模式
+    /// 也写出**（身份不省略 —— 省略即回退树形派生，恰是要摆脱的依赖）。
+    /// 旧文件无此字段 → 加载时确定性派生（仅内存，保存才落盘）。
+    pub uid: Option<String>,
     /// **组件挂载**（S8.3-2，D2 契约）：`Resource(n)` 槽位列表 ——
     /// 实例化时每个槽位在该节点下展开为一个 **Script Host 子节点**
     ///（名 = 资产路径去扩展名的词干，唯一化如常），`script` 属性引用
@@ -331,6 +335,8 @@ fn node_to_doc(tree: &SceneTree, id: NodeId, omit_defaults: bool) -> NodeDoc {
         local: tree.local(id).unwrap_or(Transform2D::IDENTITY),
         process_mode: tree.process_mode(id).unwrap_or_default(),
         overrides: tree.instance_overrides(id).unwrap_or_default().to_vec(),
+        // 持久身份（S9-1）：恒写出（compact 亦然 —— 身份不省略）。
+        uid: tree.uid_of(id).map(|u| u.to_hex()),
         props,
         // 组件（S8.3-2）：装载时展开为显式 Host 子节点，回写恒空
         //（展开是单向语法糖；再写会在下次装载双重展开）。
@@ -419,6 +425,11 @@ fn write_node(out: &mut String, doc: &NodeDoc, opts: &PackOptions, level: usize)
     out.push_str("Node(\n");
     out.push_str(&format!("{ind1}name: {},\n", quote(&doc.name)));
     out.push_str(&format!("{ind1}kind: {},\n", quote(doc.kind.as_str())));
+    // 持久身份恒写出（S9-0：compact 亦然 —— 身份不参与省略）。
+    if let Some(u) = &doc.uid {
+        out.push_str(&format!("{ind1}uid: {},
+", quote(u)));
+    }
     // 变换只在非单位（或全量模式）时写出：缺省即单位，语义不丢。
     if !opts.omit_defaults || doc.local != Transform2D::IDENTITY {
         out.push_str(&format!("{ind1}local: {},\n", transform_literal(doc.local)));
@@ -743,9 +754,41 @@ fn check_version(doc: &SceneDoc) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// 旧文件迁移派生种子：**前序路径**（不含内容 —— 内容无关性 S9-0 v1.1；
+/// 派生种子是兼容机制，不是身份来源）。兄弟同名时附代号消歧。
+fn legacy_seed(tree: &SceneTree, parent: NodeId, name: &str) -> String {
+    let parent_path = tree
+        .path_of(parent)
+        .map(|p| p.to_string())
+        .unwrap_or_default();
+    let same_named = tree
+        .children(parent)
+        .iter()
+        .filter(|&&c| tree.name(c).is_some_and(|n| n == name))
+        .count();
+    if same_named > 0 {
+        format!("{parent_path}/{name}#{same_named}")
+    } else {
+        format!("{parent_path}/{name}")
+    }
+}
+
 fn build_tree(doc: &SceneDoc) -> Result<SceneTree, ParseError> {
     let mut tree = SceneTree::new_with_kind(&doc.root.name, doc.root.kind.kind());
     let root = tree.root();
+    // 根节点持久身份（S9-1）：文件 uid 或迁移派生（与子节点同口径 ——
+    // 否则根 uid 每次装载随机，指纹漂移）。
+    let root_uid = match &doc.root.uid {
+        Some(hex) => crate::tree::Uid::from_hex(hex)
+            .map_err(|e| ParseError::semantic(format!("根节点 uid 非法：{e}")))?,
+        None => crate::tree::Uid::derive_legacy("/"),
+    };
+    if tree.set_uid(root, root_uid.clone()).is_err() {
+        return Err(ParseError::semantic(format!(
+            "根节点 uid 冲突：{}",
+            root_uid.to_hex()
+        )));
+    }
     tree.set_local(root, doc.root.local);
     tree.set_process_mode(root, doc.root.process_mode);
     tree.set_instance_overrides(root, doc.root.overrides.clone());
@@ -764,7 +807,17 @@ fn build_tree(doc: &SceneDoc) -> Result<SceneTree, ParseError> {
 }
 
 fn build_child(tree: &mut SceneTree, parent: NodeId, doc: &NodeDoc) -> Result<(), ParseError> {
-    let id = tree.add_node(parent, &doc.name, doc.kind.kind());
+    // 持久身份装载（S9-1）：文件带 uid -> 显式身份（冲突报错）；
+    // 旧文件无 uid -> **确定性迁移派生**（前序路径种子，仅内存 ——
+    // 保存时经 to_doc 写出才落盘；同一文件两次加载同 uid，幂等）。
+    let uid = match &doc.uid {
+        Some(hex) => crate::tree::Uid::from_hex(hex)
+            .map_err(|e| ParseError::semantic(format!("节点 {} 的 uid 非法：{e}", doc.name)))?,
+        None => crate::tree::Uid::derive_legacy(&legacy_seed(tree, parent, &doc.name)),
+    };
+    let id = tree
+        .add_node_with_uid(parent, &doc.name, doc.kind.kind(), uid)
+        .map_err(ParseError::semantic)?;
     tree.set_local(id, doc.local);
     tree.set_process_mode(id, doc.process_mode);
     apply_props(tree, id, &doc.props)?;
@@ -773,7 +826,17 @@ fn build_child(tree: &mut SceneTree, parent: NodeId, doc: &NodeDoc) -> Result<()
     //（名 = "comp{n}"，唯一化如常；script 属性引用同槽位）。零新协议：
     // 生成的是普通 Script 节点，装载/调度/生命周期全部走既有路径。
     for (i, slot) in doc.components.iter().enumerate() {
-        let host = tree.add_node(id, &format!("comp{i}"), NodeKindTag::Script.kind());
+        // 组件 Host 的 uid：确定性派生（父路径 + 槽位序 —— 确定性指纹
+        // 要求展开可复现；随机 v4 会让同一文件两次装载指纹漂移）。
+        let uid = crate::tree::Uid::derive_legacy(&format!(
+            "{}/{}/comp{}",
+            legacy_seed(tree, id, &doc.name),
+            doc.name,
+            i
+        ));
+        let host = tree
+            .add_node_with_uid(id, &format!("comp{i}"), NodeKindTag::Script.kind(), uid)
+            .map_err(ParseError::semantic)?;
         let _ = tree.set_prop(host, "script", Value::Resource(*slot));
     }
     for child in &doc.children {
@@ -2019,6 +2082,7 @@ impl Parser {
         let mut props: Vec<(String, Value)> = Vec::new();
         let mut children: Vec<NodeDoc> = Vec::new();
         let mut components: Vec<u64> = Vec::new();
+        let mut uid: Option<String> = None;
 
         loop {
             self.skip_trivia();
@@ -2078,6 +2142,9 @@ impl Parser {
                 "children" => {
                     children = self.node_list()?;
                 }
+                "uid" => {
+                    uid = Some(self.string()?);
+                }
                 "components" => {
                     // `[Resource(n), ...]` —— 展开为 Script Host 子节点。
                     components = self.component_list()?;
@@ -2113,6 +2180,7 @@ impl Parser {
             process_mode,
             overrides,
             props,
+            uid,
             components,
             children,
         })
