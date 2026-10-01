@@ -1,0 +1,103 @@
+// S7.4 首个真实项目：Dodge —— 玩家躲三个追踪者，撑过 30 秒。
+// 手写 .ron（感受作者侧的真实痛点，结论进 Pressure Map 文档）。
+//
+// 玩法：
+//   - 方向键/WASD 移动玩家（蓝色），三台红色追踪者以不同速度逼近；
+//   - 碰撞（距离平方 < 144）→ 受击（hp 计数 +1）+ 该追踪者传回角落；
+//   - 受击 3 次 → LOSE；撑过 1800 tick（30s @60fps）→ WIN。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/player.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/enemy.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "player",
+                kind: "Sprite2D",
+                local: (x: 16.0, y: 100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "e1",
+                kind: "Sprite2D",
+                local: (x: 8.0, y: 8.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            Node(
+                name: "e2",
+                kind: "Sprite2D",
+                local: (x: 376.0, y: 8.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            Node(
+                name: "e3",
+                kind: "Sprite2D",
+                local: (x: 376.0, y: 208.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            Node(
+                name: "hud",
+                kind: "Label",
+                local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "text": "DODGE: survive 30s", },
+                children: [],
+            ),
+            // 受击处理（信号入口）。**痛点实证：一脚本一入口** —— 同节点
+            // 不能同时挂 on + every，行为按入口拆节点。
+            Node(
+                name: "player_hit",
+                kind: "Script",
+                props: { "source": "on \"damage\" { hp = hp + 1; hud.text = \"HIT!\"; if hp >= 3 { hud.text = \"LOSE\"; emit \"game_over\" 0 } }" },
+                children: [],
+            ),
+            // 移动（process 入口；x/y 局部为真源，pos 每帧重合成 —— 无局部
+            // 初始化的绕法：缺省 0 起步）。
+            Node(
+                name: "player_move",
+                kind: "Script",
+                props: { "source": "on \"tick\" { if s == 0 { s = 1; x = player.pos.x; y = player.pos.y }; if key(\"ArrowLeft\") { x = x - 2.5 }; if key(\"ArrowRight\") { x = x + 2.5 }; if key(\"ArrowUp\") { y = y - 2.5 }; if key(\"ArrowDown\") { y = y + 2.5 }; if x < 8.0 { x = 8.0 }; if x > 376.0 { x = 376.0 }; if y < 8.0 { y = 8.0 }; if y > 208.0 { y = 208.0 }; player.pos = xy(x, y) }" },
+                children: [],
+            ),
+            // 追踪者：向玩家线性逼近（各自速度系数）。
+            Node(
+                name: "e1_brain",
+                kind: "Script",
+                props: { "source": "on \"tick\" { dx = player.pos.x - e1.pos.x; dy = player.pos.y - e1.pos.y; e1.pos = xy(e1.pos.x + dx * 0.012, e1.pos.y + dy * 0.012) }" },
+                children: [],
+            ),
+            Node(
+                name: "e2_brain",
+                kind: "Script",
+                props: { "source": "on \"tick\" { dx = player.pos.x - e2.pos.x; dy = player.pos.y - e2.pos.y; e2.pos = xy(e2.pos.x + dx * 0.018, e2.pos.y + dy * 0.018) }" },
+                children: [],
+            ),
+            Node(
+                name: "e3_brain",
+                kind: "Script",
+                props: { "source": "on \"tick\" { dx = player.pos.x - e3.pos.x; dy = player.pos.y - e3.pos.y; e3.pos = xy(e3.pos.x + dx * 0.024, e3.pos.y + dy * 0.024) }" },
+                children: [],
+            ),
+            // 碰撞/胜负判定：宿主每帧发 "tick"（跨节点写在信号入口是合法路径）。
+            Node(
+                name: "referee",
+                kind: "Script",
+                props: { "source": "on \"tick\" { t = t + 1; d1 = (player.pos.x - e1.pos.x) * (player.pos.x - e1.pos.x) + (player.pos.y - e1.pos.y) * (player.pos.y - e1.pos.y); if d1 < 144.0 { emit \"damage\" 0; e1.pos = (8.0, 8.0) }; d2 = (player.pos.x - e2.pos.x) * (player.pos.x - e2.pos.x) + (player.pos.y - e2.pos.y) * (player.pos.y - e2.pos.y); if d2 < 144.0 { emit \"damage\" 0; e2.pos = (376.0, 8.0) }; d3 = (player.pos.x - e3.pos.x) * (player.pos.x - e3.pos.x) + (player.pos.y - e3.pos.y) * (player.pos.y - e3.pos.y); if d3 < 144.0 { emit \"damage\" 0; e3.pos = (376.0, 208.0) }; if t == 1800 { hud.text = \"WIN\"; emit \"win\" 0 } }" },
+                children: [],
+            ),
+        ],
+    ),
+)

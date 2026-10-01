@@ -140,6 +140,17 @@ diff，第一处差异即定位到帧（T-HR-08 演示：同场景两条只差�
 | 基线哈希档案（把当前哈希存档进仓库，CI 跨版本比对） | 未启动（先有契约后有档案） |
 | Scratch `.sb3` 差分执行（NES vs Scratch 参照实现逐帧比对） | S8 后路线（本里程碑的差分口径就是为它铺的） |
 | 分组表/信号队列残量进指纹（出现相应行为面时） | 按需 |
+| **差分接口演进**（评审注记，S7.4 前记录）：`trace_hash` 不作为差分
+    接口的终点 —— 后续形态 `DeterminismReport { frame_hashes,
+    trace_hash, first_divergence: Option<Frame> }` 与 `FrameDiff
+    { tree/property/script/input diff }`；**现在不做**（"定位到帧"的
+    第一层能力已足够当前差分口径） | 方向记录 |
+| **语义身份分层**（评审注记）：`前序位置 + name` 是"当前 Scene 结构
+    状态"的指纹身份，**不是持久 NodeId** —— 两者不是同一概念。若未来
+    引入持久 NodeId，最终分层应为 `NodeId → 语义身份`、
+    `Preorder index → 规范遍历位`，勿让前序位置最终承担 NodeId 的
+    职责（slot/代际已是 Execution Storage 细节，前序位只是它的规范化
+    投影） | 方向记录 |
 | 跨机器/跨编译器版本的位级确定声明（f32 位形在 IEEE 下成立；正式声明待跨机验证） | 待验证 |
 
 ## 5. 记账

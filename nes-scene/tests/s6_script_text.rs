@@ -1319,3 +1319,49 @@ fn t_cmp_31_inline_source() {
     let e3 = vm4.attach(&mut t4, b4).unwrap_err();
     assert!(e3.contains("registry_key 为空"), "{e3}");
 }
+
+// ---------------------------------------------------------------- S7.4
+
+/// T-Cmp-32（S7.4 真实项目解锁）：`xy(e1, e2)` 任意表达式构造 Vec2 +
+/// `node.pos.x` / `node.pos.y` 分量读 —— 游戏数学（追踪/碰撞/合成位移）
+/// 的最小解锁面。数字字面量路径不受影响；`.pos.z` 如实报错。
+#[test]
+fn t_cmp_32_xy_construct_and_components() {
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    t.set_local(sp, Transform2D::from_pos(10.0, 20.0));
+    let b = t.add_node(t.root(), "b", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(
+        b,
+        "source",
+        Value::Str(
+            "on \"go\" { dx = 5.0\n  sp.pos = xy(sp.pos.x + dx, sp.pos.y * 2.0)\n  rx = sp.pos.x\n  ry = sp.pos.y }"
+                .into(),
+        ),
+    )
+    .unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(&mut t).is_empty());
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(t.local(sp).unwrap().pos.x, 15.0, "x = 10 + 5");
+    assert_eq!(t.local(sp).unwrap().pos.y, 40.0, "y = 20 * 2");
+    // 微批次契约（S7.1 冻结）：同处理器内自读见**旧值**（Cmd 未落地）——
+    // `rx = sp.pos.x` 读到写入前的 10.0；落地后的新值经树断言（上方）。
+    let locals = vm.locals(b).expect("局部");
+    assert_eq!(locals.get("rx"), Some(&Value::F32(10.0)), "同处理器自读旧值（微批次）");
+    assert_eq!(locals.get("ry"), Some(&Value::F32(20.0)));
+
+    // 错误口径：pos 后只支持 .x/.y；xy 需要数值分量（运行时停机）。
+    assert!(nes_scene::compile_script("on \"go\" { x = sp.pos.z }").is_err());
+    t.set_prop(b, "source", Value::Str("on \"go\" { v = xy(\"a\", 1.0) }".into())).unwrap();
+    let mut vm2 = ScriptVm::new();
+    assert!(vm2.attach_all(&mut t).is_empty());
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm2);
+    assert!(
+        vm2.locals(b).is_some_and(|l| l.contains_key(nes_scene::HALT_LOCAL)),
+        "xy 非数值分量停机"
+    );
+}

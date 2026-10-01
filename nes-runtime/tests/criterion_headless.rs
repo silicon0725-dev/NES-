@@ -242,3 +242,57 @@ fn t_hr_08_first_divergence_locates_frame() {
     assert_eq!(first, 3, "松开时机差在第 3 帧首次可见（A 已松、B 仍按）");
     assert!(ra.frame_hashes[..first] == rb.frame_hashes[..first], "分歧前全等");
 }
+
+/// T-GP-01（S7.4 首个真实项目）：**Dodge** 游戏在 headless 下的真实
+/// 玩法闭环 —— 静止玩家被三台追踪者追上 3 次 → HUD 变 "LOSE"；带轨迹
+/// 两次运行逐帧全等（真实项目 = 确定性契约的最大用例）。
+#[test]
+fn t_gp_01_dodge_gameplay_and_determinism() {
+    let _g = lock();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+
+    // 玩法闭环：无输入跑 1500 帧 —— 追踪者必然追上静止玩家 3 次。
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).expect("headless 装配");
+    rt.load_scene("first_game.ron").expect("加载");
+    let mut vm = nes_scene::ScriptVm::new();
+    {
+        let table = rt.resources_mut().clone();
+        let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+            std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+        });
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+    rt.mount_key_probe(&mut vm);
+    let mut lose_at = None;
+    for f in 0..1500u64 {
+        let snap = rt.collect_input();
+        let _ = rt.emit_input_signals(&snap);
+        rt.tree_mut().emit_signal("tick", nes_scene::Value::I64(0));
+        let _ = rt.tick_headless(1.0 / 60.0, &mut vm);
+        if f % 30 == 0 {
+            let hud = {
+                let tree = rt.tree_mut();
+                tree.find(&nes_scene::NodePath::parse("/main/hud").unwrap())
+                    .and_then(|n| tree.prop(n, "text").cloned())
+            };
+            if let Some(nes_scene::Value::Str(s)) = hud {
+                if s.contains("LOSE") {
+                    lose_at = Some(f);
+                    break;
+                }
+            }
+        }
+    }
+    assert!(lose_at.is_some(), "静止玩家在 1500 帧内必然 LOSE（追上 3 次）");
+
+    // 确定性：仓库内的游戏 + 仓库内的轨迹，两次运行全等。
+    let trace_text =
+        std::fs::read_to_string(root.join("first_game_trace.txt")).expect("读轨迹");
+    let trace = nes_render_api::input::parse_trace(&trace_text).expect("轨迹");
+    let a = nes_runtime::headless::run(&root, "first_game.ron", &trace, 600, 1.0 / 60.0)
+        .expect("跑 A");
+    let b = nes_runtime::headless::run(&root, "first_game.ron", &trace, 600, 1.0 / 60.0)
+        .expect("跑 B");
+    assert_eq!(a.frame_hashes, b.frame_hashes, "游戏逐帧全等");
+    assert_eq!(a.trace_hash, b.trace_hash);
+}

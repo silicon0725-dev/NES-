@@ -110,6 +110,13 @@ pub enum Op {
     ///（S7.2：VM 不碰平台 —— 探针由运行时接 `InputSnapshot::is_down`）。
     /// 未注入探针停机（如实：没接就是没有，不装"恒假"）。
     Key,
+    /// 弹 y、x（栈序），压 `Vec2(x, y)`（S7.4 真实项目解锁：任意表达式
+    /// 构造向量 —— `xy(px + dx, py)`；数字字面量仍走 Const 折叠）。
+    Pack,
+    /// 弹 Vec2，压 x 分量（F32）。S7.4：`node.pos.x`。
+    GetX,
+    /// 弹 Vec2，压 y 分量（F32）。S7.4：`node.pos.y`。
+    GetY,
 }
 
 /// 脚本入口。
@@ -471,6 +478,28 @@ fn run<'a, 'b>(
                     halt!(format!("key(\"{name}\") 未接输入探针（宿主未注入）"));
                 };
                 stack.push(StackVal::V(Value::Bool(p(&name))));
+            }
+            Op::Pack => {
+                let y = pop_val!();
+                let x = pop_val!();
+                let (Some(x), Some(y)) = (num_of(&x), num_of(&y)) else {
+                    halt!("xy(..) 需要数值分量");
+                };
+                stack.push(StackVal::V(Value::Vec2(Vec2::new(x, y))));
+            }
+            Op::GetX => {
+                let a = pop_val!();
+                let Value::Vec2(v) = a else {
+                    halt!(".x 需要 Vec2");
+                };
+                stack.push(StackVal::V(Value::F32(v.x)));
+            }
+            Op::GetY => {
+                let a = pop_val!();
+                let Value::Vec2(v) = a else {
+                    halt!(".y 需要 Vec2");
+                };
+                stack.push(StackVal::V(Value::F32(v.y)));
             }
         }
         pc += 1;
@@ -2052,6 +2081,30 @@ impl TextParser {
         Ok(())
     }
 
+    /// `node.pos` 之后的 `.x`/`.y` 分量读（S7.4）：GetT 产物是 Vec2，
+    /// 追加 GetX/GetY。仅这一处形态支持（`(expr).x` 不支持 —— 编译器
+    /// 无类型推理，静默不支持不如不支持）。
+    fn pos_component(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        if matches!(self.peek().tok, Tok::Sym('.')) {
+            if let Some(t) = self.toks.get(self.pos + 1) {
+                if let Tok::Ident(m) = &t.tok {
+                    match m.as_str() {
+                        "x" => {
+                            self.pos += 2;
+                            ops.push(Op::GetX);
+                        }
+                        "y" => {
+                            self.pos += 2;
+                            ops.push(Op::GetY);
+                        }
+                        _ => return Err(self.err_here("pos 后只支持 .x / .y")),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn unary(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
         // 一元负号（最小集）：`-x` -> `0 - x`（先垫 0 再解析操作数，Sub 弹序恰好）。
         if matches!(self.peek().tok, Tok::Sym('-')) {
@@ -2068,9 +2121,10 @@ impl TextParser {
             ops.push(Op::Not);
             return Ok(());
         }
-        // 内建调用（S6.30 起）：`ident (` —— `len`（长度）与 `key`（输入
-        // 探针，S7.2）。后随括号消歧，不占保留字（局部名不带括号照常是
-        // 局部）。未知内建如实报错。
+        // 内建调用（S6.30 起）：`ident (` —— `len`（长度）、`key`（输入
+        // 探针，S7.2）、`xy(e1, e2)`（任意表达式构造 Vec2，S7.4）。
+        // 后随括号消歧，不占保留字（局部名不带括号照常是局部）。
+        // 未知内建如实报错。
         if let Tok::Ident(name) = self.peek().tok.clone() {
             if name == "len" && matches!(self.peek2().tok, Tok::Sym('(')) {
                 self.pos += 2; // len (
@@ -2084,6 +2138,15 @@ impl TextParser {
                 self.expr(ops)?;
                 self.expect_sym(')')?;
                 ops.push(Op::Key);
+                return Ok(());
+            }
+            if name == "xy" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // xy (
+                self.expr(ops)?;
+                self.expect_sym(',')?;
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::Pack);
                 return Ok(());
             }
         }
@@ -2107,6 +2170,7 @@ impl TextParser {
                         ops.push(Op::This);
                         if member == "pos" {
                             ops.push(Op::GetT);
+                            self.pos_component(ops)?;
                         } else {
                             ops.push(Op::GetProp(member));
                         }
@@ -2127,6 +2191,7 @@ impl TextParser {
                         ops.push(Op::NodeByName(other.to_string()));
                         if member == "pos" {
                             ops.push(Op::GetT);
+                            self.pos_component(ops)?;
                         } else {
                             ops.push(Op::GetProp(member));
                         }
