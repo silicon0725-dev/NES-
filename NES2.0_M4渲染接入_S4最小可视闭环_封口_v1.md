@@ -409,6 +409,15 @@ cargo run --example s41_visual_closure
 > S6.15 泵序测试按 S7.1 口径补内建 tick 位；Dodge ABI 按协议重生成
 > （070713bc082dca22，评审注记在档）。新增 T-LP-01..03，runtime 升至
 > 47（全仓合计 435，文档见 `NES2.0_S8.1游戏节拍语义_v1.md`）。
+> **v1.49 注记（S8.2 移植压力测试）**：Mini Dungeon —— raylib 风格
+> top-down shooter 的结构移植（Player/Enemy/Projectile/Pickup/Door/
+> UI），**引擎零改动**跑通（T-GP-02 玩法闭环 + 确定性）。五项结构性
+> 妥协全部按 S7.4 压力图预测命中（跨脚本局部不可读 → 几何即状态；
+> 一脚本一入口 → 管理器吞并行为；无集合/句柄 → 单弹道；无 sqrt →
+> 八向瞄准），外加两项新发现（鼠标位置不可达、动态 emit 名不可达）。
+> S8.2b API 冻结清单五项入档待评审（实体句柄/集合/共享读面/动态
+> emit 名/数学）。runtime 升至 48（全仓合计 436，文档见
+> `NES2.0_S8.2移植压力测试_v1.md`）。
 
 | 事项 | 状态 |
 |---|---|

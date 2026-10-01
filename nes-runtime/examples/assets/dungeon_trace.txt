@@ -1,0 +1,8 @@
+# 走位 + 朝向 + 射击：右移朝右射、上移朝上射
+0 key_down ArrowRight key_down Space
+40 key_up ArrowRight key_down ArrowUp
+80 key_up Space key_up ArrowUp key_down ArrowRight key_down Space
+140 key_up ArrowRight key_down ArrowDown key_up Space
+200 key_up ArrowDown key_down ArrowLeft key_down Space
+260 key_up ArrowLeft key_up Space key_down ArrowUp
+320 key_up ArrowUp

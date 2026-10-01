@@ -1,0 +1,127 @@
+// S8.2 移植压力测试：Mini Dungeon —— raylib 风格 top-down shooter 的
+// 结构移植（Player/Enemy/Projectile/Pickup/Door/UI；Tilemap 按裁决略去）。
+//
+// 玩法：WASD/方向键移动（朝向 = 最后移动方向），Space 射击（单弹道、
+// 冷却 12 tick）；三台追踪者（击杀后角落重生、随分加速）；每 2 杀掉
+// 一颗心（回满 3 HP）；5 分开门，进门 WIN；HP 归零 LOSE。
+//
+// **移植裁决（压力测试的发现，详见 S8.2 文档）**：
+// - 弹道状态住在 player_brain 的局部（弹丸是哑精灵）—— 跨脚本状态
+//   只有信号一跳，管理器模式是当前唯一解；
+// - 朝向八向（无 sqrt/归一化）；
+// - 鼠标瞄准被放弃（鼠标位置进不了另一脚本的局部）；
+// - referee 以"停机坪位置"判定弹丸存活（局部不可跨读）。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/player.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/enemy.bmp", kind: "Texture"),
+        Res(id: 3, path: "Textures/bullet.bmp", kind: "Texture"),
+        Res(id: 4, path: "Textures/heart.bmp", kind: "Texture"),
+        Res(id: 5, path: "Textures/door.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "player",
+                kind: "Sprite2D",
+                local: (x: 40.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "bullet",
+                kind: "Sprite2D",
+                local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(3), },
+                children: [],
+            ),
+            Node(
+                name: "e1",
+                kind: "Sprite2D",
+                local: (x: 360.0, y: 20.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            Node(
+                name: "e2",
+                kind: "Sprite2D",
+                local: (x: 360.0, y: 196.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            Node(
+                name: "e3",
+                kind: "Sprite2D",
+                local: (x: 20.0, y: 20.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            Node(
+                name: "heart",
+                kind: "Sprite2D",
+                local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(4), },
+                children: [],
+            ),
+            Node(
+                name: "door",
+                kind: "Sprite2D",
+                local: (x: 352.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(5), "visible": false, },
+                children: [],
+            ),
+            Node(
+                name: "hud",
+                kind: "Label",
+                local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "text": "HP 3  SCORE 0", },
+                children: [],
+            ),
+            // 玩家侧管理器：位置/朝向/开火/弹道（弹丸状态在此 —— 跨脚本
+            // 局部不可读，管理器模式是当前唯一解）。
+            Node(
+                name: "player_brain",
+                kind: "Script",
+                props: { "source": "init { x = 40.0; y = 108.0; fx = 1.0; fy = 0.0; cd = 0; bl = 0; bdx = 0.0; bdy = 0.0; bx = -100.0; by = -100.0 }\non \"tick\" { if key(\"ArrowLeft\") { x = x - 2.5; fx = -1.0; fy = 0.0 }; if key(\"ArrowRight\") { x = x + 2.5; fx = 1.0; fy = 0.0 }; if key(\"ArrowUp\") { y = y - 2.5; fx = 0.0; fy = -1.0 }; if key(\"ArrowDown\") { y = y + 2.5; fx = 0.0; fy = 1.0 }; if x < 8.0 { x = 8.0 }; if x > 376.0 { x = 376.0 }; if y < 8.0 { y = 8.0 }; if y > 208.0 { y = 208.0 }; player.pos = xy(x, y); if cd > 0 { cd = cd - 1 }; if key(\"Space\") { if cd <= 0 { if bl <= 0 { cd = 12; bl = 50; bdx = fx; bdy = fy; bx = x; by = y } } }; if bl > 0 { bl = bl - 1; bx = bx + bdx * 4.0; by = by + bdy * 4.0; if bx < 0.0 { bl = 0 }; if bx > 384.0 { bl = 0 }; if by < 0.0 { bl = 0 }; if by > 216.0 { bl = 0 }; bullet.pos = xy(bx, by) } else { bullet.pos = xy(-100.0, -100.0) } }" },
+                children: [],
+            ),
+            // 追踪者：比例逼近（无归一化 —— Dodge 同款）+ 随分加速的钩子留 referee。
+            Node(
+                name: "e1_brain",
+                kind: "Script",
+                props: { "source": "init { k = 0.020 }\non \"tick\" { dx = player.pos.x - e1.pos.x; dy = player.pos.y - e1.pos.y; e1.pos = xy(e1.pos.x + dx * k, e1.pos.y + dy * k) }" },
+                children: [],
+            ),
+            Node(
+                name: "e2_brain",
+                kind: "Script",
+                props: { "source": "init { k = 0.014 }\non \"tick\" { dx = player.pos.x - e2.pos.x; dy = player.pos.y - e2.pos.y; e2.pos = xy(e2.pos.x + dx * k, e2.pos.y + dy * k) }" },
+                children: [],
+            ),
+            Node(
+                name: "e3_brain",
+                kind: "Script",
+                props: { "source": "init { k = 0.026 }\non \"tick\" { dx = player.pos.x - e3.pos.x; dy = player.pos.y - e3.pos.y; e3.pos = xy(e3.pos.x + dx * k, e3.pos.y + dy * k) }" },
+                children: [],
+            ),
+            // 裁判：hp/score/掉落/门/胜负（数据所有权切分：玩家侧状态在
+            // player_brain，对抗侧状态在 referee —— 弹丸"存活"以停机坪
+            // 位置判定，因局部不可跨读）。
+            Node(
+                name: "referee",
+                kind: "Script",
+                props: { "source": "init { hp = 3; score = 0; kills = 0 }\non \"tick\" { hit = 0; bx = bullet.pos.x; by = bullet.pos.y; alive = 0; if bx > -50.0 { alive = 1 }; d = (bx - e1.pos.x) * (bx - e1.pos.x) + (by - e1.pos.y) * (by - e1.pos.y); if alive == 1 { if d < 100.0 { hit = 1; e1.pos = xy(376.0, 12.0) } }; d = (bx - e2.pos.x) * (bx - e2.pos.x) + (by - e2.pos.y) * (by - e2.pos.y); if alive == 1 { if d < 100.0 { hit = 1; e2.pos = xy(376.0, 204.0) } }; d = (bx - e3.pos.x) * (bx - e3.pos.x) + (by - e3.pos.y) * (by - e3.pos.y); if alive == 1 { if d < 100.0 { hit = 1; e3.pos = xy(12.0, 12.0) } }; if hit == 1 { bullet.pos = xy(-100.0, -100.0); score = score + 1; kills = kills + 1; if kills % 2 == 0 { heart.pos = xy(player.pos.x, player.pos.y - 24.0) } }; pd = (player.pos.x - e1.pos.x) * (player.pos.x - e1.pos.x) + (player.pos.y - e1.pos.y) * (player.pos.y - e1.pos.y); if pd < 144.0 { hp = hp - 1; e1.pos = xy(376.0, 12.0) }; pd = (player.pos.x - e2.pos.x) * (player.pos.x - e2.pos.x) + (player.pos.y - e2.pos.y) * (player.pos.y - e2.pos.y); if pd < 144.0 { hp = hp - 1; e2.pos = xy(376.0, 204.0) }; pd = (player.pos.x - e3.pos.x) * (player.pos.x - e3.pos.x) + (player.pos.y - e3.pos.y) * (player.pos.y - e3.pos.y); if pd < 144.0 { hp = hp - 1; e3.pos = xy(12.0, 12.0) }; if hp < 3 { hd = (player.pos.x - heart.pos.x) * (player.pos.x - heart.pos.x) + (player.pos.y - heart.pos.y) * (player.pos.y - heart.pos.y); if hd < 144.0 { hp = 3; heart.pos = xy(-100.0, -100.0) } }; if score >= 5 { door.visible = true }; dd = (player.pos.x - door.pos.x) * (player.pos.x - door.pos.x) + (player.pos.y - door.pos.y) * (player.pos.y - door.pos.y); over = 0; if score >= 5 { if dd < 256.0 { over = 1; hud.text = \"WIN\"; emit \"over\" 0 } }; if hp <= 0 { over = 1; hud.text = \"LOSE\"; emit \"over\" 0 }; if over == 0 { hud.text = \"HP \" + num_to_str(hp) + \"  SCORE \" + num_to_str(score) } }" },
+                children: [],
+            ),
+        ],
+    ),
+)
