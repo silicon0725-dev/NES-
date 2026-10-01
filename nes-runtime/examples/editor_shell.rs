@@ -1,0 +1,327 @@
+//! S9-3b **Editor Shell**：建立在已验证状态模型上的编辑器 UI。
+//!
+//! 架构（评审冻结）：**UI 只消费状态模型，不成为语义来源** ——
+//! Hierarchy View 是 SceneTree 的投影（Label 文本），Inspector 是
+//! 选择节点数据的投影，Viewport 高亮是 Selection 的投影。一切修改
+//! 经 Inspector/Hierarchy 适配器 → TransactionLog。ui 零自有状态
+//!（除面板滚动等会话态）。
+//!
+//! 布局（768x432）：
+//! - 左侧 180px：Hierarchy 面板（树投影）
+//! - 右侧 160px：Inspector 面板（选中节点属性）
+//! - 中间：Viewport（场景 + 选中高亮 z_index=5）
+//! - 底部：状态栏（undo/redo 可用性、操作提示）
+//!
+//! 操作：Tab 循环选择；方向键移动选中；Delete 删除子树；
+//! Ctrl+Z undo；Ctrl+Y redo。
+//!
+//! 运行：`cargo run --example editor_shell`
+
+use std::path::Path;
+use std::time::Duration;
+
+use nes_render_api::{FrameInfo, Vec2};
+use nes_render_extract::{PROP_LABEL_TEXT, PROP_TEXTURE};
+use nes_render_wgpu::{bmp, FontParams};
+use nes_runtime::{write_bmp_rgba, NesRuntime};
+use nes_scene::editor::{Hierarchy, Inspector, Selection};
+use nes_scene::transaction::TransactionLog;
+use nes_scene::{NodeKind, ScriptVm, Transform2D, Value, Uid};
+
+fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
+    [r, g, b, 255].repeat(16 * 16)
+}
+
+fn main() {
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    let tex = assets.join("Textures");
+    std::fs::create_dir_all(&tex).unwrap();
+    for (name, rgb) in [
+        ("player.bmp", (90, 130, 255)),
+        ("enemy.bmp", (255, 80, 80)),
+        ("bullet.bmp", (255, 220, 60)),
+        ("heart.bmp", (255, 120, 200)),
+        ("door.bmp", (90, 220, 120)),
+    ] {
+        if !tex.join(name).exists() {
+            let (r, g, b) = rgb;
+            write_bmp_rgba(&tex.join(name), 16, 16, &solid_rgba(r, g, b)).expect("写纹理");
+        }
+    }
+
+    let mut rt = NesRuntime::open_windowed_with_root(
+        &assets,
+        "NES 2.0 - Editor Shell (S9-3b)",
+        768,
+        432,
+    )
+    .expect("窗口装配");
+    for t in ["player", "enemy", "bullet", "heart", "door"] {
+        let _ = rt.declare_texture(&format!("Textures/{t}.bmp")).expect("声明纹理");
+    }
+    let report = rt.bind_assets();
+    assert_eq!(report.loaded.len(), 5);
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 5);
+    {
+        let font_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nes-render-wgpu/examples/assets");
+        let (w, h, sheet) =
+            bmp::load_rgba(&std::fs::read(font_dir.join("font_atlas.bmp")).unwrap()).unwrap();
+        let metrics = std::fs::read_to_string(font_dir.join("font_metrics.txt")).unwrap();
+        let field = |k: &str| -> f32 {
+            metrics
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix(&format!("{k}=")))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("font_metrics 缺 {k}"))
+        };
+        let cell = metrics
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("cell="))
+            .and_then(|c| c.split_once('x'))
+            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+            .expect("cell 格式");
+        rt.consumer_mut()
+            .expect("GPU 消费器")
+            .set_default_font(
+                FontParams {
+                    width: w,
+                    height: h,
+                    cell_w: cell.0,
+                    cell_h: cell.1,
+                    cols: field("cols") as u32,
+                    first_char: field("first") as u32,
+                    count: field("count") as u32,
+                    advance: field("advance"),
+                    line_height: field("line_height"),
+                },
+                &sheet,
+            )
+            .expect("登记默认字体");
+    }
+
+    // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
+    let (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st) = {
+        let tree = rt.tree_mut();
+        let root = tree.root();
+        let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
+        tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
+        let obj1 = tree.add_node(root, "obj1", NodeKind::Sprite2D);
+        tree.set_prop(obj1, PROP_TEXTURE, Value::Resource(1)).unwrap();
+        tree.set_local(obj1, Transform2D::from_pos(280.0, 180.0));
+        let obj2 = tree.add_node(root, "obj2", NodeKind::Sprite2D);
+        tree.set_prop(obj2, PROP_TEXTURE, Value::Resource(2)).unwrap();
+        tree.set_local(obj2, Transform2D::from_pos(380.0, 180.0));
+        let obj3 = tree.add_node(root, "obj3", NodeKind::Sprite2D);
+        tree.set_prop(obj3, PROP_TEXTURE, Value::Resource(3)).unwrap();
+        tree.set_local(obj3, Transform2D::from_pos(480.0, 180.0));
+        // Hierarchy 面板背景。
+        let hud_tree = tree.add_node(root, "hud_tree", NodeKind::Label);
+        tree.set_local(hud_tree, Transform2D::from_pos(8.0, 40.0));
+        tree.set_prop(hud_tree, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        // Inspector 面板背景。
+        let hud_ins = tree.add_node(root, "hud_ins", NodeKind::Label);
+        tree.set_local(hud_ins, Transform2D::from_pos(612.0, 40.0));
+        tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        // 状态栏。
+        let hud_st = tree.add_node(root, "hud_st", NodeKind::Label);
+        tree.set_local(hud_st, Transform2D::from_pos(8.0, 410.0));
+        tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        tree.apply_pending();
+        (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st)
+    };
+    let _ = (obj1, obj2, obj3);
+
+    // 编辑器状态（会话态 —— 不进事务、不落盘）。
+    let mut sel = Selection::new();
+    let mut log = TransactionLog::new();
+    let mut vm = ScriptVm::new();
+    rt.mount_input_view(&mut vm);
+    // 初始选择第一个对象。
+    if let Some(uid) = rt.tree_mut().uid_of(obj1) {
+        sel.select(uid);
+    }
+
+    // 状态栏的 undo/redo 键按下沿检测。
+    let mut prev_z = false;
+    let mut prev_y = false;
+    let mut prev_del = false;
+    let mut prev_tab = false;
+
+    let total: u64 = std::env::var("NES_EDIT_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u64::MAX);
+    let mut transient = 0u64;
+    const TRANSIENT_LIMIT: u64 = 120;
+
+    for index in 0..total {
+        let snap = rt.collect_input();
+
+        // ---- 编辑器命令（消费输入快照 —— 与游戏脚本同一读面）----
+        let (z_now, y_now, del_now, tab_now) = (
+            snap.is_down("LCtrl") && snap.is_down("Z"),
+            snap.is_down("LCtrl") && snap.is_down("Y"),
+            snap.is_down("Delete"),
+            snap.pressed.contains(&nes_render_api::input::Key::Tab),
+        );
+        let _ = (z_now, y_now);
+        // Tab：循环选择（Viewport 里的 Sprite 节点）。
+        if tab_now && !prev_tab {
+            let sprites: Vec<Uid> = {
+                let tree = rt.tree_mut();
+                tree.preorder()
+                    .into_iter()
+                    .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
+                    .filter_map(|n| tree.uid_of(n))
+                    .collect()
+            };
+            if !sprites.is_empty() {
+                let cur = sel.primary(rt.tree_mut()).and_then(|p| rt.tree_mut().uid_of(p));
+                let next = match cur {
+                    Some(u) => {
+                        let i = sprites.iter().position(|s| s == &u).unwrap_or(0);
+                        sprites[(i + 1) % sprites.len()].clone()
+                    }
+                    None => sprites[0].clone(),
+                };
+                sel.select(next);
+            }
+        }
+        // 方向键：移动选中（Inspector 事务）。
+        let (dx, dy) = {
+            let s = &snap;
+            let mut d = (0.0f32, 0.0f32);
+            if s.is_down("ArrowLeft") { d.0 -= 2.0; }
+            if s.is_down("ArrowRight") { d.0 += 2.0; }
+            if s.is_down("ArrowUp") { d.1 -= 2.0; }
+            if s.is_down("ArrowDown") { d.1 += 2.0; }
+            d
+        };
+        if dx != 0.0 || dy != 0.0 {
+            if let Some(p) = sel.primary(rt.tree_mut()) {
+                if let Some(uid) = rt.tree_mut().uid_of(p) {
+                    let cur = rt.tree_mut().local(p).unwrap_or_default();
+                    let _ = &mut Inspector::new(rt.tree_mut(), &mut log);
+                    // 简化：直接经 Inspector（一步一事务的演示口径 ——
+                    // gizmo 合并提交见 T-INS-02）。
+                    log.begin().unwrap();
+                    Inspector::new(rt.tree_mut(), &mut log)
+                        .modify_local(&uid, Transform2D::from_pos(cur.pos.x + dx, cur.pos.y + dy))
+                        .unwrap();
+                    log.commit().unwrap();
+                }
+            }
+        }
+        // Delete：删除子树（Hierarchy 事务）。
+        if del_now && !prev_del {
+            if let Some(p) = sel.primary(rt.tree_mut()) {
+                if let Some(uid) = rt.tree_mut().uid_of(p) {
+                    let root_uid = { let tree = rt.tree_mut(); tree.uid_of(tree.root()).unwrap() };
+                    if uid != root_uid {
+                        log.begin().unwrap();
+                        Hierarchy::new(rt.tree_mut(), &mut log)
+                            .delete_subtree(&uid)
+                            .unwrap();
+                        log.commit().unwrap();
+                    }
+                }
+            }
+        }
+        // Ctrl+Z / Ctrl+Y：undo / redo（直接消费事务历史）。
+        if z_now && !prev_z {
+            let _ = log.undo(rt.tree_mut());
+        }
+        if y_now && !prev_y {
+            let _ = log.redo(rt.tree_mut());
+        }
+        prev_z = z_now;
+        prev_y = y_now;
+        prev_del = del_now;
+        prev_tab = tab_now;
+
+        // ---- UI 投影（每帧从状态模型重算，零自有状态）----
+        {
+            let tree = rt.tree_mut();
+            // Hierarchy View：树投影（前序 + 缩进 + 选中标记 *）。
+            let mut lines = String::from("HIERARCHY\n");
+            let sel_uids: Vec<Uid> = sel.uids().to_vec();
+            fn walk(
+                tree: &nes_scene::SceneTree,
+                id: nes_scene::NodeId,
+                depth: usize,
+                sel: &[Uid],
+                out: &mut String,
+            ) {
+                let name = tree.name(id).unwrap_or("?");
+                let mark = tree
+                    .uid_of(id)
+                    .map(|u| sel.contains(&u))
+                    .unwrap_or(false);
+                let indent = "  ".repeat(depth);
+                out.push_str(&format!("{}{}{}\n", indent, if mark { "* " } else { "  " }, name));
+                for &c in tree.children(id) {
+                    walk(tree, c, depth + 1, sel, out);
+                }
+            }
+            walk(tree, tree.root(), 0, &sel_uids, &mut lines);
+            let _ = tree.set_prop(hud_tree, PROP_LABEL_TEXT, Value::Str(lines));
+
+            // Inspector View：选中节点数据投影。
+            let mut ins_text = String::from("INSPECTOR\n");
+            match sel.primary(tree) {
+                Some(p) => {
+                    let name = tree.name(p).unwrap_or("?");
+                    let local = tree.local(p).unwrap_or_default();
+                    let uid_hex = tree.uid_of(p).map(|u| u.to_hex()).unwrap_or_default();
+                    ins_text.push_str(&format!("name: {}\npos: ({:.0}, {:.0})\nuid: {}...\n", name, local.pos.x, local.pos.y, &uid_hex[..8]));
+                    for (k, v) in tree.props(p).unwrap().iter().take(4) {
+                        ins_text.push_str(&format!("{}: {:?}\n", k, v));
+                    }
+                }
+                None => ins_text.push_str("(no selection)"),
+            }
+            let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
+
+            // 状态栏。
+            let st = format!(
+                "st> undo:{} redo:{} sel:{} | Tab=sel Arrows=move Del=del Ctrl+Z/Y=undo/redo",
+                if log.can_undo() { "Y" } else { "-" },
+                if log.can_redo() { "Y" } else { "-" },
+                sel.len(),
+            );
+            let _ = tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(st));
+
+            // 选中高亮：Viewport 里的 Sprite 的 z_index（*5* 标记）。
+            for u in sel.uids().to_vec() {
+                if let Some(id) = tree.find_by_uid(&u) {
+                    if tree.kind_tag(id) == Some(nes_scene::NodeKindTag::Sprite2D) {
+                        let _ = tree.set_prop(id, "z_index", Value::I64(5));
+                    }
+                }
+            }
+        }
+
+        let _ = rt.emit_input_signals(&snap);
+        let frame = FrameInfo::new(index, 1.0 / 60.0, index as f64 / 60.0, Vec2::new(768.0, 432.0));
+        match rt.frame_windowed_with(&frame, &mut vm) {
+            Ok(Some(stats)) => {
+                if stats.driver_errors > 0 {
+                    eprintln!("[帧 {index}] driver_errors={}", stats.driver_errors);
+                }
+                transient = 0;
+            }
+            Ok(None) => break,
+            Err(err) => {
+                transient += 1;
+                eprintln!("[帧 {index}] 失败（{transient}/{TRANSIENT_LIMIT}）：{err}");
+                if transient >= TRANSIENT_LIMIT {
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    println!("[完成] Editor Shell 退出");
+    let _ = (cam, hud_tree, hud_ins, hud_st);
+}
