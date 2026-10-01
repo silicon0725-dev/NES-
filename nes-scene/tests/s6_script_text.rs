@@ -363,3 +363,102 @@ on "c" {
         "!= 假、<= 真（+5）、>= 假"
     );
 }
+
+// ---------------------------------------------------------------- S6.22
+// break / continue（编译期循环上下文栈；break 占位回填、continue 即时）。
+
+/// T-Cmp-10：break —— `while true` 里计数到 3 逃出（不依赖步数兜底）。
+#[test]
+fn t_cmp_10_break_escapes_infinite_loop() {
+    let src = r#"
+every {
+    i = 0
+    while true {
+        i = i + 1
+        if i == 3 {
+            break
+        }
+    }
+    done = i * 100
+}
+"#;
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("esc".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("esc", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    let locals = vm.locals(brain).unwrap();
+    assert_eq!(locals.get("i"), Some(&Value::I64(3)), "break 逃出");
+    assert_eq!(locals.get("done"), Some(&Value::I64(300)), "循环后语句照常执行");
+    assert!(!locals.contains_key(HALT_LOCAL), "不靠步数兜底（无停机）");
+}
+
+/// T-Cmp-11：continue 跳过本轮（只累加奇数）；嵌套 break 只绑内层。
+#[test]
+fn t_cmp_11_continue_skip_and_nested_inner_binding() {
+    let src = r#"
+every {
+    i = 0
+    odd = 0
+    while i < 6 {
+        i = i + 1
+        if i == 2 || i == 4 || i == 6 {
+            continue
+        }
+        odd = odd + i
+    }
+    outer = 0
+    inner_total = 0
+    while outer < 3 {
+        outer = outer + 1
+        inner = 0
+        while true {
+            inner = inner + 1
+            if inner == 2 {
+                break
+            }
+        }
+        inner_total = inner_total + inner
+    }
+}
+"#;
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("cc".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("cc", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    let locals = vm.locals(brain).unwrap();
+    assert_eq!(locals.get("odd"), Some(&Value::I64(9)), "1+3+5（continue 跳偶数）");
+    assert_eq!(locals.get("outer"), Some(&Value::I64(3)), "内层 break 不影响外层");
+    assert_eq!(locals.get("inner_total"), Some(&Value::I64(6)), "内层各停在 2");
+    assert!(!locals.contains_key(HALT_LOCAL));
+}
+
+/// T-Cmp-12：循环外 break/continue 编译错；产物断言（break=Jump(出口)）。
+#[test]
+fn t_cmp_12_outside_loop_error_and_codegen() {
+    let e1 = compile_script("on \"x\" { break }").expect_err("循环外 break");
+    assert!(format!("{e1}").contains("break 在循环外"), "{e1}");
+    let e2 = compile_script("on \"x\" { if true { continue } }").expect_err("循环外 continue");
+    assert!(format!("{e2}").contains("continue 在循环外"), "{e2}");
+
+    // 产物：while i < 2 { break } —— break 的 Jump 回填到出口。
+    let s = compile_script("on \"x\" { while i < 2 { break } }").unwrap();
+    assert_eq!(
+        s.ops,
+        vec![
+            Op::Local("i".into()),
+            Op::Const(Value::I64(2)),
+            Op::Lt,
+            Op::JumpIfNot(6), // 条件假 -> 出口（尾跳之后）
+            Op::Jump(6),      // break -> 出口
+            Op::Jump(0),      // 回到条件（break 后不可达，结构完整性保留）
+        ]
+    );
+}

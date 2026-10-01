@@ -523,7 +523,11 @@ use crate::scene_io::ParseError;
 /// 类型错误不在此层（运行时停机兜底，见 §1.4）。
 pub fn compile_script(src: &str) -> Result<Script, ParseError> {
     let toks = lex(src)?;
-    let mut p = TextParser { toks, pos: 0 };
+    let mut p = TextParser {
+        toks,
+        pos: 0,
+        loops: Vec::new(),
+    };
     p.script()
 }
 
@@ -702,13 +706,25 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 10] = [
-    "on", "every", "if", "else", "while", "emit", "arg", "this", "true", "false",
+const RESERVED: [&str; 12] = [
+    "on", "every", "if", "else", "while", "break", "continue", "emit", "arg", "this", "true",
+    "false",
 ];
+
+/// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
+/// `break` 的出口下标在循环收尾才确定 —— 占位回填（同 if 的 JumpIfNot）。
+struct LoopCtx {
+    /// 循环顶（条件求值处）—— `continue` 目标。
+    top: usize,
+    /// 循环体内 break 的 `Jump(0)` 占位下标清单。
+    breaks: Vec<usize>,
+}
 
 struct TextParser {
     toks: Vec<Spanned>,
     pos: usize,
+    /// 循环栈（嵌套时 `break`/`continue` 绑定最内层）。
+    loops: Vec<LoopCtx>,
 }
 
 impl TextParser {
@@ -833,11 +849,40 @@ impl TextParser {
                 let jexit = ops.len();
                 ops.push(Op::JumpIfNot(0)); // 占位，循环出口回填
                 self.expect_sym('{')?;
-                self.stmts(ops)?;
+                // 循环入栈：体内 break/continue 绑定此层（S6.22）。
+                self.loops.push(LoopCtx {
+                    top,
+                    breaks: Vec::new(),
+                });
+                let body = self.stmts(ops);
+                let ctx = self.loops.pop().expect("循环栈配对");
+                body?;
                 self.expect_sym('}')?;
                 ops.push(Op::Jump(top)); // 回到条件
                 let end = ops.len();
                 ops[jexit] = Op::JumpIfNot(end);
+                // break 占位统一回填到出口。
+                for b in ctx.breaks {
+                    ops[b] = Op::Jump(end);
+                }
+                Ok(())
+            }
+            Tok::Ident(k) if k == "break" => {
+                self.pos += 1;
+                let Some(ctx) = self.loops.last_mut() else {
+                    return Err(self.err_here("break 在循环外"));
+                };
+                ctx.breaks.push(ops.len());
+                ops.push(Op::Jump(0)); // 占位，循环收尾回填
+                Ok(())
+            }
+            Tok::Ident(k) if k == "continue" => {
+                self.pos += 1;
+                let Some(ctx) = self.loops.last() else {
+                    return Err(self.err_here("continue 在循环外"));
+                };
+                let top = ctx.top;
+                ops.push(Op::Jump(top)); // 目标即时可知
                 Ok(())
             }
             Tok::Ident(k) if k == "emit" => {

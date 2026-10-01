@@ -261,6 +261,10 @@ cargo run --example s41_visual_closure
 > 比较五族补全（四条组合编译零新指令）；调试抓到交换族 take 主缓冲的
 > 重排 bug + 实证脚本内写读批次语义（文档见
 > `NES2.0_S6控制流与逻辑_v1.md`）；新增 T-Cmp-06..09，scene 升至 140。
+> **v1.29 注记（S6.22 循环控制）**：`break`/`continue` —— 编译期循环
+> 上下文栈（continue 即时跳顶、break 占位收尾回填，嵌套绑最内层，
+> 循环外编译错；`while true`+break 惯用法不依赖步数兜底；文档见
+> `NES2.0_S6循环控制_v1.md`）；新增 T-Cmp-10..12，scene 升至 142。
 
 | 事项 | 状态 |
 |---|---|
