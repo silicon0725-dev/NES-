@@ -719,6 +719,12 @@ cargo run --example s41_visual_closure
 > select，保持序 = 选择序）。拖拽状态是编辑器会话态（不进事务/不落盘，
 > D1 口径）。与 S9-3a Selection 模型完全一致（select 就是 select，
 > 框选只是输入法）。475 绿。
+> **v1.81 注记（S10-2 第三项：选择指示器落地）**：editor_shell 新增
+> 选择指示器（Control 20x20 边框跟随主选位置，无选择移出视口）——
+> Gizmo 最小口径（视觉反馈，不是拖拽手柄）。Control 的 anchor/
+> offset/size 经提取层 `set_rect` 渲染边框（S4.2 既有件，编辑器
+> 复用零新渲染能力）。编辑器三件（点击/多选/框选/指示器）全部就位。
+> 475 绿。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |

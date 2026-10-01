@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use nes_render_api::{FrameInfo, Vec2};
-use nes_render_extract::{PROP_LABEL_TEXT, PROP_TEXTURE};
+use nes_render_extract::{PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE};
 use nes_render_wgpu::{bmp, FontParams};
 use nes_runtime::{write_bmp_rgba, NesRuntime};
 use nes_scene::editor::{Hierarchy, Inspector, Selection};
@@ -101,7 +101,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st) = {
+    let (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
@@ -124,11 +124,17 @@ fn main() {
         tree.set_local(hud_ins, Transform2D::from_pos(612.0, 40.0));
         tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
         // 状态栏。
+        // Selection indicator (Control border following primary selection).
+        let sel_box = tree.add_node(root, "sel_box", NodeKind::Control);
+        tree.set_prop(sel_box, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
+        tree.set_prop(sel_box, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-100.0, -100.0))).unwrap();
+        tree.set_prop(sel_box, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(20.0, 20.0))).unwrap();
+
         let hud_st = tree.add_node(root, "hud_st", NodeKind::Label);
         tree.set_local(hud_st, Transform2D::from_pos(8.0, 410.0));
         tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
         tree.apply_pending();
-        (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st)
+        (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -372,6 +378,19 @@ fn main() {
             );
             let _ = tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(st));
 
+            // Selection indicator: Control rect follows primary selection.
+            match sel.primary(tree) {
+                Some(p) => {
+                    let w = tree.world(p).unwrap_or_default();
+                    let _ = tree.set_prop(sel_box, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(w.tx - 2.0, w.ty - 2.0)));
+                }
+                None => {
+                    let _ = tree.set_prop(sel_box, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(-100.0, -100.0)));
+                }
+            }
+
             // 选中高亮：Viewport 里的 Sprite 的 z_index（*5* 标记）。
             for u in sel.uids().to_vec() {
                 if let Some(id) = tree.find_by_uid(&u) {
@@ -403,5 +422,5 @@ fn main() {
         std::thread::sleep(Duration::from_millis(16));
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (cam, hud_tree, hud_ins, hud_st);
+    let _ = (cam, hud_tree, hud_ins, hud_st, sel_box);
 }
