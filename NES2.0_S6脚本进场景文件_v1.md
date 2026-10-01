@@ -77,7 +77,7 @@ nes-runtime 零改动（`attach_all` 既有签名收 source 自动生效）。
 
 | 事项 | 状态 |
 |---|---|
-| 脚本热重载（改 source 属性 / poll 后重 attach —— 复编译重挂载） | 未启动（机制已备：属性写 + attach 幂等替换） |
+| 脚本热重载 | ✅ S6.32（见 `NES2.0_S6脚本热重载_v1.md`） |
 | 外置脚本文件（`.nes` 资产 + registry_key 引用——多场景共享脚本） | 未启动（与纹理/子场景的资产路径同构） |
 | 编辑器脚本面板（source 属性的富文本编辑 + 行号对齐编译错） | 未启动 |
 | headless Linux / WM_SIZE / DPI | 沿各文档遗留表 |

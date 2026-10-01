@@ -195,3 +195,147 @@ fn t_script_r2_disk_scene_carries_behavior() {
     assert!(saved.contains("\"source\""), "源码属性在文件里：\n{saved}");
     assert!(saved.contains("\\n") || saved.contains("\n"), "换行转义：\n{saved}");
 }
+
+/// T-Script-R3：脚本热重载端到端 —— ① source 属性编辑流（编辑器）：
+/// 树上改源码 -> vm.poll_reloads -> 下一帧像素反映新行为；② 场景文件流
+///（文件即事实）：子场景文件里的脚本改写 -> rt.poll_scene_reload 整树
+/// 重载 -> vm.attach_all（含死节点清理 + 重新编译）-> 像素反映新行为。
+#[test]
+fn t_script_r3_hot_reload_reaches_pixels() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_script")
+        .join("r3b");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Textures")).unwrap();
+    write_bmp_rgba(&root.join("Textures").join("demo.bmp"), 16, 16, &quadrant_rgba(&V1))
+        .expect("写演示纹理");
+
+    // ① source 属性编辑流。
+    let mut rt = NesRuntime::open_with_root(&root, 64, 64).expect("装配");
+    let res = rt.declare_texture("Textures/demo.bmp").expect("声明");
+    let report = rt.bind_assets();
+    assert_eq!(report.loaded.len(), 1);
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 1);
+    let (sprite, brain) = {
+        let tree = rt.tree_mut();
+        let root_node = tree.root();
+        let cam = tree.add_node(root_node, "cam", NodeKind::Camera2D);
+        tree.set_local(cam, Transform2D::from_pos(32.0, 32.0));
+        let sprite = tree.add_node(root_node, "sprite", NodeKind::Sprite2D);
+        tree.set_prop(sprite, "texture", res.to_value()).unwrap();
+        tree.set_local(sprite, Transform2D::from_pos(10.0, 10.0));
+        let brain = tree.add_node(root_node, "brain", NodeKind::Script);
+        tree.set_prop(brain, "source", Value::Str(
+            "on \"go\" { sprite.pos = sprite.pos + (16.0, 0.0) }".into(),
+        )).unwrap();
+        tree.apply_pending();
+        (sprite, brain)
+    };
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(rt.tree_mut()).is_empty());
+    rt.tree_mut().emit_signal("go", Value::I64(0));
+    let f1 = rt.frame_with(&frame(0), &mut vm).expect("帧 1");
+    assert_eq!(f1.image.pixel(28, 12), Some(V1[0]), "v1：+16");
+
+    // 编辑器流：改 source -> poll_reloads -> 新行为（-8 反向）。
+    rt.tree_mut().set_prop(brain, "source", Value::Str(
+        "on \"go\" { sprite.pos = sprite.pos - (8.0, 0.0) }".into(),
+    )).unwrap();
+    let (re, fa) = vm.poll_reloads(rt.tree_mut());
+    assert_eq!(re.len(), 1);
+    assert!(fa.is_empty());
+    rt.tree_mut().emit_signal("go", Value::I64(0));
+    let f2 = rt.frame_with(&frame(1), &mut vm).expect("帧 2");
+    assert_eq!(f2.image.pixel(20, 12), Some(V1[0]), "v2：-8（26-8=18，探 (20,12)）");
+    assert_eq!(f2.image.pixel(38, 12), Some(CLEAR_RGBA), "v1 旧位已空（38 在旧不在新）");
+
+    // ② 场景文件流：子场景文件里的脚本。
+    let root2 = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_script")
+        .join("r3c");
+    let _ = std::fs::remove_dir_all(&root2);
+    std::fs::create_dir_all(root2.join("Textures")).unwrap();
+    std::fs::create_dir_all(root2.join("Scenes")).unwrap();
+    write_bmp_rgba(&root2.join("Textures").join("demo.bmp"), 16, 16, &quadrant_rgba(&V1))
+        .expect("写纹理");
+    // 子场景：精灵 + 脚本（source 内嵌）。
+    let child_v1 = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/demo.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "child_root",
+        kind: "Node2D",
+        children: [
+            Node(
+                name: "sprite",
+                kind: "Sprite2D",
+                local: (x: 10.0, y: 10.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "brain",
+                kind: "Script",
+                props: { "source": "on \"go\" { sprite.pos = sprite.pos + (16.0, 0.0) }", },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    let parent = r#"Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Scenes/child.ron", kind: "Scene"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "instance",
+                kind: "Node2D",
+                local: (x: 0.0, y: 0.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "sub_scene": Resource(1), },
+                children: [],
+            ),
+        ],
+    ),
+)
+"#;
+    std::fs::write(root2.join("Scenes").join("child.ron"), child_v1).expect("写子场景");
+    std::fs::write(root2.join("Scenes").join("parent.ron"), parent).expect("写父场景");
+
+    let mut rt2 = NesRuntime::open_with_root(&root2, 64, 64).expect("装配 2");
+    let report2 = rt2.load_scene("Scenes/parent.ron").expect("加载");
+    assert!(report2.is_clean(), "{report2:?}");
+    let _ = rt2.bind_assets();
+    assert_eq!(rt2.upload_pending_textures().expect("上传"), 1);
+    let mut vm2 = ScriptVm::new();
+    assert!(vm2.attach_all(rt2.tree_mut()).is_empty(), "子场景内脚本装载");
+    rt2.tree_mut().emit_signal("go", Value::I64(0));
+    let g1 = rt2.frame_with(&frame(0), &mut vm2).expect("子场景帧 1");
+    assert_eq!(g1.image.pixel(28, 12), Some(V1[0]), "子场景脚本 v1：+16");
+
+    // 改子场景文件里的脚本（-8），整树重载 + attach_all -> 新像素。
+    let child_v2 = child_v1.replace("+ (16.0, 0.0)", "- (8.0, 0.0)");
+    std::fs::write(root2.join("Scenes").join("child.ron"), child_v2).expect("改写子场景");
+    assert!(rt2.poll_scene_reload().expect("整树重载").is_some(), "触发");
+    let _ = rt2.upload_pending_textures();
+    assert!(vm2.attach_all(rt2.tree_mut()).is_empty(), "重载后重挂载");
+    rt2.tree_mut().emit_signal("go", Value::I64(0));
+    let g2 = rt2.frame_with(&frame(1), &mut vm2).expect("重载帧");
+    // 整树重载 = 场景文件即事实：精灵复位到文件位 (10,10)，一次信号 -8 -> 2。
+    assert_eq!(g2.image.pixel(4, 12), Some(V1[0]), "文件流：-8 生效（复位 10-8=2，探 (4,12)）");
+    assert_eq!(g2.image.pixel(28, 12), Some(CLEAR_RGBA), "v1 旧位已空");
+    assert_eq!(g2.stats.driver_errors, 0);
+    let _ = (sprite, f2);
+}

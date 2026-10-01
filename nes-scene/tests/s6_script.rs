@@ -10,7 +10,7 @@
 //! | T-VM-05 | process 入口纪律：脚本试图写**别的节点** -> 停机记录（NodeCtx 纪律不可绕） |
 
 use nes_scene::{
-    NodeKind, NodeKindTag, Op, SceneTree, Script, ScriptEntry, ScriptVm, Value,
+    NodeKind, NodeKindTag, Op, SceneTree, Script, ScriptEntry, ScriptVm, Transform2D, Value,
     HALT_LOCAL, SCRIPT_MAX_STEPS,
 };
 
@@ -265,4 +265,124 @@ fn t_vm_05_process_cannot_write_other_nodes() {
     assert_eq!(t.local(sprite).unwrap().pos.x, 0.0, "sprite 未被动");
     let _ = NodeKindTag::Script; // 引用一下避免未用告警
     let _ = SCRIPT_MAX_STEPS;
+}
+
+// ---------------------------------------------------------------- S6.32
+// 脚本热重载：source 属性变化 -> poll_reloads 重编译重挂载。
+
+/// T-VM-06：换行为 + 局部复位 —— v1 步进 +4；改 source 为 v2 步进 -8；
+/// poll 后新行为生效且局部回到初始值（换程序不打补丁）。
+#[test]
+fn t_vm_06_hot_reload_swaps_behavior_resets_locals() {
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sp, Transform2D::from_pos(0.0, 0.0));
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos + (4.0, 0.0) }".into(),
+    )).unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 4.0, "v1 步进 +4");
+
+    // 改 source（编辑器/重载流），poll -> 换行为。
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos - (8.0, 0.0) }".into(),
+    )).unwrap();
+    let (reloaded, failed) = vm.poll_reloads(&mut t);
+    assert_eq!(reloaded, vec![brain], "恰一节点重载");
+    assert!(failed.is_empty());
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, -4.0, "v2 步进 -8 生效");
+
+    // 局部复位：v3 计数 n（用局部断言；`(n, 0.0)` 是 Vec2 任意表达式
+    // 的 Pack 缺口，不用）。
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { n = n + 1; done = n * 10 }".into(),
+    )).unwrap();
+    let (re, fa) = vm.poll_reloads(&mut t);
+    assert_eq!(re.len(), 1);
+    assert!(fa.is_empty());
+    // n 未在脚本 locals 声明 -> 初始 0（复位语义：v1/v2 运行期陈值被清）。
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(vm.locals(brain).unwrap().get("n"), Some(&Value::I64(1)), "局部复位（n 从 0 起）");
+    assert_eq!(vm.locals(brain).unwrap().get("done"), Some(&Value::I64(10)), "后置计算");
+
+    // 未变化 -> 不重载（幂等）。
+    let (re3, fa3) = vm.poll_reloads(&mut t);
+    assert!(re3.is_empty() && fa3.is_empty(), "戳相同不重载");
+}
+
+/// T-VM-07：编译失败保留旧行为 + 下次 poll 重试（修好即生效）。
+#[test]
+fn t_vm_07_broken_source_keeps_old_behavior_retry_next_poll() {
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sp, Transform2D::from_pos(0.0, 0.0));
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos + (4.0, 0.0) }".into(),
+    )).unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach(&mut t, brain).is_ok());
+
+    // 塞入语法错误源码。
+    t.set_prop(brain, "source", Value::Str("on \"go\" { a = }".into())).unwrap();
+    let (re, fa) = vm.poll_reloads(&mut t);
+    assert!(re.is_empty());
+    assert_eq!(fa.len(), 1);
+    assert!(fa[0].1.contains("编译失败"), "错误指名：{}", fa[0].1);
+
+    // 旧行为继续跑（+4 不是停机）。
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 4.0, "编译失败：v1 旧行为保留");
+
+    // 修好 -> 下次 poll 生效。
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos + (1.0, 0.0) }".into(),
+    )).unwrap();
+    let (re2, fa2) = vm.poll_reloads(&mut t);
+    assert_eq!(re2.len(), 1);
+    assert!(fa2.is_empty(), "修好后无失败");
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 5.0, "4 + 1（新行为生效）");
+}
+
+/// T-VM-08：重挂载不叠加连接 —— 多次 attach/poll 后一次信号恰好一次命中。
+#[test]
+fn t_vm_08_remount_does_not_stack_connections() {
+    let mut t = SceneTree::new("root");
+    let sp = t.add_node(t.root(), "sp", NodeKind::Node2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sp, Transform2D::from_pos(0.0, 0.0));
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos + (4.0, 0.0) }".into(),
+    )).unwrap();
+    let mut vm = ScriptVm::new();
+    // 反复挂载/重载（v1 不变文本反复 attach + 变文本 poll）。
+    assert!(vm.attach(&mut t, brain).is_ok());
+    assert!(vm.attach(&mut t, brain).is_ok(), "幂等重挂载");
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos + (4.0, 0.0) }".into(),
+    )).unwrap();
+    let _ = vm.poll_reloads(&mut t); // 相同文本：戳同 -> 不重载（0 连接变化）
+    // 再换文本 poll 一次（真重载 -> 断旧接新）。
+    t.set_prop(brain, "source", Value::Str(
+        "on \"go\" { sp.pos = sp.pos + (4.0, 0.0) }".into(),
+    )).unwrap();
+    let _ = vm.poll_reloads(&mut t);
+
+    // 一次信号：恰好 +4（叠加连接会让它 +8/+12）。
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sp).unwrap().pos.x, 4.0, "一次信号恰一次命中（连接未叠加）");
 }

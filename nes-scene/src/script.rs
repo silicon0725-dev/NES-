@@ -471,12 +471,19 @@ fn num_of(v: &Value) -> Option<f32> {
 
 /// 脚本 VM：注册表 + 每脚本局部状态（跨调用持久 —— 计数器/累积器语义）。
 pub struct ScriptVm {
-    /// 键 -> 脚本（宿主登记）。
+    /// 键 -> 脚本（宿主登记 + 内嵌派生键）。
     scripts: BTreeMap<String, Script>,
     /// 节点 -> 局部状态（闭包与观察者路径共享同一份）。
     states: Rc<RefCell<HashMap<NodeId, BTreeMap<String, Value>>>>,
     /// process 入口的（节点, 脚本）表（观察者路径逐帧驱动）。
     process_scripts: Vec<(NodeId, Script)>,
+    /// 内嵌路径的**编译时戳**（节点 -> 上次成功编译的 source 文本）——
+    /// [`Self::poll_reloads`] 的比对基准（S6.32）。编译失败不更新戳：
+    /// 旧行为保留、下次 poll 重试，修好即生效。
+    inline_stamp: HashMap<NodeId, String>,
+    /// 节点 -> 该节点的信号连接句柄（S6.32）。重挂载**先断旧再接新**
+    /// —— 否则每次 attach 叠加一条连接、信号命中多次（潜伏缺口实证修复）。
+    node_conn: HashMap<NodeId, crate::tree::SignalConnectionId>,
 }
 
 impl Default for ScriptVm {
@@ -491,6 +498,8 @@ impl ScriptVm {
             scripts: BTreeMap::new(),
             states: Rc::new(RefCell::new(HashMap::new())),
             process_scripts: Vec::new(),
+            inline_stamp: HashMap::new(),
+            node_conn: HashMap::new(),
         }
     }
 
@@ -528,6 +537,8 @@ impl ScriptVm {
                 // 覆盖同键）。源码属节点所有，不占宿主命名空间。
                 key_owned = format!("__inline__:{:?}", node);
                 self.scripts.insert(key_owned.clone(), script);
+                // 戳 = 本次成功编译的源文本（poll_reloads 的比对基准）。
+                self.inline_stamp.insert(node, src.clone());
                 &key_owned
             } else {
                 Self::require_key(tree, node)?
@@ -574,9 +585,16 @@ impl ScriptVm {
                 if !ok {
                     return Err("处理器注册失败".to_string());
                 }
-                tree.connect_signal_to(&name, None, node, "run")
-                    .map(|_| ())
-                    .ok_or_else(|| format!("连接 `{name}` 失败"))
+                // 重挂载不叠加连接：先断旧句柄再接新（S6.32 实证的潜伏缺口
+                // —— 否则热重载一次信号命中 N 次）。
+                if let Some(old) = self.node_conn.remove(&node) {
+                    tree.disconnect_signal(old);
+                }
+                let conn = tree
+                    .connect_signal_to(&name, None, node, "run")
+                    .ok_or_else(|| format!("连接 `{name}` 失败"))?;
+                self.node_conn.insert(node, conn);
+                Ok(())
             }
         }
     }
@@ -591,7 +609,15 @@ impl ScriptVm {
 
     /// 批量装载：遍历树中全部 `Script` 节点，返回（节点, 缺口）清单 ——
     /// 一个坏键不挡其他节点（部分成功如实上报）。
+    ///
+    /// 前置**死节点清理**（S6.32）：树被整体替换后（如
+    /// `NesRuntime::poll_scene_reload`），VM 里旧 NodeId 的状态/戳/连接
+    /// 登记残留 —— arena 查无即移除（内存卫生 + 防陈旧戳误判）。
     pub fn attach_all(&mut self, tree: &mut SceneTree) -> Vec<(NodeId, String)> {
+        self.states.borrow_mut().retain(|n, _| tree.contains(*n));
+        self.process_scripts.retain(|(n, _)| tree.contains(*n));
+        self.inline_stamp.retain(|n, _| tree.contains(*n));
+        self.node_conn.retain(|n, _| tree.contains(*n));
         let nodes: Vec<NodeId> = tree
             .preorder()
             .into_iter()
@@ -604,6 +630,42 @@ impl ScriptVm {
             }
         }
         issues
+    }
+
+    /// **脚本热重载**（S6.32）：轮询全部内嵌（source 路径）脚本的节点，
+    /// `source` 属性与编译时戳不同的 -> 重新编译重挂载。
+    ///
+    /// 返回 `(重载成功清单, 失败清单(节点, 错误))`。语义口径：
+    /// - **编译失败保留旧行为**：戳不更新（仍为上次成功编译的文本），
+    ///   旧脚本继续跑、错误进清单 —— 修好源码后下次 poll 即生效；
+    /// - 重挂载 = **换程序不打补丁**：局部复位为初始值（attach 既有语义）；
+    /// - `registry_key` 路径不经此轮询（宿主改注册表 + 手动 re-attach，
+    ///   宿主全权）；死节点不参与（stamp 在 attach_all 已清理，或经
+    ///   arena 查无自然跳过）。
+    pub fn poll_reloads(
+        &mut self,
+        tree: &mut SceneTree,
+    ) -> (Vec<NodeId>, Vec<(NodeId, String)>) {
+        let mut reloaded = Vec::new();
+        let mut failed = Vec::new();
+        let nodes: Vec<NodeId> = tree
+            .preorder()
+            .into_iter()
+            .filter(|&n| tree.kind_tag(n) == Some(NodeKindTag::Script))
+            .collect();
+        for node in nodes {
+            let Some(Value::Str(src)) = tree.prop(node, "source") else {
+                continue;
+            };
+            if src.is_empty() || self.inline_stamp.get(&node) == Some(src) {
+                continue; // 非内嵌路径 / 未变化
+            }
+            match self.attach(tree, node) {
+                Ok(()) => reloaded.push(node),
+                Err(e) => failed.push((node, e)),
+            }
+        }
+        (reloaded, failed)
     }
 }
 
