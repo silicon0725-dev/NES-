@@ -371,6 +371,15 @@ cargo run --example s41_visual_closure
 > 新增 T-In-C01..03 / T-In-VM-01..02 / T-In-01..02（重写）/ T-In-R1..02，
 > scene 174、api 43、wgpu 88、runtime 34（全仓合计 415，文档见
 > `NES2.0_S7.2输入系统_v1.md`）。
+> **v1.45 注记（S7.3 Headless 确定性运行时）**：`open_headless`
+>（GPU 端 `Option` 化 —— 装配缺席而非 `if headless` 语义分支，tick/
+> 输入/装载/指纹与窗口模式逐字节同路径）+ `InputTrace`/`parse_trace`
+>（纯文本帧事件轨迹）+ `scene_fingerprint`（**语义状态白名单**哈希：
+> 前序结构/变换 f32 位形/属性/脚本局部；绝不取句柄/指针/HashMap
+> 布局）+ 逐帧指纹 → `trace_hash`（差分定位到帧）+ `nes` CLI
+>（`headless::run` 薄壳）。T-HR-01..08 **全部无 GPU 依赖**；CLI 实测
+> 跨进程确定。新增 T-In-C04 与 T-HR-01..08，api 升至 44、runtime 至
+> 42（全仓合计 424，文档见 `NES2.0_S7.3Headless确定性运行时_v1.md`）。
 
 | 事项 | 状态 |
 |---|---|

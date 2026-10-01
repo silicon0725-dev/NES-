@@ -107,3 +107,32 @@ fn t_in_c03_transient_data_and_names() {
     assert!(!s3.is_down("ArrowLeft"));
     assert!(!s3.is_down("NoSuchKey"), "未列举 = 未按（不猜）");
 }
+
+/// T-In-C04：轨迹解析（S7.3）—— 全事件族 round-trip、注释/空行、
+/// 同帧合并、未知记法/未知键名如实报错带行号。
+#[test]
+fn t_in_c04_parse_trace() {
+    use nes_render_api::input::parse_trace;
+    let text = "# 注释\n\n0 key_down W mouse_move 10 20\n1 char 104 char 13\n2 key_up W mouse_down left resize 800 600\n0 key_down LShift";
+    let trace = parse_trace(text).expect("解析");
+    assert_eq!(trace.len(), 3, "帧 0 两行合并");
+    assert_eq!(trace[0].frame, 0);
+    assert_eq!(
+        trace[0].events,
+        vec![
+            InputEvent::Key { key: Key::W, down: true },
+            InputEvent::MouseMove { x: 10.0, y: 20.0 },
+            InputEvent::Key { key: Key::LShift, down: true },
+        ],
+        "同帧合并按出现序"
+    );
+    assert_eq!(trace[1].events, vec![InputEvent::Char(104), InputEvent::Char(13)]);
+    assert_eq!(trace[2].events.len(), 3);
+
+    // 错误口径：未知键名 / 未知事件 / 缺参数 —— 指名行。
+    assert!(parse_trace("0 key_down NOPE").unwrap_err().contains("未知键名"));
+    assert!(parse_trace("0 teleport").unwrap_err().contains("未知事件"));
+    assert!(parse_trace("0 key_down").unwrap_err().contains("缺名"));
+    assert!(parse_trace("later key_down W").unwrap_err().contains("帧号"));
+    assert!(parse_trace("").unwrap().is_empty(), "空文本 = 空轨迹");
+}

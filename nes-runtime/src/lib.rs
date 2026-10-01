@@ -37,6 +37,8 @@
 //! "改磁盘文件 -> 下一帧画面变化"的完整链路。
 
 use std::collections::BTreeMap;
+pub mod headless;
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -58,6 +60,8 @@ use nes_scene::{
     SceneTree, ScriptVm, TableError, Value,
 };
 
+pub use headless::{run, HeadlessReport};
+
 /// 组装好的引擎帧循环。
 ///
 /// 装配一次、逐帧推进；`tree_mut` / `resources_mut` / `registry_mut` 暴露给
@@ -68,7 +72,9 @@ pub struct NesRuntime {
     registry: AssetRegistry,
     extractor: RenderExtractor,
     server: WgpuRenderServer,
-    consumer: CommandConsumer,
+    /// 渲染消费端（GPU）。**headless 装配没有它**（[`Self::open_headless`]）——
+    /// 渲染路径如实报错，语义路径（tick/输入/装载/指纹）完全同一套。
+    consumer: Option<CommandConsumer>,
     commands: Vec<RenderCommand>,
     /// 资产根（场景文件与资源路径都相对它解析；`load_scene`/`save_scene` 用）。
     root: std::path::PathBuf,
@@ -126,7 +132,12 @@ impl NesRuntime {
     ) -> Result<Self, BackendError> {
         let mut rt = Self::assemble(root, width, height)?;
         let window = Window::open(title, width, height)?;
-        let surface = SurfaceTarget::new(consumer_ctx(&rt.consumer), &window)?;
+        let Some(consumer) = &rt.consumer else {
+            return Err(BackendError::ConfigMismatch(
+                "窗口模式需要 GPU 装配（此处不可达：assemble(true)）".into(),
+            ));
+        };
+        let surface = SurfaceTarget::new(consumer_ctx(consumer), &window)?;
         rt.window = Some(window);
         rt.surface = Some(surface);
         Ok(rt)
@@ -138,10 +149,32 @@ impl NesRuntime {
         width: u32,
         height: u32,
     ) -> Result<Self, BackendError> {
-        let ctx = GpuContext::open()?;
-        let target = RenderTarget::with_size(&ctx, width, height)?;
-        let atlas = SpriteAtlas::new(&ctx)?;
-        let consumer = CommandConsumer::new(ctx, target, atlas)?;
+        Self::assemble_with(root, width, height, true)
+    }
+
+    /// headless 装配：**同一运行时、同一 tick 语义，无 GPU/窗口**。
+    ///
+    /// 架构口径（S7.3）：headless 不是"窗口关掉继续跑"，也不是第二套
+    /// 运行时 —— 只是不装配渲染端。`frame*`/`upload_pending_textures`
+    /// 如实报错；装载/输入/tick/指纹与窗口模式逐字节同路径。
+    pub fn open_headless(root: &Path) -> Result<Self, BackendError> {
+        Self::assemble_with(root, 0, 0, false)
+    }
+
+    fn assemble_with(
+        root: &Path,
+        width: u32,
+        height: u32,
+        gpu: bool,
+    ) -> Result<Self, BackendError> {
+        let consumer = if gpu {
+            let ctx = GpuContext::open()?;
+            let target = RenderTarget::with_size(&ctx, width, height)?;
+            let atlas = SpriteAtlas::new(&ctx)?;
+            Some(CommandConsumer::new(ctx, target, atlas)?)
+        } else {
+            None
+        };
         Ok(Self {
             tree: SceneTree::new("root"),
             table: ResourceTable::new(),
@@ -199,7 +232,11 @@ impl NesRuntime {
             frame,
             &mut self.commands,
         );
-        let consumer = &mut self.consumer;
+        let Some(consumer) = &mut self.consumer else {
+            return Err(BackendError::ConfigMismatch(
+                "headless 运行时没有渲染端（用 open_windowed 装配窗口模式）".into(),
+            ));
+        };
         let stats = consumer.consume_to_surface(&self.commands, surface)?;
         Ok(Some(stats))
     }
@@ -220,8 +257,9 @@ impl NesRuntime {
     }
 
     /// GPU 消费器（设置默认字体、注册表诊断等宿主侧操作）。
-    pub fn consumer_mut(&mut self) -> &mut CommandConsumer {
-        &mut self.consumer
+    /// headless 装配如实报 `None`（不装渲染端就没有消费器）。
+    pub fn consumer_mut(&mut self) -> Option<&mut CommandConsumer> {
+        self.consumer.as_mut()
     }
 
     /// 声明一张纹理资源（记录槽位，供 [`Self::upload_pending_textures`] 遍历）。
@@ -523,7 +561,12 @@ impl NesRuntime {
             };
             let (w, h, rgba) = bmp::load_rgba(&bytes)
                 .map_err(|e| BackendError::Io(format!("纹理 {path_text} 解码失败：{e}")))?;
-            self.consumer.register_texture(
+            let Some(consumer) = &mut self.consumer else {
+                return Err(BackendError::ConfigMismatch(
+                    "headless 运行时没有渲染端（纹理无需上传）".into(),
+                ));
+            };
+            consumer.register_texture(
                 RenderAssetKey::from_bits(view.to_bits()),
                 w,
                 h,
@@ -563,7 +606,12 @@ impl NesRuntime {
             frame,
             &mut self.commands,
         );
-        self.consumer.consume(&self.commands)
+        let Some(consumer) = &mut self.consumer else {
+            return Err(BackendError::ConfigMismatch(
+                "headless 运行时没有渲染端（用带 GPU 的装配跑帧）".into(),
+            ));
+        };
+        consumer.consume(&self.commands)
     }
 }
 

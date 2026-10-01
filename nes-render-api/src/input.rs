@@ -287,3 +287,102 @@ impl InputCollector {
         snap
     }
 }
+
+// ---------- 输入轨迹（S7.3：headless / 回放 / 差分测试） ----------
+
+/// 一帧的输入事件批（回放口径：帧号 + 该帧注入的事件，按列出序）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputTrace {
+    /// 帧号（从 0 起；与运行帧循环对齐）。
+    pub frame: u64,
+    /// 该帧注入的事件。
+    pub events: Vec<InputEvent>,
+}
+
+/// 解析输入轨迹文本（每行一帧：`帧号 事件...`；`#` 注释；空行跳过）。
+///
+/// 事件记法（与 [`InputEvent`] 一一对应；键名/按钮名走
+/// [`Key::from_name`]/[`MouseButton::from_name`] 口径，未知如实报错）：
+///
+/// ```text
+/// # 示例
+/// 0 key_down W
+/// 1 mouse_move 100 100
+/// 2 key_up W key_down Space
+/// 3 char 104 char 105      # text（UTF-16 单元码）
+/// 4 mouse_down left resize 800 600
+/// ```
+pub fn parse_trace(text: &str) -> Result<Vec<InputTrace>, String> {
+    let mut out: Vec<InputTrace> = Vec::new();
+    for (li, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut toks = line.split_whitespace();
+        let frame: u64 = toks
+            .next()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| format!("第 {} 行：行首要帧号", li + 1))?;
+        let mut events = Vec::new();
+        while let Some(tok) = toks.next() {
+            let ev = match tok {
+                "key_down" | "key_up" => {
+                    let name = toks.next().ok_or_else(|| format!("第 {} 行：key 缺名", li + 1))?;
+                    let key = Key::from_name(name)
+                        .ok_or_else(|| format!("第 {} 行：未知键名 {name}", li + 1))?;
+                    InputEvent::Key { key, down: tok == "key_down" }
+                }
+                "mouse_move" => {
+                    let x: f32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：mouse_move 缺 X", li + 1))?;
+                    let y: f32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：mouse_move 缺 Y", li + 1))?;
+                    InputEvent::MouseMove { x, y }
+                }
+                "mouse_down" | "mouse_up" => {
+                    let name = toks
+                        .next()
+                        .ok_or_else(|| format!("第 {} 行：mouse 按钮缺名", li + 1))?;
+                    let button = MouseButton::from_name(name)
+                        .ok_or_else(|| format!("第 {} 行：未知按钮 {name}", li + 1))?;
+                    InputEvent::MouseButton { button, down: tok == "mouse_down" }
+                }
+                "char" => {
+                    let code: u32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：char 缺码点", li + 1))?;
+                    InputEvent::Char(code)
+                }
+                "resize" => {
+                    let w: u32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：resize 缺宽", li + 1))?;
+                    let h: u32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：resize 缺高", li + 1))?;
+                    InputEvent::Resize { w, h }
+                }
+                other => return Err(format!("第 {} 行：未知事件 {other}", li + 1)),
+            };
+            events.push(ev);
+        }
+        if events.is_empty() {
+            return Err(format!("第 {} 行：帧 {frame} 无事件", li + 1));
+        }
+        // 同帧多行合并；最终按帧号稳定排序（确定性口径）。
+        match out.iter_mut().find(|t| t.frame == frame) {
+            Some(t) => t.events.extend(events),
+            None => out.push(InputTrace { frame, events }),
+        }
+    }
+    out.sort_by_key(|t| t.frame);
+    Ok(out)
+}

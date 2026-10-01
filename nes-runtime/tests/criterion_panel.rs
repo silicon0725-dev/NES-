@@ -59,6 +59,7 @@ fn register_font(rt: &mut NesRuntime) {
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
         .unwrap();
     rt.consumer_mut()
+        .expect("GPU 消费器")
         .set_default_font(
             FontParams {
                 width: w,

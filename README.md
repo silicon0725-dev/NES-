@@ -31,9 +31,9 @@ python check_dependency_direction.py
 cd nes-asset  && cargo test   # 34
 cd nes-scene  && cargo test   # 174
 cd nes-render-extract && cargo test  # 42
-cd nes-render-api    && cargo test  # 43
+cd nes-render-api    && cargo test  # 44
 cd nes-render-wgpu   && cargo test  # 88
-cd nes-runtime && cargo test        # 34
+cd nes-runtime && cargo test        # 42
 
 cargo clippy --all-targets   # 各 crate 零警告
 ```
@@ -44,6 +44,8 @@ cargo clippy --all-targets   # 各 crate 零警告
 cd nes-runtime
 cargo run --example engine_window      # 真窗口帧循环 + 动画（SceneObserver）+ 热重载
 cargo run --example script_panel       # 编辑器脚本面板（窗口键入 -> 提交 -> 热重载 -> 同帧像素）
+cargo build -p nes-runtime --release --bin nes   # headless CLI
+./nes-runtime/target/release/nes.exe --headless scene.ron --frames 300   # 逐帧状态哈希（确定性）
 cargo run --example scene_disk         # 磁盘场景 -> 渲染 -> 回存
 cargo run --example subscene_reload    # 子场景热重载（改文件 -> 整树重载）
 ```

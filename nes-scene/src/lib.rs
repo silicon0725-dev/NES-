@@ -67,6 +67,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod determinism;
 pub mod identity;
 pub mod node;
 pub mod path;
@@ -98,6 +99,7 @@ pub use script::{
     compile_script, Op, Script, ScriptEntry, ScriptVm, StackVal, HALT_LOCAL, SCRIPT_MAX_STEPS,
 };
 pub use transform::{Affine, Transform2D, Vec2};
+pub use determinism::scene_fingerprint;
 pub use tree::{
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, Observers, ProcessMode, SceneObserver,
     SceneTree, Signal, SignalConnection, SignalConnectionId, SignalCtx, SignalFilter,

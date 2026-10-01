@@ -131,6 +131,7 @@ fn main() {
             .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
             .expect("cell 格式");
         rt.consumer_mut()
+            .expect("GPU 消费器")
             .set_default_font(
                 FontParams {
                     width: w,
