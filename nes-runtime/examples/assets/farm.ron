@@ -1,20 +1,13 @@
-// S10-0 第二完整项目：**Seed & Harvest** —— 刻意脱离 Dodge 惯性。
-// 非战斗：种植/生长/收获/经济循环；时间驱动状态转移（非帧位移动）。
+// S10-0 第二项目 **v2**：Seed & Harvest —— 用 S10-1 的 timer + hit 重构。
+// 消除 v1 的 6 个平行 g0..g5 计时局部 → per-entity NodeData.timer。
+// "点击地块种植"替代数字键（hit 命中检测）。
 //
-// 玩法：6 块地。数字键 1-6 种植（花 5 金）；苗生长 ~5 秒变熟；
-// 熟自动收获（+15 金）。日每 300 tick +1。达到 100 金 WIN。
-//
-// **API 摩擦记录（S10-0 校准的核心产出）**：
-// 1. 无 per-entity 计时器 → 退化为管理器统一计时 + z_index 编码阶段
-// 2. 无命中检测 → 退化为数字键选地
-// 3. 无容器/背包 → 退化为管理器局部计数
-// 4. 一脚本一入口 → 种植/浇水/收获/经济全挤一个 tick 入口
-// 5. 跨脚本局部不可读 → 单控制器模式（无分离关注点）
+// 玩法：鼠标点击地块种植（花 5 金）；苗生长 ~1 秒（timer 倒数）；
+// 熟自动收获（+15 金）。50 金 WIN。
 Scene(
     version: 1,
     resources: [
         Res(id: 1, path: "Textures/heart.bmp", kind: "Texture"),
-        Res(id: 2, path: "Textures/door.bmp", kind: "Texture"),
     ],
     root: Node(
         name: "main",
@@ -22,16 +15,15 @@ Scene(
         children: [
             Node(name: "cam", kind: "Camera2D", local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
             Node(name: "plots", kind: "Node", children: [
-                Node(name: "p0", kind: "Sprite2D", local: (x: 100.0, y: 80.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": false, }, children: [],),
-                Node(name: "p1", kind: "Sprite2D", local: (x: 192.0, y: 80.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": false, }, children: [],),
-                Node(name: "p2", kind: "Sprite2D", local: (x: 284.0, y: 80.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": false, }, children: [],),
-                Node(name: "p3", kind: "Sprite2D", local: (x: 100.0, y: 160.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": false, }, children: [],),
-                Node(name: "p4", kind: "Sprite2D", local: (x: 192.0, y: 160.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": false, }, children: [],),
-                Node(name: "p5", kind: "Sprite2D", local: (x: 284.0, y: 160.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": false, }, children: [],),
+                Node(name: "p0", kind: "Sprite2D", local: (x: 100.0, y: 80.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": true, }, children: [],),
+                Node(name: "p1", kind: "Sprite2D", local: (x: 192.0, y: 80.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": true, }, children: [],),
+                Node(name: "p2", kind: "Sprite2D", local: (x: 284.0, y: 80.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": true, }, children: [],),
+                Node(name: "p3", kind: "Sprite2D", local: (x: 100.0, y: 160.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": true, }, children: [],),
+                Node(name: "p4", kind: "Sprite2D", local: (x: 192.0, y: 160.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": true, }, children: [],),
+                Node(name: "p5", kind: "Sprite2D", local: (x: 284.0, y: 160.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 0, "visible": true, }, children: [],),
             ],),
-            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "GOLD:20 DAY:1", }, children: [],),
-            Node(name: "game", kind: "Script", props: { "source": "init { gold = 20; day = 1; t = 0; cd = 0; g0 = 0; g1 = 0; g2 = 0; g3 = 0; g4 = 0; g5 = 0; plots = children(node(\"plots\")) }
-on \"tick\" { t = t + 1; if t >= 300 { t = 0; day = day + 1 }; if cd > 0 { cd = cd - 1 }; if g0 > 0 { g0 = g0 - 1; if g0 == 0 { p0.z_index = 2; p0.visible = true } }; if g1 > 0 { g1 = g1 - 1; if g1 == 0 { p1.z_index = 2; p1.visible = true } }; if g2 > 0 { g2 = g2 - 1; if g2 == 0 { p2.z_index = 2; p2.visible = true } }; if g3 > 0 { g3 = g3 - 1; if g3 == 0 { p3.z_index = 2; p3.visible = true } }; if g4 > 0 { g4 = g4 - 1; if g4 == 0 { p4.z_index = 2; p4.visible = true } }; if g5 > 0 { g5 = g5 - 1; if g5 == 0 { p5.z_index = 2; p5.visible = true } }; for_each(plots) { if it.z_index == 2 { gold = gold + 15; it.z_index = 0; it.visible = false } }; if cd <= 0 { if gold >= 5 { if key(\"Num1\") { if p0.z_index == 0 { gold = gold - 5; g0 = 60; p0.z_index = 1; p0.visible = true; p0.texture_flip_h = false; cd = 20 } }; if key(\"Num2\") { if p1.z_index == 0 { gold = gold - 5; g1 = 60; p1.z_index = 1; p1.visible = true; cd = 20 } }; if key(\"Num3\") { if p2.z_index == 0 { gold = gold - 5; g2 = 60; p2.z_index = 1; p2.visible = true; cd = 20 } }; if key(\"Num4\") { if p3.z_index == 0 { gold = gold - 5; g3 = 60; p3.z_index = 1; p3.visible = true; cd = 20 } }; if key(\"Num5\") { if p4.z_index == 0 { gold = gold - 5; g4 = 60; p4.z_index = 1; p4.visible = true; cd = 20 } }; if key(\"Num6\") { if p5.z_index == 0 { gold = gold - 5; g5 = 60; p5.z_index = 1; p5.visible = true; cd = 20 } } } }; if gold >= 50 { hud.text = \"WIN GOLD:\" + num_to_str(gold); emit \"win\" 0 } else { hud.text = \"GOLD:\" + num_to_str(gold) + \" DAY:\" + num_to_str(day) + \" | 1-6=plant\" } }" }, children: [],),
-                                ],
+            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "GOLD:20", }, children: [],),
+            Node(name: "game", kind: "Script", props: { "source": "init { gold = 20; day = 1; t = 0; cd = 0; plots = children(node(\"plots\")) }\non \"tick\" { t = t + 1; if t >= 300 { t = 0; day = day + 1 }; if cd > 0 { cd = cd - 1 }; if cd <= 0 { if button(\"left\") { h = hit(mouse_x(), mouse_y()); if h != false { if h.z_index == 0 { if gold >= 5 { gold = gold - 5; h.timer = 60; h.z_index = 1; h.texture_flip_h = true; cd = 20 } } } } }; for_each(plots) { if it.z_index == 1 { if it.timer == 0 { it.z_index = 2 } }; if it.z_index == 2 { gold = gold + 15; it.z_index = 0; it.texture_flip_h = false } }; if gold >= 50 { hud.text = \"WIN GOLD:\" + num_to_str(gold); emit \"win\" 0 } else { hud.text = \"GOLD:\" + num_to_str(gold) + \" DAY:\" + num_to_str(day) + \" | CLICK=plant\" } }" }, children: [],),
+        ],
     ),
 )

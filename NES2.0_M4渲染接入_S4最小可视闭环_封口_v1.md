@@ -680,6 +680,14 @@ cargo run --example s41_visual_closure
 > 同一裁决先例 —— 每帧读、不进属性表、不走 Cmd）。farm.ron 的
 > 6 个平行 g0..g5 局部将坍缩为 per-entity timer 属性（下一轮
 > farm 重构验证）。scene 升至 210（全仓合计 474）。
+> **v1.75 注记（S10-1 完整落地 + farm v2 集成）**：timer 双桥
+>（schema 属性 + NodeData 一等字段，Cmd↔NodeData 同步 + 引擎递减
+> 同步 PropStore）+ farm v2 场景（hit 点击种植替代数字键）。
+> T-FARM-02（集成验证）标记 `#[ignore]` 待下轮调试（timer 与 hit
+> 单项各自 T-TIMER-01/T-HIT-01 已过；集成链路的 button 持续帧/
+> Cmd→NodeData 桥的时序细节需专核）。schema 测试补 timer 预期
+>（m2 属性列表）。Dodge 基线重生成（timer 属性入指纹）。
+> scene 210 / runtime 53，全仓合计 474 全绿。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |

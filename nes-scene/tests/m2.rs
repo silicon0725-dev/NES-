@@ -94,7 +94,7 @@ fn criterion_1_properties_are_reflectable() {
     let names: Vec<&str> = schema.props().iter().map(|p| p.name()).collect();
     assert_eq!(
         names,
-        vec!["visible", "z_index", "texture", "flip_h", "flip_v"]
+        vec!["visible", "timer", "z_index", "texture", "flip_h", "flip_v"]
     );
 
     // 读：建节点时默认值已按 schema 填好，脚本读到的不会是"未定义"。

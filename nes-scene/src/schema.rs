@@ -243,6 +243,13 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 H::None,
                 "是否参与显示与处理。隐藏节点仍参与变换与脚本逻辑。",
             ),
+            PropDesc::new(
+                "timer",
+                ValueType::I64,
+                Value::I64(0),
+                H::Number { min: 0.0, max: 3600.0, step: 1.0 },
+                "每帧倒计时。引擎每 tick -1 到 0 停住。脚本读写（S10-1/F-2）。",
+            ),
         ],
         NodeKindTag::Node2D => vec![PropDesc::new(
             "z_index",
@@ -394,8 +401,8 @@ mod tests {
             ]
         );
         let names: Vec<&str> = s.props().iter().map(|p| p.name()).collect();
-        assert_eq!(names, vec!["visible", "z_index", "texture", "flip_h", "flip_v"]);
-        assert_eq!(s.len(), 5);
+        assert_eq!(names, vec!["visible", "timer", "z_index", "texture", "flip_h", "flip_v"]);
+        assert_eq!(s.len(), 6);
     }
 
     #[test]
@@ -403,7 +410,7 @@ mod tests {
         let s = NodeSchema::of(NodeKindTag::Node2D);
         assert_eq!(s.own_props().len(), 1);
         assert_eq!(s.own_props()[0].name(), "z_index");
-        assert_eq!(NodeSchema::of(NodeKindTag::Node).own_props().len(), 1);
+        assert_eq!(NodeSchema::of(NodeKindTag::Node).own_props().len(), 2);
     }
 
     #[test]
@@ -423,7 +430,7 @@ mod tests {
         let s = NodeSchema::of(NodeKindTag::Camera2D);
         let store = s.default_store();
         // visible（Node）+ z_index（Node2D）+ zoom / active（Camera2D）
-        assert_eq!(store.len(), 4);
+        assert_eq!(store.len(), 5);
         assert_eq!(store.get("visible"), Some(&Value::Bool(true)));
         assert_eq!(store.get("zoom"), Some(&Value::F32(1.0)));
         assert_eq!(store.get("active"), Some(&Value::Bool(true)));

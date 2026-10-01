@@ -1742,6 +1742,8 @@ impl SceneTree {
             if let Some(nd) = self.nodes.get_mut(id) {
                 if nd.timer > 0 {
                     nd.timer -= 1;
+                    // 同步属性表（脚本经 GetProp 可见引擎递减值）。
+                    let _ = nd.props.set("timer", Value::I64(nd.timer as i64));
                 }
             }
         }
@@ -2000,8 +2002,13 @@ impl SceneTree {
             Cmd::Tree(op) => self.pending.push(op),
             Cmd::SetLocal { node, t } => self.set_local(node, t),
             Cmd::SetProp { node, name, value } => {
-                if let Err(e) = self.set_prop(node, &name, value.clone()) {
-                    eprintln!("[apply_cmd] {:?} {} {:?} Err {:?}", node, name, value, e);
+                let _ = self.set_prop(node, &name, value.clone());
+                if name == "timer" {
+                    if let Value::I64(t) = value {
+                        if let Some(nd) = self.nodes.get_mut(node) {
+                            nd.timer = t.max(0) as u32;
+                        }
+                    }
                 }
             }
             Cmd::Spawn { parent, name, kind } => {
