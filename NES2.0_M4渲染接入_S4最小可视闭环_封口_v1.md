@@ -610,6 +610,15 @@ cargo run --example s41_visual_closure
 > 复用死 uid 机械可行但 undo 时身份冲突被如实检测 —— 无静默双身份；
 > 移除复用者后合法恢复继续）。scene 升至 202（全仓合计 464）。
 > VM 状态不随 undo 恢复（脚本 locals 非设计数据，S9-3 裁决口径）。
+> **v1.67 注记（S9-3 三模型契约冻结）**：Selection = **uid 有序集**
+>（非 Handle —— undo 复活自动回选、悬空条目保留不剔除、不落盘）；
+> Inspector：**设计数据修改全入事务**（name/local/mode/props/
+> components），**会话态不入**（hover/高亮/gizmo 中间帧/展开 ——
+> Document State ≠ Editor Session State 操作化；gizmo 落点一次
+> commit）；Hierarchy：**uid + 父 uid + 兄弟序 = 完整可逆结构表达**
+>（与 S9-1 指纹同三元组 —— 编辑器与确定性共用结构观；展示 = 前序
+>  = children 结构序）。全部建在 uid/transaction/handle/component
+> 之上，零新 VM。文档见 `NES2.0_S9.3编辑器对象模型契约_v1.md`。
 
 | 事项 | 状态 |
 |---|---|
