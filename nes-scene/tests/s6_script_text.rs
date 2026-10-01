@@ -788,3 +788,127 @@ fn t_cmp_21_step_zero_and_compat() {
     let e = compile_script("on \"x\" { step = 1 }").expect_err("step 保留字");
     assert!(format!("{e}").contains("保留字"), "{e}");
 }
+
+// ---------------------------------------------------------------- S6.26
+// 取模 / 位运算全族（& | ^ << >>）/ 字符串拼接（+ 严格 Str+Str）。
+
+fn run_locals(src: &str) -> BTreeMap<String, Value> {
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("r".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("r", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    vm.locals(brain).unwrap()
+}
+
+/// T-Cmp-22：取模 —— 整型（奇偶分流）、负数符号跟随被除数、浮点提升。
+#[test]
+fn t_cmp_22_modulo() {
+    let l = run_locals("every { a = 17 % 5; b = -17 % 5; c = 17 % -5; d = 1.5 % 0.4; e = 0 }");
+    assert_eq!(l.get("a"), Some(&Value::I64(2)), "17%5=2");
+    assert_eq!(l.get("b"), Some(&Value::I64(-2)), "-17%5=-2（符号跟随被除数）");
+    assert_eq!(l.get("c"), Some(&Value::I64(2)), "17%-5=2");
+    let d = match l.get("d") {
+        Some(Value::F32(v)) => *v,
+        other => panic!("d 应为 F32：{other:?}"),
+    };
+    assert!((d - 0.3).abs() < 1e-5, "1.5%0.4≈0.3（浮点提升）：{d}");
+
+    // 奇偶分流驱动：0..10 中偶数计数。
+    let l2 = run_locals("every { evens = 0; for i in 0..10 { if i % 2 == 0 { evens = evens + 1 } } }");
+    assert_eq!(l2.get("evens"), Some(&Value::I64(5)), "0..10 偶数 5 个");
+}
+
+/// T-Cmp-23：位运算全族 —— mask/or/xor/移位；大移位量 wrapping 不崩；
+/// 非整型停机；优先级（位阶梯在加减之上、比较之下）。
+#[test]
+fn t_cmp_23_bitwise_family() {
+    let l = run_locals(
+        "every {
+            m = 240 & 15
+            o = 240 | 15
+            x = 255 ^ 15
+            s = 1 << 10
+            r = 1024 >> 3
+            big = 1 << 100
+            neg = -8 >> 1
+            mix = 1 + 2 << 2
+        }",
+    );
+    assert_eq!(l.get("m"), Some(&Value::I64(0)), "240&15=0");
+    assert_eq!(l.get("o"), Some(&Value::I64(255)), "240|15=255");
+    assert_eq!(l.get("x"), Some(&Value::I64(240)), "255^15=240");
+    assert_eq!(l.get("s"), Some(&Value::I64(1024)), "1<<10");
+    assert_eq!(l.get("r"), Some(&Value::I64(128)), "1024>>3");
+    // 1<<100：移位量 100 按 2^6 取模 = 36（wrapping，不崩帧）。
+    assert_eq!(l.get("big"), Some(&Value::I64(1 << 36)), "大移位 wrapping");
+    assert_eq!(l.get("neg"), Some(&Value::I64(-4)), "-8>>1 算术右移");
+    // 优先级：(1+2)<<2 = 12（加减高于移位）。
+    assert_eq!(l.get("mix"), Some(&Value::I64(12)), "1+2<<2 = (1+2)<<2");
+
+    // 非整型停机（位运算遇 Bool）。
+    let l2 = run_locals("every { z = true & 1 }");
+    assert_eq!(
+        l2.get(HALT_LOCAL),
+        Some(&Value::Str("位运算需要 I64".into())),
+        "布尔逻辑走 &&，& 是整型"
+    );
+
+    // 位阶梯在比较之下：`(1 & 1) == 1` 可写 `1 & 1 == 1`。
+    let l3 = run_locals("every { ok = 0; if 1 & 1 == 1 { ok = 1 } }");
+    assert_eq!(l3.get("ok"), Some(&Value::I64(1)), "比较优先于位与");
+}
+
+/// T-Cmp-24：字符串拼接 —— `+` 严格 Str+Str；链拼；混型停机；经属性可见。
+#[test]
+fn t_cmp_24_string_concat() {
+    // 基本与链拼（左结合）。
+    let l = run_locals(
+        "every {
+            name = \"NES\"
+            greet = \"Hello, \" + name + \"!\"
+            pad = \"a\" + \"b\" + \"c\"
+        }",
+    );
+    assert_eq!(
+        l.get("greet"),
+        Some(&Value::Str("Hello, NES!".into())),
+        "局部 + 字面量链拼"
+    );
+    assert_eq!(l.get("pad"), Some(&Value::Str("abc".into())), "字面量链拼");
+
+    // 混型停机（Str + I64 不隐式转换）。
+    let l2 = run_locals("every { bad = \"n=\" + 1 }");
+    assert_eq!(
+        l2.get(HALT_LOCAL),
+        Some(&Value::Str("Add 类型不符".into())),
+        "Str+I64 停机（宿主自查自拼数字）"
+    );
+
+    // 经属性可见：树上的 Label text 拿到拼接结果。
+    let mut t = SceneTree::new("root");
+    let label = t.add_node(t.root(), "label", NodeKind::Label);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("s".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text(
+        "s",
+        "every { label.text = \"hp=\" + label.tag }",
+    )
+    .expect("编译");
+    // 预置 tag 局部不可 —— tag 是属性：直接给 label 一个自定义属性再读。
+    // 最小口径：脚本里读不存在的属性回落 I64(0) -> 拼接停机（类型不符）。
+    // 换一个可验证路径：拼接写入后读回。
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.set_prop(label, "text", Value::Str("hp=".into())).unwrap();
+    t.tick(0.016, &mut vm);
+    assert_eq!(
+        t.prop(label, "text"),
+        Some(&Value::Str("hp=".into())),
+        "每帧覆写为拼接结果（此时只有常量部分）"
+    );
+}

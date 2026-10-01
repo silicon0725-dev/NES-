@@ -172,7 +172,7 @@ fn t_vm_03_halt_protection() {
         "② 步数上限"
     );
 
-    // ③ 类型错：Add 两边不可数。
+    // ③ 类型错：Bool + I64 不可加（Str+Str 自 S6.26 合法 —— 拼接）。
     t.set_prop(script_node, "registry_key", Value::Str("ty".into()))
         .unwrap();
     vm.register(
@@ -180,8 +180,8 @@ fn t_vm_03_halt_protection() {
         Script::new(
             ScriptEntry::Signal("z".into()),
             vec![
-                Op::Const(Value::Str("a".into())),
-                Op::Const(Value::Str("b".into())),
+                Op::Const(Value::Bool(true)),
+                Op::Const(Value::I64(1)),
                 Op::Add,
             ],
         ),

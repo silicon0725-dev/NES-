@@ -91,6 +91,12 @@ pub enum Op {
     Or,
     /// 弹 Bool，压非。
     Not,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 /// 脚本入口。
@@ -268,6 +274,9 @@ fn run<'a, 'b>(
                 stack.push(StackVal::V(match (a, b) {
                     (Value::I64(x), Value::I64(y)) => Value::I64(x + y),
                     (Value::Vec2(x), Value::Vec2(y)) => Value::Vec2(Vec2::new(x.x + y.x, x.y + y.y)),
+                    // 字符串拼接走 `+`（S6.26；Str+Str 严格 —— 混型不停机
+                    // 不转换，数字转字符串宿主侧自查自拼）。
+                    (Value::Str(x), Value::Str(y)) => Value::Str(x + &y),
                     (a, b) => match (num_of(&a), num_of(&b)) {
                         (Some(x), Some(y)) => Value::F32(x + y),
                         _ => halt!("Add 类型不符"),
@@ -357,6 +366,43 @@ fn run<'a, 'b>(
                     Value::Bool(x) => Value::Bool(!x),
                     _ => halt!("Not 需要 Bool"),
                 }));
+            }
+            Op::Mod => {
+                let b = pop_val!();
+                let a = pop_val!();
+                stack.push(StackVal::V(match (a, b) {
+                    (Value::I64(x), Value::I64(y)) => Value::I64(x % y),
+                    (a, b) => match (num_of(&a), num_of(&b)) {
+                        (Some(x), Some(y)) => Value::F32(x % y),
+                        _ => halt!("Mod 类型不符"),
+                    },
+                }));
+            }
+            Op::BitAnd | Op::BitOr | Op::BitXor => {
+                let b = pop_val!();
+                let a = pop_val!();
+                let (Value::I64(x), Value::I64(y)) = (a, b) else {
+                    halt!("位运算需要 I64");
+                };
+                let v = match ops[pc] {
+                    Op::BitAnd => x & y,
+                    Op::BitOr => x | y,
+                    _ => x ^ y,
+                };
+                stack.push(StackVal::V(Value::I64(v)));
+            }
+            Op::Shl | Op::Shr => {
+                let b = pop_val!();
+                let a = pop_val!();
+                let (Value::I64(x), Value::I64(y)) = (a, b) else {
+                    halt!("移位需要 I64");
+                };
+                // wrapping：移位量按 2^6 取模（x86 语义），大移位量不崩帧。
+                let v = match ops[pc] {
+                    Op::Shl => x.wrapping_shl(y as u32),
+                    _ => x.wrapping_shr(y as u32),
+                };
+                stack.push(StackVal::V(Value::I64(v)));
             }
         }
         pc += 1;
@@ -650,8 +696,15 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
             _ if i + 1 < n
                 && matches!(
                     (c, chars[i + 1]),
-                    ('=', '=') | ('<', '=') | ('>', '=') | ('!', '=') | ('&', '&') | ('|', '|')
+                    ('=', '=')
+                        | ('<', '=')
+                        | ('>', '=')
+                        | ('!', '=')
+                        | ('&', '&')
+                        | ('|', '|')
                         | ('.', '.')
+                        | ('<', '<')
+                        | ('>', '>')
                 ) =>
             {
                 let pair: String = [c, chars[i + 1]].iter().collect();
@@ -663,7 +716,8 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 i += 2;
                 col += 2;
             }
-            '{' | '}' | '(' | ')' | ',' | '.' | ':' | '=' | '+' | '-' | '*' | '<' | '>' | '!' | ';' => {
+            '{' | '}' | '(' | ')' | ',' | '.' | ':' | '=' | '+' | '-' | '*' | '<' | '>' | '!'
+                | ';' | '&' | '|' | '^' | '%' => {
                 out.push(Spanned {
                     tok: Tok::Sym(c),
                     line,
@@ -1215,7 +1269,7 @@ impl TextParser {
     /// S6.21 调试实证）。
     fn cmp(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
         let mut a_code = Vec::new();
-        self.add(&mut a_code)?; // a（源序，先入临时）
+        self.bitor(&mut a_code)?; // a（源序，先入临时；经位阶梯到加减）
         let op = match self.peek().tok.clone() {
             Tok::Sym2(s) if s == "==" => Some("=="),
             Tok::Sym2(s) if s == "!=" => Some("!="),
@@ -1290,14 +1344,80 @@ impl TextParser {
         }
     }
 
+    /// mul := unary ("*" | "%") unary*（S6.26 增 `%`，与乘同级）。
     fn mul(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
         self.primary(ops)?;
-        while matches!(self.peek().tok, Tok::Sym('*')) {
+        loop {
+            match &self.peek().tok {
+                Tok::Sym('*') => {
+                    self.pos += 1;
+                    self.primary(ops)?;
+                    ops.push(Op::Mul);
+                }
+                Tok::Sym('%') => {
+                    self.pos += 1;
+                    self.primary(ops)?;
+                    ops.push(Op::Mod);
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    // ------------------------------------------------ 位阶梯（S6.26，C/Rust 序）
+    // bitor <= bitxor <= bitand <= shift <= add —— 全左结合。
+
+    /// bitor := bitxor ("|" bitxor)*。
+    fn bitor(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.bitxor(ops)?;
+        while matches!(self.peek().tok, Tok::Sym('|')) {
             self.pos += 1;
-            self.primary(ops)?;
-            ops.push(Op::Mul);
+            self.bitxor(ops)?;
+            ops.push(Op::BitOr);
         }
         Ok(())
+    }
+
+    /// bitxor := bitand ("^" bitand)*。
+    fn bitxor(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.bitand(ops)?;
+        while matches!(self.peek().tok, Tok::Sym('^')) {
+            self.pos += 1;
+            self.bitand(ops)?;
+            ops.push(Op::BitXor);
+        }
+        Ok(())
+    }
+
+    /// bitand := shift ("&" shift)*。
+    fn bitand(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.shift(ops)?;
+        while matches!(self.peek().tok, Tok::Sym('&')) {
+            self.pos += 1;
+            self.shift(ops)?;
+            ops.push(Op::BitAnd);
+        }
+        Ok(())
+    }
+
+    /// shift := add (("<<" | ">>") add)*。
+    fn shift(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.add(ops)?;
+        loop {
+            match &self.peek().tok {
+                Tok::Sym2(s) if s == "<<" => {
+                    self.pos += 1;
+                    self.add(ops)?;
+                    ops.push(Op::Shl);
+                }
+                Tok::Sym2(s) if s == ">>" => {
+                    self.pos += 1;
+                    self.add(ops)?;
+                    ops.push(Op::Shr);
+                }
+                _ => return Ok(()),
+            }
+        }
     }
 
     fn primary(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
