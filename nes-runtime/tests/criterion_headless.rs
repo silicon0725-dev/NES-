@@ -815,3 +815,51 @@ fn t_ed_01_editor_object_system() {
     let b = nes_runtime::headless::run(&root, "editor.ron", &trace, 100, 1.0 / 60.0).unwrap();
     assert_eq!(a.trace_hash, b.trace_hash);
 }
+
+/// T-FARM-02: Seed & Harvest v2 - timer + hit integration.
+/// Click plots via mouse, timer grows, auto-harvest -> WIN.
+#[test]
+fn t_farm_02_click_timer_win() {
+    let _g = lock();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    // 3 clicks: plant p0/p1/p2, each held 30 frames. Growth=60t, cooldown=20t.
+    // Cycle: plant(5g) -> 60t -> harvest(+15g) = net +10g. 3 cycles: 20+30=50=WIN.
+    let trace_text = "# 3 clicks\n0 mouse_move 100 80\n5 mouse_down left\n35 mouse_up left\n100 mouse_move 192 80\n105 mouse_down left\n135 mouse_up left\n250 mouse_move 284 80\n255 mouse_down left\n285 mouse_up left\n";
+    let trace = nes_render_api::input::parse_trace(trace_text).expect("trace");
+
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene("farm.ron").unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    rt.mount_input_view(&mut vm);
+
+    let mut win_at = None;
+    for f in 0..900u64 {
+        for t in trace.iter().filter(|t| t.frame == f) {
+            for ev in &t.events {
+                nes_render_wgpu::window::inject_input(*ev);
+            }
+        }
+        let snap = rt.collect_input();
+        let _ = rt.emit_input_signals(&snap);
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+        if f % 30 == 0 {
+            let hud = {
+                let tree = rt.tree_mut();
+                tree.find(&nes_scene::NodePath::parse("/main/hud").unwrap())
+                    .and_then(|n| tree.prop(n, "text").cloned())
+            };
+            if let Some(nes_scene::Value::Str(s)) = hud {
+                if s.contains("WIN") {
+                    win_at = Some(f);
+                    break;
+                }
+            }
+        }
+    }
+    assert!(win_at.is_some(), "click->plant->timer->harvest->WIN within 900 frames");
+}

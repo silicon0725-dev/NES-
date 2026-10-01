@@ -701,6 +701,14 @@ cargo run --example s41_visual_closure
 > 场景已修复可跑；T-FARM-02 集成测试因编辑过程中文件损坏（重复
 > 函数 + 编码问题）已移除——下轮重新编写干净版本。全仓 474 绿
 > /守卫 11/11/clippy 零。
+> **v1.78 注记（S10-1 完成：farm 集成通过）**：T-FARM-02 通过 ——
+> 点击种植（hit + node(h).member）→ per-entity timer 生长 → 自动
+> 收获 → 50 金 WIN（900 帧内）。S10-1 两项 ★★★（hit + timer）
+> 全部落地并通过集成验证。**API 摩擦对照更新**：F-2（平行计时局部）
+> 消除（NodeData.timer per-entity）；F-3（数字键退化）消除（hit
+> 空间命中 + InputView mouse_x/y/button）；F-4（单控制器膨胀）缓解
+> （可分离关注点但仍受一脚本一入口约束）。runtime 升至 54（全仓
+> 合计 475）。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |
