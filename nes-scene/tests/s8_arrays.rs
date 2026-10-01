@@ -179,3 +179,28 @@ fn t_a_05_array_locals_deterministic_fingerprint() {
         "数组局部（句柄元素语义化）双跑恒等"
     );
 }
+
+/// T-A-06（补）：**嵌套 for_each** —— 内层 `it` 遮蔽外层（语言层单名，
+/// VM 层 it0/it1）；外层变量在内层可见。
+#[test]
+fn t_a_06_nested_for_each_shadowing() {
+    let mut t = SceneTree::new("root");
+    let b = t.add_node(t.root(), "b", NodeKind::Script);
+    t.apply_pending();
+    src(
+        &mut t,
+        b,
+        "on \"go\" { outer = array()\n  push(outer, 1)\n  push(outer, 2)\n  inner = array()\n  push(inner, 10)\n  push(inner, 20)\n  push(inner, 30)\n  pairs = \"\"\n  for_each(outer) { for_each(inner) { pairs = pairs + \"[\" + num_to_str(it) + \"]\" }\n  after = it } }",
+    );
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(&mut t).is_empty());
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    let l = vm.locals(b).unwrap();
+    assert_eq!(
+        l.get("pairs"),
+        Some(&Value::Str("[10][20][30][10][20][30]".to_string())),
+        "内层 it 遮蔽外层（6 次内层迭代）"
+    );
+    assert_eq!(l.get("after"), Some(&Value::I64(2)), "内层结束后外层 it 可见");
+}

@@ -1,8 +1,9 @@
-# 走位 + 朝向 + 射击：右移朝右射、上移朝上射
-0 key_down ArrowRight key_down Space
-40 key_up ArrowRight key_down ArrowUp
-80 key_up Space key_up ArrowUp key_down ArrowRight key_down Space
-140 key_up ArrowRight key_down ArrowDown key_up Space
-200 key_up ArrowDown key_down ArrowLeft key_down Space
-260 key_up ArrowLeft key_up Space key_down ArrowUp
-320 key_up ArrowUp
+# v3 验证轨迹：移动 + 鼠标瞄准 + 射击
+0 mouse_move 200 108 key_down Space
+20 key_up Space mouse_move 300 150 key_down ArrowRight
+60 key_up ArrowRight key_down ArrowLeft mouse_move 100 80
+100 key_up ArrowLeft key_down Space
+140 key_up Space key_down ArrowDown mouse_move 250 180
+200 key_up ArrowDown key_down ArrowUp
+260 key_up ArrowUp mouse_move 150 60 key_down Space
+320 key_up Space

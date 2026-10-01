@@ -2085,7 +2085,9 @@ impl TextParser {
                 ops.push(Op::Local(src.clone()));
                 ops.push(Op::Local(iv.clone()));
                 ops.push(Op::StrIndex); // 运行时分派：数组元素
-                ops.push(Op::SetLocal("it".to_string()));
+                // 循环变量按深度编号（it0/it1/...）：嵌套 for_each 的内层
+                // it 遮蔽外层（语言层单名 `it`，VM 层 itN）。
+                ops.push(Op::SetLocal(format!("it{depth}")));
                 self.expect_sym('{')?;
                 self.loops.push(LoopCtx {
                     top: inc,
@@ -2189,6 +2191,7 @@ impl TextParser {
                 // `it.member`（S8.2b-2）：it 是局部绑定 —— 赋值目标走
                 // Local(it)（成员写全链复用；物化即校验）。
                 } else if name == "it" && matches!(self.peek2().tok, Tok::Sym('.')) {
+                    let itn = format!("it{}", self.fe_depth.saturating_sub(1));
                     self.pos += 1; // it
                     self.expect_sym('.')?;
                     let member = match self.next().tok {
@@ -2198,8 +2201,8 @@ impl TextParser {
                     let bin = self.assign_op()?;
                     match bin {
                         Some(op) => {
-                            ops.push(Op::Local("it".to_string()));
-                            ops.push(Op::Local("it".to_string())); // 读侧双压
+                            ops.push(Op::Local(itn.clone()));
+                            ops.push(Op::Local(itn.clone())); // 读侧双压
                             if member == "pos" {
                                 ops.push(Op::GetT);
                             } else {
@@ -2209,7 +2212,7 @@ impl TextParser {
                             ops.push(op);
                         }
                         None => {
-                            ops.push(Op::Local("it".to_string()));
+                            ops.push(Op::Local(itn.clone()));
                             self.expr(ops)?;
                         }
                     }
@@ -2682,16 +2685,18 @@ impl TextParser {
                     }
                 }
                 // `it.member`（S8.2b-2 特例）：it 是 for_each 的循环绑定
-                //（普通局部）—— 成员访问压 Local(it) 而非 NodeByName，
-                // 物化即经 resolve 边界（悬垂句柄自然停机）。
+                //（普通局部）—— 成员访问压 Local(itN) 而非 NodeByName，
+                // 物化即经 resolve 边界（悬垂句柄自然停机）。N = 当前
+                // 嵌套深度（内层遮蔽外层，语言层单名 `it`）。
                 "it" => {
+                    let itn = format!("it{}", self.fe_depth.saturating_sub(1));
                     if matches!(self.peek().tok, Tok::Sym('.')) {
                         self.pos += 1;
                         let member = match self.next().tok {
                             Tok::Ident(m) => m,
                             _ => return Err(self.err_here("期望属性名或 `pos`")),
                         };
-                        ops.push(Op::Local("it".to_string()));
+                        ops.push(Op::Local(itn));
                         if member == "pos" {
                             ops.push(Op::GetT);
                             self.pos_component(ops)?;
@@ -2699,7 +2704,7 @@ impl TextParser {
                             ops.push(Op::GetProp(member));
                         }
                     } else {
-                        ops.push(Op::Local("it".to_string()));
+                        ops.push(Op::Local(itn));
                     }
                 }
                 other => {
