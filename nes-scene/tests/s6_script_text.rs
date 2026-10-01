@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use nes_scene::Transform2D;
+
 use nes_scene::{
     compile_script, NodeKind, Op, SceneTree, ScriptEntry, ScriptVm, Value, HALT_LOCAL,
 };
@@ -961,4 +963,120 @@ fn t_cmp_25_radix_literals() {
     assert!(format!("{e2}").contains("非法数字 `2`（基数 2）"), "{e2}");
     let e3 = compile_script("on \"x\" { a = 0xFFFFFFFFFFFFFFFFFF }").expect_err("溢出");
     assert!(format!("{e3}").contains("超出 i64"), "{e3}");
+}
+
+// ---------------------------------------------------------------- S6.28
+// 除法（补 S6.20 缺口）+ 复合赋值全族（十种）。
+
+/// T-Cmp-26：除法 —— 整型截断、负数、除零停机、浮点 IEEE。
+#[test]
+fn t_cmp_26_division() {
+    let l = run_locals(
+        "every {
+            a = 7 / 2
+            b = -7 / 2
+            c = 7.5 / 2.5
+            inf = 1.0 / 0.0
+        }",
+    );
+    assert_eq!(l.get("a"), Some(&Value::I64(3)), "7/2=3（截断）");
+    assert_eq!(l.get("b"), Some(&Value::I64(-3)), "-7/2=-3（向零截断）");
+    let c = match l.get("c") {
+        Some(Value::F32(v)) => *v,
+        other => panic!("c 应为 F32：{other:?}"),
+    };
+    assert!((c - 3.0).abs() < 1e-6, "7.5/2.5=3.0");
+    let inf = match l.get("inf") {
+        Some(Value::F32(v)) => *v,
+        other => panic!("inf 应为 F32：{other:?}"),
+    };
+    assert!(inf.is_infinite() && inf > 0.0, "1.0/0.0=+inf（IEEE，非错误）");
+
+    // 整型除零：停机可观测。
+    let l2 = run_locals("every { z = 1 / 0 }");
+    assert_eq!(
+        l2.get(HALT_LOCAL),
+        Some(&Value::Str("整型除零".into())),
+        "1/0 停机（不 panic 不编造）"
+    );
+
+    // 复合 /= 与整型除零组合。
+    let l3 = run_locals("every { n = 100; n /= 7; n /= 0 }");
+    assert_eq!(l3.get("n"), Some(&Value::I64(14)), "100/=7 -> 14 后除零停机（n 留停机前值）");
+    assert_eq!(l3.get(HALT_LOCAL), Some(&Value::Str("整型除零".into())));
+}
+
+/// T-Cmp-27：复合赋值全族（局部十种 + 自增惯用法 + 节点成员 pos/属性）。
+#[test]
+fn t_cmp_27_compound_assign_family() {
+    let l = run_locals(
+        "every {
+            a = 10
+            a += 5
+            b = 10; b -= 3
+            c = 4; c *= 6
+            d = 100; d /= 4
+            e = 17; e %= 5
+            f = 0xF0; f &= 0x0F
+            g = 0xF0; g |= 0x0F
+            h = 0xFF; h ^= 0x0F
+            i = 1; i <<= 4
+            j = 1024; j >>= 3
+            k = 0
+            for x in 0..5 {
+                k += x
+            }
+            n = 0
+            n += 1; n += 1
+        }",
+    );
+    assert_eq!(l.get("a"), Some(&Value::I64(15)), "10+=5");
+    assert_eq!(l.get("b"), Some(&Value::I64(7)), "10-=3");
+    assert_eq!(l.get("c"), Some(&Value::I64(24)), "4*=6");
+    assert_eq!(l.get("d"), Some(&Value::I64(25)), "100/=4");
+    assert_eq!(l.get("e"), Some(&Value::I64(2)), "17%=5");
+    assert_eq!(l.get("f"), Some(&Value::I64(0)), "0xF0&=0x0F");
+    assert_eq!(l.get("g"), Some(&Value::I64(255)), "0xF0|=0x0F");
+    assert_eq!(l.get("h"), Some(&Value::I64(240)), "0xFF^=0x0F");
+    assert_eq!(l.get("i"), Some(&Value::I64(16)), "1<<=4");
+    assert_eq!(l.get("j"), Some(&Value::I64(128)), "1024>>=3");
+    assert_eq!(l.get("k"), Some(&Value::I64(10)), "循环内累加（0+1+2+3+4）");
+    assert_eq!(l.get("n"), Some(&Value::I64(2)), "自增惯用法 n+=1");
+
+    // 节点成员复合：pos += 与属性 |=。
+    let mut t = SceneTree::new("root");
+    let sprite = t.add_node(t.root(), "sprite", NodeKind::Node2D);
+    let hero = t.add_node(t.root(), "hero", NodeKind::Sprite2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_local(sprite, Transform2D::from_pos(10.0, 0.0));
+    t.set_prop(hero, "z_index", Value::I64(1)).unwrap();
+    t.set_prop(brain, "registry_key", Value::Str("ca".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text(
+        "ca",
+        "on \"go\" {
+            sprite.pos += (6.0, 0.0)
+            hero.z_index |= 0x10
+        }",
+    )
+    .expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.emit_signal("go", Value::I64(0));
+    t.tick(0.016, &mut nes_scene::NoObserver);
+    assert_eq!(t.local(sprite).unwrap().pos.x, 16.0, "sprite.pos += (6,0)（读-算-写双压）");
+    assert_eq!(t.prop(hero, "z_index"), Some(&Value::I64(17)), "hero.z_index |= 0x10（1|16=17）");
+
+    // 产物断言：x += 1 的脱糖与手写逐指令同构。
+    let s = compile_script("on \"x\" { n += 1 }").unwrap();
+    assert_eq!(
+        s.ops,
+        vec![
+            Op::Local("n".into()),
+            Op::Const(Value::I64(1)),
+            Op::Add,
+            Op::SetLocal("n".into()),
+        ],
+        "x += e 脱糖 = x = x + e"
+    );
 }

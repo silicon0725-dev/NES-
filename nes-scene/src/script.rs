@@ -72,8 +72,12 @@ pub enum Op {
     Add,
     /// 弹 b、a，压 a-b（同上类型规则）。
     Sub,
-    /// 弹 b、a，压 a*b（数值提升 F32）。
+    /// 弹 b、a，压 a*b（I64*I64 -> I64；数值提升 F32）。
     Mul,
+    /// 弹 b、a，压 a/b —— I64 截断除（**除零停机**：checked，不 panic
+    /// 不静默）；浮点走 IEEE（0 除得 ±inf，是数学事实不是错误）。
+    /// S6.20 文档写"四则"但实现缺 `/`—— 本轮（S6.28）补缺。
+    Div,
     /// 弹 b、a，压 a<b（数值比较 -> Bool）。
     Lt,
     /// 弹 b、a，压 a==b（值或节点相等 -> Bool）。
@@ -303,6 +307,22 @@ fn run<'a, 'b>(
                     (a, b) => match (num_of(&a), num_of(&b)) {
                         (Some(x), Some(y)) => Value::F32(x * y),
                         _ => halt!("Mul 类型不符"),
+                    },
+                }));
+            }
+            Op::Div => {
+                let b = pop_val!();
+                let a = pop_val!();
+                stack.push(StackVal::V(match (a, b) {
+                    // 整型截断除：checked —— 除零是停机错误（不 panic 不编造值）。
+                    (Value::I64(x), Value::I64(y)) => match x.checked_div(y) {
+                        Some(v) => Value::I64(v),
+                        None => halt!("整型除零"),
+                    },
+                    // 浮点走 IEEE：0 除得 ±inf（数学事实，不是错误）。
+                    (a, b) => match (num_of(&a), num_of(&b)) {
+                        (Some(x), Some(y)) => Value::F32(x / y),
+                        _ => halt!("Div 类型不符"),
                     },
                 }));
             }
@@ -726,16 +746,23 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 });
                 col += i - start;
             }
-            // 双字符符号族（S6.21 扩到 == <= >= != && ||）。
-            _ if i + 2 < n && (c, chars[i + 1], chars[i + 2]) == ('.', '.', '=') => {
+            // 三字符符号族（S6.25 `..=`；S6.28 复合移位 `<<=` `>>=`）。
+            _ if i + 2 < n
+                && matches!(
+                    (c, chars[i + 1], chars[i + 2]),
+                    ('.', '.', '=') | ('<', '<', '=') | ('>', '>', '=')
+                ) =>
+            {
+                let triple: String = [c, chars[i + 1], chars[i + 2]].iter().collect();
                 out.push(Spanned {
-                    tok: Tok::Sym2("..=".into()),
+                    tok: Tok::Sym2(triple),
                     line,
                     col,
                 });
                 i += 3;
                 col += 3;
             }
+            // 双字符符号族（S6.21 比较/逻辑；S6.26 移位；S6.28 复合赋值对）。
             _ if i + 1 < n
                 && matches!(
                     (c, chars[i + 1]),
@@ -748,6 +775,14 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                         | ('.', '.')
                         | ('<', '<')
                         | ('>', '>')
+                        | ('+', '=')
+                        | ('-', '=')
+                        | ('*', '=')
+                        | ('/', '=')
+                        | ('%', '=')
+                        | ('&', '=')
+                        | ('|', '=')
+                        | ('^', '=')
                 ) =>
             {
                 let pair: String = [c, chars[i + 1]].iter().collect();
@@ -760,7 +795,7 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 col += 2;
             }
             '{' | '}' | '(' | ')' | ',' | '.' | ':' | '=' | '+' | '-' | '*' | '<' | '>' | '!'
-                | ';' | '&' | '|' | '^' | '%' => {
+                | ';' | '&' | '|' | '^' | '%' | '/' => {
                 out.push(Spanned {
                     tok: Tok::Sym(c),
                     line,
@@ -910,6 +945,31 @@ impl TextParser {
     }
 
     /// `break`/`continue` 后的可选标签（后随标识符即视为标签）。
+    /// 赋值操作符（S6.28）：消费当前 token —— `=` -> `None`（纯赋值）；
+    /// 十种复合 `OP=` -> `Some(二元 Op)`。不认识则报错（在赋值目标之后，
+    /// 错误信息指明"期望赋值"）。
+    fn assign_op(&mut self) -> Result<Option<Op>, ParseError> {
+        let op = match &self.peek().tok {
+            Tok::Sym('=') => None,
+            Tok::Sym2(s) => match s.as_str() {
+                "+=" => Some(Op::Add),
+                "-=" => Some(Op::Sub),
+                "*=" => Some(Op::Mul),
+                "/=" => Some(Op::Div),
+                "%=" => Some(Op::Mod),
+                "&=" => Some(Op::BitAnd),
+                "|=" => Some(Op::BitOr),
+                "^=" => Some(Op::BitXor),
+                "<<=" => Some(Op::Shl),
+                ">>=" => Some(Op::Shr),
+                _ => return Err(self.err_here("期望 `=` 赋值或复合赋值")),
+            },
+            _ => return Err(self.err_here("期望 `=` 赋值或复合赋值")),
+        };
+        self.pos += 1;
+        Ok(op)
+    }
+
     fn opt_label(&mut self) -> Option<String> {
         match self.peek().tok.clone() {
             Tok::Ident(s) if !RESERVED.contains(&s.as_str()) => {
@@ -1244,20 +1304,47 @@ impl TextParser {
                 }
                 self.pos += 1;
                 if matches!(self.peek().tok, Tok::Sym('.')) {
-                    // 节点成员赋值：node.member = expr（member 为 pos -> SetT）。
-                    // 栈序：SetT/SetProp 弹值再弹节点 —— 节点必须**先压**（值之下）。
+                    // 节点成员赋值（S6.28 泛化到复合）：node.member OP= expr。
+                    // 纯 `=`：节点先压 + expr + Set（值之下）。
+                    // 复合 OP=：脱糖 读-算-写（节点压两次：一次给读消费、
+                    // 一次留给写回收 —— 与手写双压同构）。
                     self.pos += 1;
                     let member = match self.next().tok {
                         Tok::Ident(m) => m,
                         _ => return Err(self.err_here("期望属性名或 `pos`")),
                     };
-                    self.expect_sym('=')?;
-                    if name == "this" {
-                        ops.push(Op::This);
-                    } else {
-                        ops.push(Op::NodeByName(name));
+                    let bin = self.assign_op()?;
+                    match bin {
+                        Some(op) => {
+                            // 读侧**双压**：一个节点给 GetT/GetProp 消费，
+                            // 一个留在栈底给 Set 回收（Set 弹值在先 —— 值必须在顶，
+                            // 写侧节点不能压在值后面 —— S6.28 调试实证）。
+                            for _ in 0..2 {
+                                if name == "this" {
+                                    ops.push(Op::This);
+                                } else {
+                                    ops.push(Op::NodeByName(name.clone()));
+                                }
+                            }
+                            if member == "pos" {
+                                ops.push(Op::GetT);
+                            } else {
+                                ops.push(Op::GetProp(member.clone()));
+                            }
+                            // 算：读值 OP expr。
+                            self.expr(ops)?;
+                            ops.push(op);
+                        }
+                        None => {
+                            // 纯赋值：节点先压 + expr（值压在节点上）。
+                            if name == "this" {
+                                ops.push(Op::This);
+                            } else {
+                                ops.push(Op::NodeByName(name));
+                            }
+                            self.expr(ops)?;
+                        }
                     }
-                    self.expr(ops)?; // 值压在节点上
                     if member == "pos" {
                         ops.push(Op::SetT);
                     } else {
@@ -1269,6 +1356,19 @@ impl TextParser {
                     self.expr(ops)?;
                     ops.push(Op::SetLocal(name));
                     Ok(())
+                } else if let Tok::Sym2(_) = self.peek().tok.clone() {
+                    // 复合局部赋值（S6.28）：x OP= e -> Local(x), e, OP, SetLocal(x)。
+                    let bin = self.assign_op()?;
+                    match bin {
+                        Some(op) => {
+                            ops.push(Op::Local(name.clone()));
+                            self.expr(ops)?;
+                            ops.push(op);
+                            ops.push(Op::SetLocal(name));
+                            Ok(())
+                        }
+                        None => Err(self.err_here("期望 `=` 赋值或复合赋值")),
+                    }
                 } else {
                     Err(self.err_here("期望 `=` 赋值"))
                 }
@@ -1401,6 +1501,11 @@ impl TextParser {
                     self.pos += 1;
                     self.primary(ops)?;
                     ops.push(Op::Mod);
+                }
+                Tok::Sym('/') => {
+                    self.pos += 1;
+                    self.primary(ops)?;
+                    ops.push(Op::Div);
                 }
                 _ => return Ok(()),
             }
