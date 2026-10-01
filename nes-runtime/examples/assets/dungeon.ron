@@ -32,21 +32,11 @@ Scene(
             Node(name: "marker", kind: "Node2D", local: (x: 200.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
             // 弹丸池：5 个哑实体 + 各自自治飞行脚本（同源）。
             Node(name: "bullets", kind: "Node", children: [
-                Node(name: "b0", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [
-                    Node(name: "fly", kind: "Script", props: { "source": "every { if this.pos.x > -50.0 { this.pos = xy(this.pos.x + (marker.pos.x - this.pos.x) * 0.22, this.pos.y + (marker.pos.y - this.pos.y) * 0.22); mx = marker.pos.x - this.pos.x; my = marker.pos.y - this.pos.y; if mx * mx + my * my < 25.0 { this.pos = xy(-100.0, -100.0) } } }" }, children: [],),
-                ],),
-                Node(name: "b1", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [
-                    Node(name: "fly", kind: "Script", props: { "source": "every { if this.pos.x > -50.0 { this.pos = xy(this.pos.x + (marker.pos.x - this.pos.x) * 0.22, this.pos.y + (marker.pos.y - this.pos.y) * 0.22); mx = marker.pos.x - this.pos.x; my = marker.pos.y - this.pos.y; if mx * mx + my * my < 25.0 { this.pos = xy(-100.0, -100.0) } } }" }, children: [],),
-                ],),
-                Node(name: "b2", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [
-                    Node(name: "fly", kind: "Script", props: { "source": "every { if this.pos.x > -50.0 { this.pos = xy(this.pos.x + (marker.pos.x - this.pos.x) * 0.22, this.pos.y + (marker.pos.y - this.pos.y) * 0.22); mx = marker.pos.x - this.pos.x; my = marker.pos.y - this.pos.y; if mx * mx + my * my < 25.0 { this.pos = xy(-100.0, -100.0) } } }" }, children: [],),
-                ],),
-                Node(name: "b3", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [
-                    Node(name: "fly", kind: "Script", props: { "source": "every { if this.pos.x > -50.0 { this.pos = xy(this.pos.x + (marker.pos.x - this.pos.x) * 0.22, this.pos.y + (marker.pos.y - this.pos.y) * 0.22); mx = marker.pos.x - this.pos.x; my = marker.pos.y - this.pos.y; if mx * mx + my * my < 25.0 { this.pos = xy(-100.0, -100.0) } } }" }, children: [],),
-                ],),
-                Node(name: "b4", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [
-                    Node(name: "fly", kind: "Script", props: { "source": "every { if this.pos.x > -50.0 { this.pos = xy(this.pos.x + (marker.pos.x - this.pos.x) * 0.22, this.pos.y + (marker.pos.y - this.pos.y) * 0.22); mx = marker.pos.x - this.pos.x; my = marker.pos.y - this.pos.y; if mx * mx + my * my < 25.0 { this.pos = xy(-100.0, -100.0) } } }" }, children: [],),
-                ],),
+                Node(name: "b0", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [],),
+                Node(name: "b1", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [],),
+                Node(name: "b2", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [],),
+                Node(name: "b3", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [],),
+                Node(name: "b4", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(3), }, children: [],),
             ],),
             // 敌人组：3 台自治追踪者（children 序 = referee 的结构序）。
             Node(name: "enemies", kind: "Node", children: [
@@ -60,6 +50,8 @@ Scene(
             Node(name: "e2_brain", kind: "Script", props: { "source": "init { k = 0.030 }
 on \"tick\" { dx = player.pos.x - e2.pos.x; dy = player.pos.y - e2.pos.y; e2.pos = xy(e2.pos.x + dx * k, e2.pos.y + dy * k) }" }, children: [],),
             Node(name: "e3_brain", kind: "Script", props: { "source": "on \"tick\" { dx = player.pos.x - e3.pos.x; dy = player.pos.y - e3.pos.y; ax = dx; if ax < 0.0 { ax = 0.0 - dx }; ay = dy; if ay < 0.0 { ay = 0.0 - dy }; if ax > ay { if dx > 0.0 { e3.pos = xy(e3.pos.x + 2.2, e3.pos.y) } else { e3.pos = xy(e3.pos.x - 2.2, e3.pos.y) } } else { if dy > 0.0 { e3.pos = xy(e3.pos.x, e3.pos.y + 2.2) } else { e3.pos = xy(e3.pos.x, e3.pos.y - 2.2) } } }" }, children: [],),
+            // 弹道控制器：单脚本 for_each 驱动全池（S8.3-1 收敛：5 份同源内嵌 -> 1 控制器 + 集合）。
+            Node(name: "fly_ctl", kind: "Script", props: { "source": "on \"tick\" { for_each(children(node(\"bullets\"))) { if it.pos.x > -50.0 { it.pos = xy(it.pos.x + (marker.pos.x - it.pos.x) * 0.22, it.pos.y + (marker.pos.y - it.pos.y) * 0.22); mx = marker.pos.x - it.pos.x; my = marker.pos.y - it.pos.y; if mx * mx + my * my < 25.0 { it.pos = xy(-100.0, -100.0) } } } }" }, children: [],),
             Node(name: "heart", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(4), }, children: [],),
             Node(name: "door", kind: "Sprite2D", local: (x: 352.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(5), "visible": false, }, children: [],),
             Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "HP 3  SCORE 0", }, children: [],),

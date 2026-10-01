@@ -552,3 +552,101 @@ fn t_em_01_mechanism_entity_model() {
     assert_eq!(a.frame_hashes, b.frame_hashes);
     assert_eq!(a.trace_hash, b.trace_hash);
 }
+
+/// T-SMI-01（S8.3-1）：**同源多实例装载** —— 多节点引用同一外置
+/// .nes 资产：编译产物共享（scripts 表 `__file__:` 键去重），**执行
+/// 状态独立**（states 按 NodeId 键控）。代码共享、状态不共享。
+#[test]
+fn t_smi_01_shared_source_independent_state() {
+    let _g = lock();
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_smi");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Scripts")).unwrap();
+    std::fs::write(
+        dir.join("Scripts/drift.nes"),
+        "every { n = n + 1; this.pos = xy(n * 1.0, 0.0) }",
+    )
+    .unwrap();
+    let scene = r#"Scene(
+    version: 1,
+    resources: [Res(id: 1, path: "Scripts/drift.nes", kind: "Script"),],
+    root: Node(
+        name: "main", kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 32.0, y: 32.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            Node(name: "s1", kind: "Node2D", children: [
+                Node(name: "b1", kind: "Script", props: { "script": Resource(1), }, children: [],),
+            ],),
+            Node(name: "s2", kind: "Node2D", children: [
+                Node(name: "b2", kind: "Script", props: { "script": Resource(1), }, children: [],),
+            ],),
+            Node(name: "s3", kind: "Node2D", children: [
+                Node(name: "b3", kind: "Script", props: { "script": Resource(1), }, children: [],),
+            ],),
+        ],
+    ),
+)
+"#;
+    std::fs::write(dir.join("main.ron"), scene).unwrap();
+
+    let mut rt = nes_runtime::NesRuntime::open_headless(&dir).unwrap();
+    rt.load_scene("main.ron").unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(dir.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+
+    // 先让 s1 跑 3 帧、s2/s3 不跑？——every 是 process 入口全员跑。
+    // 独立性验证：全体跑 5 帧 -> 各实例 n=5；再把其中一实例热重载为
+    // 不同脚本（另一 .nes）-> 只影响该实例，其余继续累加。
+    for _ in 0..5 {
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+    }
+    for name in ["s1/b1", "s2/b2", "s3/b3"] {
+        let n = {
+            let tree = rt.tree_mut();
+            tree.find(&nes_scene::NodePath::parse(&format!("/main/{name}")).unwrap())
+                .and_then(|id| vm.locals(id))
+                .and_then(|l| l.get("n").cloned())
+        };
+        assert_eq!(n, Some(nes_scene::Value::I64(5)), "{name} 独立累加");
+    }
+    // 独立性最强的证据：替换 s3 的脚本为不同文本 -> s1/s2 不受影响。
+    std::fs::write(dir.join("Scripts/other.nes"), "every { n = n + 10; this.pos = xy(0.0, 0.0) }").unwrap();
+    let scene2 = scene.replace(
+        r#"Node(name: "s3", kind: "Node2D", children: [
+                Node(name: "b3", kind: "Script", props: { "script": Resource(1), }, children: [],),
+            ],),"#,
+        r#"Node(name: "s3", kind: "Node2D", children: [
+                Node(name: "b3", kind: "Script", props: { "script": Resource(2), }, children: [],),
+            ],),"#,
+    ).replace(
+        "resources: [Res(id: 1, path: \"Scripts/drift.nes\", kind: \"Script\"),]",
+        "resources: [Res(id: 1, path: \"Scripts/drift.nes\", kind: \"Script\"), Res(id: 2, path: \"Scripts/other.nes\", kind: \"Script\"),]",
+    );
+    std::fs::write(dir.join("main2.ron"), scene2).unwrap();
+    rt.load_scene("main2.ron").unwrap();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(dir.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    for _ in 0..2 {
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+    }
+    // 重挂载 = 状态复位（S6.32/S8.0 语义）：全体重新从 0 开始，
+    // s1/s2 走 +1 两帧 -> n=2；s3 走 +10 -> n=20。
+    for (name, want) in [("s1/b1", 2), ("s2/b2", 2), ("s3/b3", 20)] {
+        let n = {
+            let tree = rt.tree_mut();
+            tree.find(&nes_scene::NodePath::parse(&format!("/main/{name}")).unwrap())
+                .and_then(|id| vm.locals(id))
+                .and_then(|l| l.get("n").cloned())
+        };
+        let msg = if name == "s3/b3" { "实例间互不污染" } else { "同源实例继续独立累加" };
+        assert_eq!(n, Some(nes_scene::Value::I64(want)), "{name}: {msg}");
+    }
+}
