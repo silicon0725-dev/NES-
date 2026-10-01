@@ -568,6 +568,20 @@ cargo run --example s41_visual_closure
 > 不落盘、双跑全等。runtime 升至 53（全仓合计 454）。至此
 > S8.4 三个验证象限齐备：战斗（Dodge/Dungeon）/ 拓扑触发
 >（机关）/ 编辑资源（编辑器对象）。
+> **v1.64 注记（S8 收官 + S9-0 设计冻结）**：S8 正式定名
+> **Runtime Entity Model & Behavior Organization Validation** 并
+> **CLOSED/FROZEN**（454/11 守卫/clippy 零/wgpu 89/D2·P5·G-COMP-01
+> 冻结/VM 封口）。`this`=Host 第四次实证与 Tab 闩锁边缘作为边界
+> 证据保留。**S9 裁决**：不做第二完整游戏，先进 S9-0 持久身份契约
+>（编辑器拐点：preorder 在 delete/rename/undo 前不稳定）。十问
+> 裁决落档：**uid = 128 位 UUID 永久一次性**（clone/duplicate 新
+> 生成、delete 永久死亡、同 uid 冲突装载报错）；**undo/redo 恢复
+> 原 uid**（事务日志全量快照，身份跨事务连续）；**三身份分层**
+>（gen=执行安全/uid=语义身份/Handle=弱引用，resolve 各走各道）；
+> **指纹在 S9-1 一次性切换 uid**（不留双轨，Dodge 基线按协议重生成）；
+> **序列化 uid 一等字段 + 旧文件前序派生回写**（幂等升级）。
+> 路线：S9-0 契约 → S9-1 对象模型 → S9-2 事务 → S9-3 Inspector。
+> 文档见 `NES2.0_S9.0持久身份与编辑器变更契约_设计冻结_v1.md`。
 
 | 事项 | 状态 |
 |---|---|
