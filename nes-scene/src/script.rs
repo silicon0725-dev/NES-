@@ -638,6 +638,15 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 col += i - start;
             }
             // 双字符符号族（S6.21 扩到 == <= >= != && ||）。
+            _ if i + 2 < n && (c, chars[i + 1], chars[i + 2]) == ('.', '.', '=') => {
+                out.push(Spanned {
+                    tok: Tok::Sym2("..=".into()),
+                    line,
+                    col,
+                });
+                i += 3;
+                col += 3;
+            }
             _ if i + 1 < n
                 && matches!(
                     (c, chars[i + 1]),
@@ -711,9 +720,9 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 14] = [
-    "on", "every", "if", "else", "while", "for", "in", "break", "continue", "emit", "arg",
-    "this", "true", "false",
+const RESERVED: [&str; 15] = [
+    "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
+    "arg", "this", "true", "false",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -868,30 +877,120 @@ impl TextParser {
         }
         let mut a_code = Vec::new();
         self.expr(&mut a_code)?; // 下界
-        if !matches!(&self.peek().tok, Tok::Sym2(s) if s == "..") {
-            return Err(self.err_here("期望 `..` 区间"));
-        }
-        self.pos += 1;
+        // 区间形态：`..`（右开）或 `..=`（右闭，S6.25）。
+        let inclusive = match &self.peek().tok {
+            Tok::Sym2(s) if s == ".." => {
+                self.pos += 1;
+                false
+            }
+            Tok::Sym2(s) if s == "..=" => {
+                self.pos += 1;
+                true
+            }
+            _ => return Err(self.err_here("期望 `..` 或 `..=` 区间")),
+        };
         let mut b_code = Vec::new();
         self.expr(&mut b_code)?; // 上界（活值：内联进条件）
+        // 可选步进：`step expr`（S6.25）。缺省 Const(1)。
+        // 字面量符号在**编译期**定向（升/降/零迭代）；一般表达式编译为
+        // 运行时方向条件（方向随每次迭代的活值符号）。
+        let step_code: Vec<Op> = if matches!(&self.peek().tok, Tok::Ident(k) if k == "step") {
+            self.pos += 1;
+            let mut c = Vec::new();
+            self.expr(&mut c)?;
+            c
+        } else {
+            vec![Op::Const(Value::I64(1))]
+        };
 
         // init
         ops.extend(a_code);
         ops.push(Op::SetLocal(var.clone()));
         let jinit = ops.len();
-        ops.push(Op::Jump(0)); // 占位 -> cond（inc 块长度已知，直接算）
-        // inc（continue 目标）
+        ops.push(Op::Jump(0)); // 占位 -> cond（下方回填）
+        // inc（continue 目标）：i = i + step（活步进）
         let inc = ops.len();
         ops.push(Op::Local(var.clone()));
-        ops.push(Op::Const(Value::I64(1)));
+        ops.extend(step_code.clone());
         ops.push(Op::Add);
         ops.push(Op::SetLocal(var.clone()));
-        // cond
+        // cond：按步进符号定向。
         let cond = ops.len();
         ops[jinit] = Op::Jump(cond);
-        ops.push(Op::Local(var.clone()));
-        ops.extend(b_code);
-        ops.push(Op::Lt);
+        // Rust 的 f64::signum(+0.0) == 1.0（IEEE 正号惯例）—— 显式三分：
+        // 正 1 / 负 -1 / 零 0（零 -> 恒假零次，见下方 Some(_) 臂）。
+        let sign3 = |x: f64| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 };
+        let lit_sign = match step_code.as_slice() {
+            [Op::Const(Value::I64(v))] => Some(sign3(*v as f64)),
+            [Op::Const(Value::F32(v))] => Some(sign3(*v as f64)),
+            _ => None,
+        };
+        match lit_sign {
+            // 编译期定向：升序 i<b / i<=b；降序 i>b / i>=b；零 -> 恒假（零次）。
+            Some(s) if s > 0.0 => {
+                if inclusive {
+                    ops.extend(b_code);
+                    ops.push(Op::Local(var.clone()));
+                    ops.push(Op::Lt); // b < i
+                    ops.push(Op::Not); // !(b<i) = i<=b
+                } else {
+                    ops.push(Op::Local(var.clone()));
+                    ops.extend(b_code);
+                    ops.push(Op::Lt); // i < b
+                }
+            }
+            Some(s) if s < 0.0 => {
+                if inclusive {
+                    ops.push(Op::Local(var.clone()));
+                    ops.extend(b_code);
+                    ops.push(Op::Lt); // i < b
+                    ops.push(Op::Not); // !(i<b) = i>=b
+                } else {
+                    ops.extend(b_code);
+                    ops.push(Op::Local(var.clone()));
+                    ops.push(Op::Lt); // b < i = i>b
+                }
+            }
+            Some(_) => {
+                ops.push(Op::Const(Value::Bool(false))); // step 0：恒假零次
+            }
+            // 一般表达式（活方向）：
+            //   开区间 (0<s && i<b) || (s<0 && b<i)
+            //   闭区间 (0<s && i<=b) || (s<0 && i>=b)
+            None => {
+                // 0 < s
+                ops.push(Op::Const(Value::I64(0)));
+                ops.extend(step_code.clone());
+                ops.push(Op::Lt);
+                if inclusive {
+                    ops.extend(b_code.clone());
+                    ops.push(Op::Local(var.clone()));
+                    ops.push(Op::Lt);
+                    ops.push(Op::Not);
+                } else {
+                    ops.push(Op::Local(var.clone()));
+                    ops.extend(b_code.clone());
+                    ops.push(Op::Lt);
+                }
+                ops.push(Op::And);
+                // s < 0
+                ops.extend(step_code);
+                ops.push(Op::Const(Value::I64(0)));
+                ops.push(Op::Lt);
+                if inclusive {
+                    ops.push(Op::Local(var.clone()));
+                    ops.extend(b_code);
+                    ops.push(Op::Lt);
+                    ops.push(Op::Not);
+                } else {
+                    ops.extend(b_code);
+                    ops.push(Op::Local(var.clone()));
+                    ops.push(Op::Lt);
+                }
+                ops.push(Op::And);
+                ops.push(Op::Or);
+            }
+        }
         let jexit = ops.len();
         ops.push(Op::JumpIfNot(0)); // 占位 -> end
         // body（循环栈：continue 目标 = inc）

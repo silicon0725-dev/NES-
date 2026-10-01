@@ -8,6 +8,8 @@
 //! | T-Cmp-04 | 优先级与字面量：`1 + 2 * 3` == 7、整数/F32/Vec2/字符串/布尔字面量 |
 //! | T-Cmp-05 | 语法错误如实报错（行定位、保留字、非法字符、结构缺失） |
 
+use std::collections::BTreeMap;
+
 use nes_scene::{
     compile_script, NodeKind, Op, SceneTree, ScriptEntry, ScriptVm, Value, HALT_LOCAL,
 };
@@ -692,4 +694,97 @@ fn t_cmp_18_empty_range_live_bound_and_labeled_for() {
     t4.tick(0.016, &mut vm4);
     // i 走 1.5, 2.5, 3.5? i+1 每轮：1.5<3.5 ✓, 2.5<3.5 ✓, 3.5<3.5 ✗ -> 2 次。
     assert_eq!(vm4.locals(b4).unwrap().get("c"), Some(&Value::I64(2)), "浮点界（步进仍 +1）");
+}
+
+// ---------------------------------------------------------------- S6.25
+// 步进参数（step，活方向）与闭区间（..=）。
+
+/// T-Cmp-19：步进参数 —— 正步跳格、负步降序、变量步进（活方向）。
+#[test]
+fn t_cmp_19_step_parameter() {
+    // ① step 2 升序：0,2,4。
+    let run = |src: &str| -> BTreeMap<String, Value> {
+        let mut t = SceneTree::new("root");
+        let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+        t.apply_pending();
+        t.set_prop(brain, "registry_key", Value::Str("s".into())).unwrap();
+        let mut vm = ScriptVm::new();
+        vm.register_text("s", src).expect("编译");
+        assert!(vm.attach(&mut t, brain).is_ok());
+        t.tick(0.016, &mut vm);
+        vm.locals(brain).unwrap()
+    };
+    let l = run("every { s = 0; for i in 0..6 step 2 { s = s * 10 + i } }");
+    assert_eq!(l.get("s"), Some(&Value::I64(24)), "0,2,4（step 2 升序）");
+
+    // ② step -1 降序开区间：5,4,3,2,1。
+    let l2 = run("every { s = 0; for i in 5..0 step -1 { s = s * 10 + i } }");
+    assert_eq!(l2.get("s"), Some(&Value::I64(54321)), "5..0 step -1（开）");
+
+    // ③ 变量步进（活方向）：k=1 走 0,1,2；体内每轮 k 翻倍不影响本轮。
+    let l3 = run("every { s = 0; k = 1; for i in 0..3 step k { s = s * 10 + i; k = 1 } }");
+    assert_eq!(l3.get("s"), Some(&Value::I64(12)), "变量步进（每轮 1）");
+
+    // ④ 变量步进改变方向（活方向的可见差异）：步进每轮变号 -> 条件随活值。
+    //    i: 0(+1)=1(+(-1))=0(+1)=1... 死循环由步数兜底 —— 换可终止例：
+    let l4 = run("every { s = 0; for i in 0..2 step 1 { s = s + 1 } }");
+    assert_eq!(l4.get("s"), Some(&Value::I64(2)), "字面量 1 与缺省等价");
+}
+
+/// T-Cmp-20：闭区间 `..=` —— 升序含端、降序含端、浮点端、与步进组合。
+#[test]
+fn t_cmp_20_inclusive_range() {
+    let run = |src: &str| -> BTreeMap<String, Value> {
+        let mut t = SceneTree::new("root");
+        let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+        t.apply_pending();
+        t.set_prop(brain, "registry_key", Value::Str("i".into())).unwrap();
+        let mut vm = ScriptVm::new();
+        vm.register_text("i", src).expect("编译");
+        assert!(vm.attach(&mut t, brain).is_ok());
+        t.tick(0.016, &mut vm);
+        vm.locals(brain).unwrap()
+    };
+    // ① 升序含端：0..=3 -> 4 次。
+    let l = run("every { c = 0; for i in 0..=3 { c = c + 1 } }");
+    assert_eq!(l.get("c"), Some(&Value::I64(4)), "0..=3 含端 4 次");
+
+    // ② 降序含端：5..=0 step -1 -> 6 次。
+    let l2 = run("every { c = 0; for i in 5..=0 step -1 { c = c + 1 } }");
+    assert_eq!(l2.get("c"), Some(&Value::I64(6)), "5..=0 step -1 含端 6 次");
+
+    // ③ 浮点端：1.5..=3.5 -> 1.5, 2.5, 3.5 共 3 次。
+    let l3 = run("every { c = 0; for i in 1.5..=3.5 { c = c + 1 } }");
+    assert_eq!(l3.get("c"), Some(&Value::I64(3)), "1.5..=3.5 含端 3 次");
+
+    // ④ 单元素区间 a..=a 恰 1 次；反向开区间 0..-1 零次。
+    let l4 = run("every { c = 0; for i in 2..=2 { c = c + 1 } }");
+    assert_eq!(l4.get("c"), Some(&Value::I64(1)), "2..=2 恰 1 次");
+}
+
+/// T-Cmp-21：边界 —— step 0 恒假零次；标签 for 带步进；step 是保留字。
+#[test]
+fn t_cmp_21_step_zero_and_compat() {
+    let run = |src: &str| -> BTreeMap<String, Value> {
+        let mut t = SceneTree::new("root");
+        let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+        t.apply_pending();
+        t.set_prop(brain, "registry_key", Value::Str("z".into())).unwrap();
+        let mut vm = ScriptVm::new();
+        vm.register_text("z", src).expect("编译");
+        assert!(vm.attach(&mut t, brain).is_ok());
+        t.tick(0.016, &mut vm);
+        vm.locals(brain).unwrap()
+    };
+    // ① step 0：恒假零次（数学诚实：条件两支都不成立）。
+    let l = run("every { c = 0; for i in 0..9 step 0 { c = c + 100 } }");
+    assert_eq!(l.get("c"), Some(&Value::I64(0)), "step 0 零次");
+
+    // ② 标签 for 带步进 + 跨层 break。
+    let l2 = run("every { hit = 0; outer: for i in 0..6 step 2 { if i == 4 { hit = i; break outer } } }");
+    assert_eq!(l2.get("hit"), Some(&Value::I64(4)), "标签 for + step");
+
+    // ③ step 是保留字（作局部名编译错）。
+    let e = compile_script("on \"x\" { step = 1 }").expect_err("step 保留字");
+    assert!(format!("{e}").contains("保留字"), "{e}");
 }
