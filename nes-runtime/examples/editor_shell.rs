@@ -156,6 +156,8 @@ fn main() {
     let mut prev_click = false;
     // 框选拖拽状态（编辑器会话态 —— 不进事务/不落盘）。
     let mut drag_start: Option<(f32, f32)> = None;
+    // Gizmo 拖拽（选中的对象直接拖动移动）：(uid, 鼠标偏移)。
+    let mut gizmo: Option<(Uid, f32, f32)> = None;
 
     let total: u64 = std::env::var("NES_EDIT_FRAMES")
         .ok()
@@ -231,6 +233,14 @@ fn main() {
                 found
             };
             if let Some(uid) = hit_uid {
+                // Gizmo：点在已选对象上 → 拖拽移动（记录鼠标-对象偏移）。
+                if sel.contains(&uid) {
+                    let tree = rt.tree_mut();
+                    if let Some(id) = tree.find_by_uid(&uid) {
+                        let w = tree.world(id).unwrap_or_default();
+                        gizmo = Some((uid.clone(), mx - w.tx, my - w.ty));
+                    }
+                }
                 if mouse_shift {
                     sel.toggle(uid);
                 } else {
@@ -245,6 +255,36 @@ fn main() {
                 }
             }
         }
+        // Gizmo 拖拽：鼠标移动 → 选中对象跟随（preview 直写，不入账）；
+        // 松开 → Inspector.modify_local 一次事务。
+        if let Some((ref uid, ox, oy)) = gizmo {
+            if mouse_left_held {
+                // preview：直写树位置（会话态，微批次之外）。
+                let tree = rt.tree_mut();
+                if let Some(id) = tree.find_by_uid(&uid) {
+                    let cur = tree.local(id).unwrap_or_default();
+                    tree.set_local(id, Transform2D::from_pos(snap.mouse.x - ox, snap.mouse.y - oy));
+                    let _ = cur;
+                }
+            } else {
+                // 松开：一次事务提交最终位置。
+                let final_pos = {
+                    let tree = rt.tree_mut();
+                    tree.find_by_uid(&uid)
+                        .and_then(|id| tree.local(id))
+                        .map(|t| (t.pos.x, t.pos.y))
+                };
+                if let Some((fx, fy)) = final_pos {
+                    log.begin().unwrap();
+                    Inspector::new(rt.tree_mut(), &mut log)
+                        .modify_local(&uid.clone(), Transform2D::from_pos(fx, fy))
+                        .unwrap();
+                    log.commit().unwrap();
+                }
+                gizmo = None;
+            }
+        }
+
         // 框选拖拽中：mouse up → 选中矩形内全部 Sprite。
         if let Some((sx, sy)) = drag_start {
             if !mouse_left_held {
