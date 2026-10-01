@@ -604,6 +604,10 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 let mut is_int = true;
                 while i < n && (chars[i].is_ascii_digit() || chars[i] == '.') {
                     if chars[i] == '.' {
+                        // 区间分隔符（S6.24）：`0..n` / `1.5..2` —— 数字遇 `..` 停扫。
+                        if i + 1 < n && chars[i + 1] == '.' {
+                            break;
+                        }
                         if !is_int {
                             err!("数字里多余的 `.`");
                         }
@@ -638,6 +642,7 @@ fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
                 && matches!(
                     (c, chars[i + 1]),
                     ('=', '=') | ('<', '=') | ('>', '=') | ('!', '=') | ('&', '&') | ('|', '|')
+                        | ('.', '.')
                 ) =>
             {
                 let pair: String = [c, chars[i + 1]].iter().collect();
@@ -706,9 +711,9 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 12] = [
-    "on", "every", "if", "else", "while", "break", "continue", "emit", "arg", "this", "true",
-    "false",
+const RESERVED: [&str; 14] = [
+    "on", "every", "if", "else", "while", "for", "in", "break", "continue", "emit", "arg",
+    "this", "true", "false",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -832,6 +837,83 @@ impl TextParser {
         }
     }
 
+    /// for 区间迭代体（S6.24）：`for i in a..b { ... }` —— **纯糖**脱糖为
+    /// while 形态，界是**活值**（每次迭代重求值，与手写完全一致）。
+    ///
+    /// 布局用**循环旋转**（continue 安全的关键）：
+    /// ```text
+    /// init:  a; SetLocal(i)
+    ///        Jump(cond)            // 首轮不增量，直达条件
+    /// inc:   i = i + 1             // continue 目标（LoopCtx.top 指此）
+    /// cond:  i < b                 // b 的代码内联 —— 活界
+    ///        JumpIfNot(end)
+    /// body
+    ///        Jump(inc)
+    /// end:
+    /// ```
+    /// continue 落在增量上（不吃增量——否则死循环，经典脱糖坑）；break 到 end。
+    fn for_body(
+        &mut self,
+        ops: &mut Vec<Op>,
+        label: Option<String>,
+    ) -> Result<(), ParseError> {
+        // 已消费 for。循环变量（非保留字标识符）。
+        let var = match self.next().tok {
+            Tok::Ident(v) if !RESERVED.contains(&v.as_str()) => v,
+            _ => return Err(self.err_here("for 需要循环变量名")),
+        };
+        match self.next().tok {
+            Tok::Ident(k) if k == "in" => {}
+            _ => return Err(self.err_here("期望 `in`")),
+        }
+        let mut a_code = Vec::new();
+        self.expr(&mut a_code)?; // 下界
+        if !matches!(&self.peek().tok, Tok::Sym2(s) if s == "..") {
+            return Err(self.err_here("期望 `..` 区间"));
+        }
+        self.pos += 1;
+        let mut b_code = Vec::new();
+        self.expr(&mut b_code)?; // 上界（活值：内联进条件）
+
+        // init
+        ops.extend(a_code);
+        ops.push(Op::SetLocal(var.clone()));
+        let jinit = ops.len();
+        ops.push(Op::Jump(0)); // 占位 -> cond（inc 块长度已知，直接算）
+        // inc（continue 目标）
+        let inc = ops.len();
+        ops.push(Op::Local(var.clone()));
+        ops.push(Op::Const(Value::I64(1)));
+        ops.push(Op::Add);
+        ops.push(Op::SetLocal(var.clone()));
+        // cond
+        let cond = ops.len();
+        ops[jinit] = Op::Jump(cond);
+        ops.push(Op::Local(var.clone()));
+        ops.extend(b_code);
+        ops.push(Op::Lt);
+        let jexit = ops.len();
+        ops.push(Op::JumpIfNot(0)); // 占位 -> end
+        // body（循环栈：continue 目标 = inc）
+        self.expect_sym('{')?;
+        self.loops.push(LoopCtx {
+            top: inc,
+            breaks: Vec::new(),
+            label,
+        });
+        let body = self.stmts(ops);
+        let ctx = self.loops.pop().expect("循环栈配对");
+        body?;
+        self.expect_sym('}')?;
+        ops.push(Op::Jump(inc)); // 回到增量
+        let end = ops.len();
+        ops[jexit] = Op::JumpIfNot(end);
+        for b in ctx.breaks {
+            ops[b] = Op::Jump(end);
+        }
+        Ok(())
+    }
+
     /// while 体（S6.22 抽取；S6.23 增标签参数）。
     fn while_body(
         &mut self,
@@ -913,6 +995,10 @@ impl TextParser {
                 self.pos += 1;
                 self.while_body(ops, None)
             }
+            Tok::Ident(k) if k == "for" => {
+                self.pos += 1;
+                self.for_body(ops, None)
+            }
             Tok::Ident(k) if k == "break" => {
                 self.pos += 1;
                 // 可选标签：`break`（最内层）/ `break name`（由内向外找标签）。
@@ -939,15 +1025,21 @@ impl TextParser {
                 Ok(())
             }
             Tok::Ident(name) => {
-                // 标签语句（S6.23）：`name: while ...` —— 标签只能用于 while。
+                // 标签语句（S6.23/24）：`name: while/for ...`。
                 if matches!(self.peek2().tok, Tok::Sym(':')) {
                     self.pos += 2; // name ':'
-                    if !matches!(&self.peek().tok, Tok::Ident(k) if k == "while") {
-                        return Err(self.err_here("标签只能用于 while"));
+                    match &self.peek().tok {
+                        Tok::Ident(k) if k == "while" => {
+                            self.pos += 1;
+                            self.while_body(ops, Some(name))
+                        }
+                        Tok::Ident(k) if k == "for" => {
+                            self.pos += 1;
+                            self.for_body(ops, Some(name))
+                        }
+                        _ => Err(self.err_here("标签只能用于 while/for")),
                     }
-                    self.pos += 1; // while
-                    return self.while_body(ops, Some(name));
-                }
+                } else {
                 // 保留字里只有 `this` 可作成员赋值目标（this.pos = ...）；
                 // 其余（arg = 1 之类）在裸局部路径拒绝。
                 let reserved = RESERVED.contains(&name.as_str());
@@ -984,8 +1076,9 @@ impl TextParser {
                 } else {
                     Err(self.err_here("期望 `=` 赋值"))
                 }
+                }
             }
-            _ => Err(self.err_here("期望语句（赋值 / if / emit）")),
+            _ => Err(self.err_here("期望语句（赋值 / if / while / for / break / continue / emit）")),
         }
     }
 

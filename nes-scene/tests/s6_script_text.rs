@@ -566,3 +566,130 @@ fn t_cmp_15_label_errors_and_rules() {
     let jumps = s.ops.iter().filter(|o| matches!(o, Op::Jump(_))).count();
     assert!(jumps >= 2, "break 与尾跳存在：{jumps}");
 }
+
+// ---------------------------------------------------------------- S6.24
+// for 区间迭代（纯糖脱糖 while；界活值；循环旋转 continue 安全）。
+
+/// T-Cmp-16：基本迭代 —— 0..4 累加 0+1+2+3=6；循环变量循环后留存（退出值 4）。
+#[test]
+fn t_cmp_16_for_range_basic_and_var_survives() {
+    let src = r#"
+every {
+    s = 0
+    for i in 0..4 {
+        s = s + i
+    }
+}
+"#;
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("fr".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("fr", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    let l = vm.locals(brain).unwrap();
+    assert_eq!(l.get("s"), Some(&Value::I64(6)), "0+1+2+3");
+    assert_eq!(l.get("i"), Some(&Value::I64(4)), "循环变量留存（退出值）");
+    assert!(!l.contains_key(HALT_LOCAL));
+}
+
+/// T-Cmp-17：continue 不吃增量（循环旋转的关键证明）—— 跳过 2 不死循环。
+#[test]
+fn t_cmp_17_continue_runs_increment() {
+    let src = r#"
+every {
+    s = 0
+    for i in 0..5 {
+        if i == 2 {
+            continue
+        }
+        s = s + i
+    }
+    after = 1
+}
+"#;
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("fc".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text("fc", src).expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    let l = vm.locals(brain).unwrap();
+    assert_eq!(l.get("s"), Some(&Value::I64(8)), "0+1+3+4（跳 2 且不死循环）");
+    assert_eq!(l.get("i"), Some(&Value::I64(5)));
+    assert_eq!(l.get("after"), Some(&Value::I64(1)), "循环后语句执行");
+    assert!(!l.contains_key(HALT_LOCAL), "不靠步数兜底");
+}
+
+/// T-Cmp-18：空区间（4..0 零次）；活界（体内改界生效）；标签 for + break name。
+#[test]
+fn t_cmp_18_empty_range_live_bound_and_labeled_for() {
+    // ① 空区间零次。
+    let mut t = SceneTree::new("root");
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(brain, "registry_key", Value::Str("fe".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register_text(
+        "fe",
+        "every { s = 0; for i in 4..0 { s = s + 100 } }",
+    )
+    .expect("编译");
+    assert!(vm.attach(&mut t, brain).is_ok());
+    t.tick(0.016, &mut vm);
+    assert_eq!(vm.locals(brain).unwrap().get("s"), Some(&Value::I64(0)), "空区间零次");
+
+    // ② 活界：界是局部，体内每轮缩减 -> 提前终止（糖=手写 while 的可见差异）。
+    let mut t2 = SceneTree::new("root");
+    let b2 = t2.add_node(t2.root(), "b", NodeKind::Script);
+    t2.apply_pending();
+    t2.set_prop(b2, "registry_key", Value::Str("fl".into())).unwrap();
+    let mut vm2 = ScriptVm::new();
+    vm2.register_text(
+        "fl",
+        "every { n = 3; rounds = 0; for i in 0..n { n = n - 1; rounds = rounds + 1 } }",
+    )
+    .expect("编译");
+    assert!(vm2.attach(&mut t2, b2).is_ok());
+    t2.tick(0.016, &mut vm2);
+    let l = vm2.locals(b2).unwrap();
+    // i=0: n 3->2; i=1: n 2->1; i=2? cond 2<n=1 假 -> 停。rounds=2。
+    assert_eq!(l.get("rounds"), Some(&Value::I64(2)), "活界提前终止");
+    assert_eq!(l.get("n"), Some(&Value::I64(1)));
+
+    // ③ 标签 for + 跨层 break。
+    let mut t3 = SceneTree::new("root");
+    let b3 = t3.add_node(t3.root(), "b", NodeKind::Script);
+    t3.apply_pending();
+    t3.set_prop(b3, "registry_key", Value::Str("ft".into())).unwrap();
+    let mut vm3 = ScriptVm::new();
+    vm3.register_text(
+        "ft",
+        "every { hit = 0; outer: for i in 0..3 { for j in 0..9 { if i * 10 + j == 15 { hit = i * 10 + j; break outer } } } }",
+    )
+    .expect("编译");
+    assert!(vm3.attach(&mut t3, b3).is_ok());
+    t3.tick(0.016, &mut vm3);
+    assert_eq!(
+        vm3.locals(b3).unwrap().get("hit"),
+        Some(&Value::I64(15)),
+        "标签 for 跨层 break"
+    );
+
+    // ④ 浮点界（1.5..3 走 F32 比较）。
+    let mut t4 = SceneTree::new("root");
+    let b4 = t4.add_node(t4.root(), "b", NodeKind::Script);
+    t4.apply_pending();
+    t4.set_prop(b4, "registry_key", Value::Str("ff".into())).unwrap();
+    let mut vm4 = ScriptVm::new();
+    vm4.register_text("ff", "every { c = 0; for i in 1.5..3.5 { c = c + 1 } }")
+        .expect("编译");
+    assert!(vm4.attach(&mut t4, b4).is_ok());
+    t4.tick(0.016, &mut vm4);
+    // i 走 1.5, 2.5, 3.5? i+1 每轮：1.5<3.5 ✓, 2.5<3.5 ✓, 3.5<3.5 ✗ -> 2 次。
+    assert_eq!(vm4.locals(b4).unwrap().get("c"), Some(&Value::I64(2)), "浮点界（步进仍 +1）");
+}
