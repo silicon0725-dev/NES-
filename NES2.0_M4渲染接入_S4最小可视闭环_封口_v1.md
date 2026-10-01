@@ -636,6 +636,17 @@ cargo run --example s41_visual_closure
 > Inspector = 选择节点数据投影，一切修改经适配器 → TransactionLog。
 > 操作：Tab 循环选择 / 方向键移动 / Delete 删子树 / Ctrl+Z·Y
 > undo·redo。**T-ESH-01** 无头验证状态模型全链。全仓 471 绿。
+> **v1.70 注记（S9 线收官）**：S9 CLOSED —— Persistent Identity →
+> Transaction → Editor Object Model 全链闭环（S9-0 FROZEN / S9-1
+> CLOSED / S9-2 CLOSED / S9-3 FROZEN / S9-3a CLOSED / S9-3b
+> CLOSED）。**S9 零 VM 语言增量**：S8 回答"Runtime Entity Model
+> 能否支撑真实项目"，S9 回答"Runtime/Project Model 能否成为编辑器
+> 数据基础"。后续编辑器扩展全部后置（多选/框选/Gizmo 控件/跨文件
+> 事务/信号化通知/自动拦截/VM undo/协作 merge），扩展纪律 =
+> **UI 投影 / Editor Core 操作 / Transaction 历史 / SceneTree 结构 /
+> uid 身份**。当前基线：471 测试 / 11 守卫 / clippy 零 / Dodge ABI
+> / 六份异构项目证据。下一阶段候选：S10 编辑器产品化扩展（按上述
+> 纪律逐项解锁后置清单）或第二完整游戏项目。
 
 | 事项 | 状态 |
 |---|---|

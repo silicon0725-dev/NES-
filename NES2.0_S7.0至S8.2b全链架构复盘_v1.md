@@ -163,6 +163,29 @@ preorder 身份在 delete/rename/undo 面前不稳定 —— Persistent
 NodeId 从"未来设计"变为"实际工程需求"）；路线 S9-0 契约 →
 S9-1 对象模型 → S9-2 变更/事务 → S9-3 Inspector/选择/层级。
 
+## 5.6 S9 收官补记（S9-3a..S9-3b 评审后）
+
+S9 正式收官：**Persistent Identity → Transaction → Editor Object
+Model** 全链闭环。核心架构验证：**Editor Shell 是投影层** —— UI
+只消费 `uid + TransactionLog + Selection/Inspector/Hierarchy`，
+零自有状态零自有语义。S9 **没有给 VM 增加任何语言能力**：
+S8 解决"Runtime Entity Model 能否支撑真实项目"，S9 解决"这个
+Runtime/Project Model 能否成为真正编辑器的数据基础"—— 都已
+经实现 + 回归网验证。
+
+```text
+Persistent UID ──┬── Runtime Handle（arena resolve）
+                 ├── Transaction History（原 uid 复活）
+                 └── Editor State（Selection/Inspector/Hierarchy）
+                          ↓
+                    Editor Shell（Projection）
+```
+
+后续编辑器扩展（多选/框选/Gizmo/Inspector 控件/子场景跨文件事务/
+通知信号化/自动拦截/VM locals undo/协作 merge）全部后置 ——
+都不属于 S9 完成条件。扩展纪律：**UI 是投影，Editor Core 是操作层，
+Transaction 是历史，SceneTree 是结构，uid 是身份**。
+
 ## 6. 复盘结论
 
 - 九里程碑无回退项；三条新原则、两条待裁、两道封口令入档；
