@@ -815,3 +815,53 @@ fn t_ed_01_editor_object_system() {
     let b = nes_runtime::headless::run(&root, "editor.ron", &trace, 100, 1.0 / 60.0).unwrap();
     assert_eq!(a.trace_hash, b.trace_hash);
 }
+
+/// T-FARM-01（S10-0）：**Seed & Harvest** 第二项目 —— 非战斗游戏
+/// 闭环（种植→生长→收获→经济→胜利），headless 确定性。
+#[test]
+fn t_farm_01_seed_and_harvest() {
+    let _g = lock();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    let trace_text = "# 种 p0 → 等待生长（~100 tick）→ 收获 → 种 p1 → WIN\n0 key_down Num1\n20 key_up Num1\n150 key_down Num2\n170 key_up Num2\n400 key_down Num3\n420 key_up Num3\n700 key_down Num4\n720 key_up Num4\n";
+    let trace = nes_render_api::input::parse_trace(trace_text).expect("轨迹");
+
+    let mut rt = nes_runtime::NesRuntime::open_headless(&root).unwrap();
+    rt.load_scene("farm.ron").unwrap();
+    let mut vm = nes_scene::ScriptVm::new();
+    let table = rt.resources_mut().clone();
+    let issues = vm.attach_all_with_sources(rt.tree_mut(), &table, &mut |rel| {
+        std::fs::read_to_string(root.join(rel)).map_err(|e| e.to_string())
+    });
+    assert!(issues.is_empty(), "{issues:?}");
+    rt.mount_input_view(&mut vm);
+
+    let mut win_at = None;
+    for f in 0..900u64 {
+        for t in trace.iter().filter(|t| t.frame == f) {
+            for ev in &t.events {
+                nes_render_wgpu::window::inject_input(*ev);
+            }
+        }
+        let snap = rt.collect_input();
+        let _ = rt.emit_input_signals(&snap);
+        let _ = rt.step_headless(1.0 / 60.0, &mut vm);
+        if f % 30 == 0 {
+            let hud = {
+                let tree = rt.tree_mut();
+                tree.find(&nes_scene::NodePath::parse("/main/hud").unwrap())
+                    .and_then(|n| tree.prop(n, "text").cloned())
+            };
+            if let Some(nes_scene::Value::Str(s)) = hud {
+                if s.contains("WIN") {
+                    win_at = Some(f);
+                    break;
+                }
+            }
+        }
+    }
+    assert!(win_at.is_some(), "种→长→收→WIN 在 900 帧内达成（非战斗闭环）");
+
+    let a = nes_runtime::headless::run(&root, "farm.ron", &trace, 300, 1.0 / 60.0).unwrap();
+    let b = nes_runtime::headless::run(&root, "farm.ron", &trace, 300, 1.0 / 60.0).unwrap();
+    assert_eq!(a.trace_hash, b.trace_hash, "确定性");
+}
