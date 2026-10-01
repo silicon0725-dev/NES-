@@ -358,6 +358,19 @@ cargo run --example s41_visual_closure
 > 冲洗入画；connect/disconnect 不是 Cmd —— 回调不可改接线）。
 > 新增 T-RS-01..04（含 02b/03b）与 T-RS-R1，scene 升至 172、runtime
 > 至 32（全仓合计 407，文档见 `NES2.0_S7.1运行时语义冻结_v1.md`）。
+> **v1.44 注记（S7.2 输入系统）**：四层管线落地 —— 平台（Win32 消息
+> → 中性 `InputEvent` 队列，容量 1024，VK→`Key` 映射）/ 契约
+>（render-api `input` 模块：`InputCollector` 事件流 → 帧快照，**闩锁
+> 边缘**）/ 运行时（`collect_input` + `emit_input_signals` 标准
+> `input/*` 信号 + `mount_key_probe`）/ 消费（事件式 `on
+> "input/key_down"`（arg=键名）与轮询式 `key("名")` 探针 —— 未接
+> 探针停机）。Keyboard/Mouse/TextInput/Window 四路分开；**WM_CHAR
+> 从引擎 API 退役**（`drain_chars`/`inject_char` 删除，面板迁移到
+> 快照 text）。实证三修：泵只翻译按下族（KEYUP 异常 lparam 的幻影
+> 字符）、闩锁边缘（同帧按下+抬起不再不可见）、首帧鼠标增量只建基准。
+> 新增 T-In-C01..03 / T-In-VM-01..02 / T-In-01..02（重写）/ T-In-R1..02，
+> scene 174、api 43、wgpu 88、runtime 34（全仓合计 415，文档见
+> `NES2.0_S7.2输入系统_v1.md`）。
 
 | 事项 | 状态 |
 |---|---|

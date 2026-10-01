@@ -7,10 +7,10 @@
 //!   - `in >` 输入行（键入即回显 + 光标 `_`；退格删除；回车提交）；
 //!   - `st >` 状态行（OK 重载 / 错误信息 —— 出错时精灵保持旧行为）。
 //!
-//! 输入链：WM_CHAR -> 窗口字符队列（`drain_chars`）-> 宿主编辑解释
-//!（0x08 退格 / 0x0D 提交 / 可打印追加）-> set_prop source ->
-//! `vm.poll_reloads` -> 下一帧行为变化。**引擎用自己的渲染管线
-//! 显示自己的编辑器**。
+//! 输入链（S7.2 升级）：平台消息 -> 中性事件队列 -> `rt.collect_input`
+//! 帧快照 -> text 字段 -> 宿主编辑解释（0x08 退格 / 0x0D 提交 /
+//! 可打印追加）-> set_prop source -> `vm.poll_reloads` -> 下一帧
+//! 行为变化。**引擎用自己的渲染管线显示自己的编辑器**。
 //!
 //! 运行：`cargo run --example script_panel`
 //! 自动化钩子：`NES_PANEL_FRAMES=N`（N 帧后退出）、
@@ -22,7 +22,8 @@ use nes_render_api::{FrameInfo, Vec2};
 use nes_render_extract::{
     PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE,
 };
-use nes_render_wgpu::window::{drain_chars, inject_char};
+use nes_render_api::input::InputEvent;
+use nes_render_wgpu::window::inject_input;
 use nes_render_wgpu::{bmp, FontParams};
 use nes_runtime::{write_bmp_rgba, NesRuntime};
 use nes_scene::{NodeKind, NodeId, ScriptVm, Transform2D, Value};
@@ -217,15 +218,16 @@ fn main() {
             if let Some(script) = typed.as_deref() {
                 panel.input.clear();
                 for ch in script.chars() {
-                    inject_char(ch as u32);
+                    inject_input(InputEvent::Char(ch as u32));
                 }
-                inject_char(0x0D);
+                inject_input(InputEvent::Char(0x0D));
             }
         }
         // 宿主节拍：每帧发 step（脚本行为的驱动源）。
         rt.tree_mut().emit_signal("step", Value::I64(0));
-        // 输入解释：入队字符 -> 编辑缓冲；回车 -> 提交热重载。
-        for code in drain_chars() {
+        // 输入解释：帧输入快照的 text 字段（WM_CHAR 在这层已经不是 API）
+        // -> 编辑缓冲；回车 -> 提交热重载。
+        for code in rt.collect_input().text {
             if panel.feed(code) {
                 let src = panel.input.clone();
                 rt.tree_mut().set_prop(brain, "source", Value::Str(src)).unwrap();

@@ -37,10 +37,13 @@
 //! "改磁盘文件 -> 下一帧画面变化"的完整链路。
 
 use std::collections::BTreeMap;
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 use nes_asset::{AssetKey, AssetKind, AssetRegistry, FsLoader, ReloadReport};
-use nes_render_api::{FrameInfo, RenderAssetKey, RenderCommand};
+use nes_render_api::input::{InputCollector, InputSnapshot};
+use nes_render_api::{FrameInfo, RenderAssetKey, RenderCommand, Vec2};
 use nes_render_wgpu::FrameStats;
 use nes_render_extract::RenderExtractor;
 use nes_render_wgpu::bmp;
@@ -48,11 +51,11 @@ use nes_render_wgpu::{
     BackendError, CommandConsumer, FrameOutcome, GpuContext, RenderTarget, SpriteAtlas,
     SurfaceTarget, WgpuRenderServer,
 };
-use nes_render_wgpu::window::Window;
+use nes_render_wgpu::window::{drain_input, Window};
 use nes_scene::scene_io::{instantiate_doc_with_resources, parse_ron, write_ron_with_resources};
 use nes_scene::{
     AdoptReport, BindReport, NoObserver, PackOptions, ResId, ResourceTable, SceneDoc, SceneObserver,
-    SceneTree, TableError,
+    SceneTree, ScriptVm, TableError, Value,
 };
 
 /// 组装好的引擎帧循环。
@@ -80,6 +83,10 @@ pub struct NesRuntime {
     /// 当前场景的磁盘来源（`load_scene` 记录、`instantiate_scene` 清除）——
     /// 子场景热重载的入口：任一 Scene 类资产变化 -> 从来源整树重载。
     scene_source: Option<String>,
+    /// 输入折叠器（S7.2：平台事件流 -> 帧快照）。
+    input_collector: InputCollector,
+    /// 输入快照共享槽（键探针读它 —— `mount_key_probe` 接线）。
+    input_state: Rc<RefCell<InputSnapshot>>,
 }
 
 impl NesRuntime {
@@ -149,6 +156,8 @@ impl NesRuntime {
             window: None,
             surface: None,
             scene_source: None,
+            input_collector: InputCollector::new(),
+            input_state: Rc::new(RefCell::new(InputSnapshot::default())),
         })
     }
 
@@ -385,6 +394,94 @@ impl NesRuntime {
     /// 把资源表接到资产注册表（注册 -> 加载 -> 场景持有；幂等）。
     pub fn bind_assets(&mut self) -> BindReport {
         self.table.bind(&mut self.registry)
+    }
+
+    // ---------- 输入（S7.2：平台事件 -> 帧快照 -> 标准信号/探针）----------
+
+    /// 收集本帧输入：排空平台事件队列 -> 折叠成快照（边缘 + 按住态）。
+    ///
+    /// 每帧调用一次（`frame*` 之前）；同时更新共享快照（键探针读它，
+    /// 见 [`Self::mount_key_probe`]）。离屏模式同样可用 —— 无真实消息
+    /// 时快照为空，`inject_input` 注入的事件照常折叠（自动化/headless）。
+    pub fn collect_input(&mut self) -> InputSnapshot {
+        for ev in drain_input() {
+            self.input_collector.push(ev);
+        }
+        let snap = self.input_collector.frame();
+        *self.input_state.borrow_mut() = snap.clone();
+        snap
+    }
+
+    /// 把快照的**边缘**发射成标准 `input/*` 信号（宿主预发纪律：在
+    /// `frame*` 之前调用，信号当帧入泵 —— S7.1 黄金帧序）。返回发射数。
+    ///
+    /// 信号名契约（载荷）：
+    /// - `input/key_down` / `input/key_up`（Str 键名，[`Key::name`] 口径）
+    /// - `input/mouse_move`（Vec2 位置；仅本帧有位移时）
+    /// - `input/mouse_down` / `input/mouse_up`（Str "left"/"right"/"middle"）
+    /// - `input/text`（Str 本帧提交的字符 —— 非 UTF-16 合法标量的单元
+    ///   被丢弃并如实计数在返回值外不装；一次一条整帧文本）
+    /// - `input/window/resized`（Vec2 新客户区尺寸）
+    ///
+    /// 按住态（轮询）不走信号 —— 脚本用 `key("名")` 探针读。
+    pub fn emit_input_signals(&mut self, snap: &InputSnapshot) -> usize {
+        let mut n = 0usize;
+        let emit = |tree: &mut SceneTree, name: &str, v: Value| {
+            tree.emit_signal(name, v);
+        };
+        for k in &snap.pressed {
+            emit(self.tree_mut(), "input/key_down", Value::Str(k.name()));
+            n += 1;
+        }
+        for k in &snap.released {
+            emit(self.tree_mut(), "input/key_up", Value::Str(k.name()));
+            n += 1;
+        }
+        if snap.mouse_delta != Vec2::new(0.0, 0.0) {
+            emit(
+                self.tree_mut(),
+                "input/mouse_move",
+                Value::Vec2(nes_scene::Vec2::new(snap.mouse.x, snap.mouse.y)),
+            );
+            n += 1;
+        }
+        for (i, name) in ["left", "right", "middle"].into_iter().enumerate() {
+            if snap.buttons_pressed[i] {
+                emit(self.tree_mut(), "input/mouse_down", Value::Str(name.into()));
+                n += 1;
+            }
+            if snap.buttons_released[i] {
+                emit(self.tree_mut(), "input/mouse_up", Value::Str(name.into()));
+                n += 1;
+            }
+        }
+        if !snap.text.is_empty() {
+            let text: String = snap
+                .text
+                .iter()
+                .filter_map(|&c| char::from_u32(c))
+                .collect();
+            emit(self.tree_mut(), "input/text", Value::Str(text));
+            n += 1;
+        }
+        if let Some((w, h)) = snap.resized {
+            emit(
+                self.tree_mut(),
+                "input/window/resized",
+                Value::Vec2(nes_scene::Vec2::new(w as f32, h as f32)),
+            );
+            n += 1;
+        }
+        n
+    }
+
+    /// 给脚本 VM 接键探针（`key("名")` -> 本帧快照 `is_down`）。
+    ///
+    /// 装一次即可（共享槽：之后每帧 `collect_input` 自动刷新读数）。
+    /// VM 不碰平台 —— 与文件读取器同一注入纪律（S6.33/S7.2）。
+    pub fn mount_key_probe(&self, vm: &mut ScriptVm) {
+        let state = self.input_state.clone();
+        vm.set_key_probe(Rc::new(move |name: &str| state.borrow().is_down(name)));
     }
 
     /// 轮询文件变化（内容戳判定）。变化后调用 [`Self::upload_pending_textures`] 重传。

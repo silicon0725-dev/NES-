@@ -10,9 +10,11 @@
 //! # 语义（刻意最小）
 //!
 //! - 窗口关闭（点 X）=> [`Window::pump`] 返回 `false`，宿主随之退出帧循环；
-//! - 不处理 DPI / 重绘 / 输入：S6.1 只需要"有一个能被 surface 呈现的客户区"；
-//! - **固定尺寸**：surface 按创建时的客户区配置，窗口 resize 的重配置
-//!   （`WM_SIZE` -> `wgpuSurfaceConfigure`）属后续里程碑，见 S6 文档遗留。
+//! - **输入（S7.2）**：键/字符/鼠标/尺寸消息映射成中性 `InputEvent`
+//!   入进程级队列（[`drain_input`]），折叠与消费在契约层/运行时 ——
+//!   平台层只投递事实，**WM_CHAR 不是引擎 API**；
+//! - 不处理 DPI / 重绘；**固定尺寸**：surface 按创建时的客户区配置，
+//!   `WM_SIZE` 只入事件队列（表面重配置属后续里程碑，见 S6 文档遗留）。
 
 use core::ffi::c_void;
 use core::ptr;
@@ -23,34 +25,96 @@ const SW_SHOW: i32 = 5;
 const WM_DESTROY: u32 = 0x0002;
 const WM_QUIT: u32 = 0x0012;
 const PM_REMOVE: u32 = 0x0001;
-/// 字符输入（S6.34 编辑器面板的最小输入面）。
+// ---- 输入面（S7.2：平台消息 → 中性事件）----
+const WM_SIZE: u32 = 0x0005;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
 const WM_CHAR: u32 = 0x0102;
+/// Alt 路径的按键按下（字符合成同覆盖）。
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_RBUTTONDOWN: u32 = 0x0205;
+const WM_RBUTTONUP: u32 = 0x0206;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+// 虚拟键（Win32）。
+const VK_BACK: u32 = 0x08;
+const VK_TAB: u32 = 0x09;
+const VK_SHIFT: u32 = 0x10;
+const VK_CONTROL: u32 = 0x11;
+const VK_MENU: u32 = 0x12;
+const VK_RETURN: u32 = 0x0D;
+const VK_ESCAPE: u32 = 0x1B;
+const VK_SPACE: u32 = 0x20;
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
+const VK_DOWN: u32 = 0x28;
 
-/// 进程级字符输入队列（`WM_CHAR` 落进 `wnd_proc` 时入队）。
+use nes_render_api::input::{InputEvent, Key, MouseButton};
+
+/// 进程级中性输入事件队列（`wnd_proc` 里平台消息映射后入队；宿主每帧
+/// `drain_input` 取走交给 [`nes_render_api::input::InputCollector`]）。
 ///
-/// **单窗口口径**：本引擎的帧循环一次驱动一个窗口，队列不区分来源
-/// （多窗口同时泵会串键 —— 编辑器面板是首个消费者，多窗口输入属后续）。
-/// [`inject_char`] 是同队列的程序化入口（自动化测试 / 辅助技术路径）。
-///
-/// **容量上限**（收束阶段）：宿主不排空时队列也不无界增长 —— 满时
-/// 丢弃新字符（键盘语义：按住不放也只排这么多）。
-static TYPED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// **单窗口口径**：队列不区分来源窗口（一进程一窗口）；**容量上限**
+/// （S7.0 纪律）：宿主不排空也不无界增长，满时丢新。
+/// [`inject_input`] 是同队列的程序化入口（自动化测试 / headless 合成）。
+/// **WM_CHAR 不是引擎 API**：字符码在这层折成 `InputEvent::Char`，
+/// 引擎与脚本消费的是快照的 `text` 字段。
+static EVENTS: Mutex<Vec<InputEvent>> = Mutex::new(Vec::new());
 
-/// 队列容量上限（字符数）。
-const TYPED_CAP: usize = 4096;
+/// 队列容量上限（事件数）。
+const EVENTS_CAP: usize = 1024;
 
-/// 取走全部已入队的字符（按到达序）。
-pub fn drain_chars() -> Vec<u32> {
-    let mut guard = TYPED.lock().unwrap_or_else(|p| p.into_inner());
+/// 取走全部已入队的输入事件（按到达序）。
+pub fn drain_input() -> Vec<InputEvent> {
+    let mut guard = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
     std::mem::take(&mut *guard)
 }
 
-/// 程序化注入一个字符（与真实按键同队列；自动化测试与示例演示用）。
-/// 队列满时丢弃（见 [`TYPED_CAP`]）。
-pub fn inject_char(code: u32) {
-    let mut guard = TYPED.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.len() < TYPED_CAP {
-        guard.push(code);
+/// 程序化注入一个输入事件（与真实消息同队列；自动化测试用）。
+/// 队列满时丢弃（见 [`EVENTS_CAP`]）。
+pub fn inject_input(ev: InputEvent) {
+    let mut guard = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.len() < EVENTS_CAP {
+        guard.push(ev);
+    }
+}
+
+/// Win32 虚拟键 → 中性 [`Key`]。
+///
+/// Win32 的 `WM_KEYDOWN` 缺省**不分左右修饰**（`VK_SHIFT` 一个码）——
+/// 统一记到左侧变体（`LShift` 等），需要区分左右的宿主走增强路径
+///（raw input / scancode），属后续。未列举键保留原码（`Other`）。
+pub fn vk_to_key(vk: u32) -> Key {
+    const LETTERS: [Key; 26] = [
+        Key::A, Key::B, Key::C, Key::D, Key::E, Key::F, Key::G, Key::H, //
+        Key::I, Key::J, Key::K, Key::L, Key::M, Key::N, Key::O, Key::P, //
+        Key::Q, Key::R, Key::S, Key::T, Key::U, Key::V, Key::W, Key::X, //
+        Key::Y, Key::Z,
+    ];
+    const DIGITS: [Key; 10] = [
+        Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, //
+        Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9,
+    ];
+    match vk {
+        0x41..=0x5A => LETTERS[(vk - 0x41) as usize],
+        0x30..=0x39 => DIGITS[(vk - 0x30) as usize],
+        VK_BACK => Key::Backspace,
+        VK_TAB => Key::Tab,
+        VK_SHIFT => Key::LShift,
+        VK_CONTROL => Key::LCtrl,
+        VK_MENU => Key::LAlt,
+        VK_RETURN => Key::Enter,
+        VK_ESCAPE => Key::Escape,
+        VK_SPACE => Key::Space,
+        VK_LEFT => Key::ArrowLeft,
+        VK_UP => Key::ArrowUp,
+        VK_RIGHT => Key::ArrowRight,
+        VK_DOWN => Key::ArrowDown,
+        other => Key::Other(other),
     }
 }
 
@@ -129,7 +193,8 @@ extern "system" {
     fn GetModuleHandleW(name: *const u16) -> *mut c_void;
 }
 
-/// 窗口过程：只处理销毁（`WM_DESTROY` -> 投递退出消息），其余走默认过程。
+/// 窗口过程：销毁 → 投递退出消息；输入消息 → 中性事件入队（S7.2，
+/// 映射见 [`vk_to_key`]）；其余走默认过程。
 unsafe extern "system" fn wnd_proc(
     hwnd: *mut c_void,
     msg: u32,
@@ -140,14 +205,40 @@ unsafe extern "system" fn wnd_proc(
         unsafe { PostQuitMessage(0) };
         return 0;
     }
-    if msg == WM_CHAR {
-        // 键盘字符入队（回车 \r、退格 \x08 也在其中 —— 面板的编辑语义
-        // 由宿主解释，窗口层只投递事实）。wparam 是字符码（UTF-16 单元）。
-        // 经 inject_char 入队：与程序化注入共用同一容量上限。
-        inject_char(wparam as u32);
-        return 0;
+    if let Some(ev) = input_event_of(msg, wparam, lparam) {
+        inject_input(ev);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// 平台消息 → 中性输入事件（非输入消息返回 `None`）。
+///
+/// lparam 打包口径：鼠标 x/y 各 16 位有符号（客户区像素，多显示器可
+/// 为负）；WM_SIZE 宽高各 16 位无符号。WM_CHAR 的 wparam 是 UTF-16
+/// 单元原码（代理对重组属后续，见 S7.2 文档遗留）。
+fn input_event_of(msg: u32, wparam: usize, lparam: isize) -> Option<InputEvent> {
+    let lo = (lparam & 0xFFFF) as u16;
+    let hi = ((lparam >> 16) & 0xFFFF) as u16;
+    match msg {
+        WM_KEYDOWN => Some(InputEvent::Key { key: vk_to_key(wparam as u32), down: true }),
+        WM_KEYUP => Some(InputEvent::Key { key: vk_to_key(wparam as u32), down: false }),
+        WM_CHAR => Some(InputEvent::Char(wparam as u32)),
+        WM_MOUSEMOVE => Some(InputEvent::MouseMove {
+            x: lo as i16 as f32,
+            y: hi as i16 as f32,
+        }),
+        WM_LBUTTONDOWN => Some(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+        WM_LBUTTONUP => Some(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+        WM_RBUTTONDOWN => Some(InputEvent::MouseButton { button: MouseButton::Right, down: true }),
+        WM_RBUTTONUP => Some(InputEvent::MouseButton { button: MouseButton::Right, down: false }),
+        WM_MBUTTONDOWN => Some(InputEvent::MouseButton { button: MouseButton::Middle, down: true }),
+        WM_MBUTTONUP => Some(InputEvent::MouseButton { button: MouseButton::Middle, down: false }),
+        WM_SIZE => Some(InputEvent::Resize {
+            w: lo as u32,
+            h: hi as u32,
+        }),
+        _ => None,
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -282,10 +373,12 @@ impl Window {
             if msg.message == WM_QUIT {
                 return false;
             }
-            unsafe {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            // 只对按键按下族做 Translate（字符合成只应来自按下 —— 带异常
+            // lparam 的 KEYUP / 注入消息不再产生幻影字符；S7.2 实证）。
+            if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
+                unsafe { TranslateMessage(&msg) };
             }
+            unsafe { DispatchMessageW(&msg) };
         }
     }
 }

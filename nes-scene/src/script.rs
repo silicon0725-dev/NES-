@@ -106,6 +106,10 @@ pub enum Op {
     /// 弹下标（I64）、弹 Str，压**单字符 Str**（无 char 类型，一字符串即
     /// 字符的表达）。按字符索引；负数或 >= 长度停机记 `__halt`（附下标）。
     StrIndex,
+    /// 弹 Str 键名，问**宿主注入的输入探针**该键是否按住，压 Bool
+    ///（S7.2：VM 不碰平台 —— 探针由运行时接 `InputSnapshot::is_down`）。
+    /// 未注入探针停机（如实：没接就是没有，不装"恒假"）。
+    Key,
 }
 
 /// 脚本入口。
@@ -179,6 +183,7 @@ fn run<'a, 'b>(
     locals: &mut BTreeMap<String, Value>,
     ctx: &mut VmCtx<'a, 'b>,
     arg: Value,
+    probe: &ProbeSlot,
 ) {
     let mut stack: Vec<StackVal> = Vec::new();
     let mut pc = 0usize;
@@ -456,6 +461,17 @@ fn run<'a, 'b>(
                 let ch = s.chars().nth(i as usize).expect("已校验范围");
                 stack.push(StackVal::V(Value::Str(ch.to_string())));
             }
+            Op::Key => {
+                let a = pop_val!();
+                let Value::Str(name) = a else {
+                    halt!("key(..) 需要 Str 键名");
+                };
+                // 槽内克隆再调用：探针闭包只读快照，不回调进 VM（无重入）。
+                let Some(p) = probe.borrow().clone() else {
+                    halt!(format!("key(\"{name}\") 未接输入探针（宿主未注入）"));
+                };
+                stack.push(StackVal::V(Value::Bool(p(&name))));
+            }
         }
         pc += 1;
     }
@@ -469,9 +485,15 @@ fn num_of(v: &Value) -> Option<f32> {
     }
 }
 
+/// 键探针（宿主注入的 `key("名") -> Bool` 求值源；VM 不碰平台）。
+pub type KeyProbe = Rc<dyn Fn(&str) -> bool>;
+
+/// 探针共享槽：信号处理器闭包（装进树的处理器表）与 process 路径
+/// （留在 VM 里）共享同一份 —— attach 后 `set_key_probe` 也立即生效。
+type ProbeSlot = Rc<RefCell<Option<KeyProbe>>>;
+
 /// 脚本 VM：注册表 + 每脚本局部状态（跨调用持久 —— 计数器/累积器语义）。
-pub struct ScriptVm {
-    /// 键 -> 脚本（宿主登记 + 内嵌派生键）。
+pub struct ScriptVm {    /// 键 -> 脚本（宿主登记 + 内嵌派生键）。
     scripts: BTreeMap<String, Script>,
     /// 节点 -> 局部状态（闭包与观察者路径共享同一份）。
     states: Rc<RefCell<HashMap<NodeId, BTreeMap<String, Value>>>>,
@@ -487,6 +509,9 @@ pub struct ScriptVm {
     /// 节点 -> 该节点的信号连接句柄（S6.32）。重挂载**先断旧再接新**
     /// —— 否则每次 attach 叠加一条连接、信号命中多次（潜伏缺口实证修复）。
     node_conn: HashMap<NodeId, crate::tree::SignalConnectionId>,
+    /// 键探针槽（S7.2）：宿主经 [`Self::set_key_probe`] 注入；信号处理器
+    /// 闭包与 process 路径共享同一份（attach 后改设也立即生效）。
+    probe: ProbeSlot,
 }
 
 impl Default for ScriptVm {
@@ -504,7 +529,15 @@ impl ScriptVm {
             inline_stamp: HashMap::new(),
             file_stamp: HashMap::new(),
             node_conn: HashMap::new(),
+            probe: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// 注入键探针（S7.2）：`key("名")` 的求值源 —— 运行时把
+    /// `InputSnapshot::is_down` 接进来（VM 不碰平台，与文件读取器
+    /// 同一注入纪律）。可在 attach 之前或之后设置。
+    pub fn set_key_probe(&mut self, probe: KeyProbe) {
+        *self.probe.borrow_mut() = Some(probe);
     }
 
     /// 登记一个脚本（键 = `registry_key` 引用值；同名替换）。
@@ -626,6 +659,7 @@ impl ScriptVm {
             ScriptEntry::Signal(name) => {
                 // 处理器表闭包 + 方法连接（S6.18 substrate）。
                 let states = self.states.clone();
+                let probe = self.probe.clone();
                 let ok = tree.set_signal_handler(
                     node,
                     "run",
@@ -637,6 +671,7 @@ impl ScriptVm {
                             &mut locals,
                             &mut VmCtx::Signal(ctx),
                             sig.payload.clone(),
+                            &probe,
                         );
                         states.borrow_mut().insert(node, locals);
                     }),
@@ -888,7 +923,14 @@ impl SceneObserver for ScriptVm {
             return;
         };
         let mut locals = self.states.borrow_mut().remove(&node).unwrap_or_default();
-        run(&script.ops, node, &mut locals, &mut VmCtx::Node(ctx), Value::F32(delta));
+        run(
+            &script.ops,
+            node,
+            &mut locals,
+            &mut VmCtx::Node(ctx),
+            Value::F32(delta),
+            &self.probe,
+        );
         self.states.borrow_mut().insert(node, locals);
     }
 }
@@ -2026,14 +2068,22 @@ impl TextParser {
             ops.push(Op::Not);
             return Ok(());
         }
-        // 内建调用（S6.30）：`ident (` —— 目前仅 `len`。后随括号消歧，
-        // 不占保留字（局部名 `len` 不带括号照常是局部）。未知内建如实报错。
+        // 内建调用（S6.30 起）：`ident (` —— `len`（长度）与 `key`（输入
+        // 探针，S7.2）。后随括号消歧，不占保留字（局部名不带括号照常是
+        // 局部）。未知内建如实报错。
         if let Tok::Ident(name) = self.peek().tok.clone() {
             if name == "len" && matches!(self.peek2().tok, Tok::Sym('(')) {
                 self.pos += 2; // len (
                 self.expr(ops)?;
                 self.expect_sym(')')?;
                 ops.push(Op::StrLen);
+                return Ok(());
+            }
+            if name == "key" && matches!(self.peek2().tok, Tok::Sym('(')) {
+                self.pos += 2; // key (
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+                ops.push(Op::Key);
                 return Ok(());
             }
         }

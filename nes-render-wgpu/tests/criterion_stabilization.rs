@@ -4,12 +4,13 @@
 //! | 编号 | 契约 |
 //! |---|---|
 //! | T-Stab-02 | 表面获取状态**命名化**：wgpu 六个状态码 <-> 名字如实映射（未知码报"未知"不猜）；错误信息不再裸数字 |
-//! | T-Stab-03 | 字符输入队列**有界**：超限丢弃新字符（FIFO 头保留）、drain 清空 |
+//! | T-Stab-03 | 输入事件队列**有界**（S7.2 起为中性事件队列）：超限丢弃新事件（FIFO 头保留）、drain 清空 |
 //! | T-Stab-04 | BMP 解码**checked 算术**：恶构头（尺寸近 i32 上限）报"头尺寸字段非法"错误而非溢出 panic/回绕；正常路径不受影响 |
 
+use nes_render_api::input::InputEvent;
 use nes_render_wgpu::bmp::load_rgba;
 use nes_render_wgpu::gpu::surface_status_name;
-use nes_render_wgpu::window::{drain_chars, inject_char};
+use nes_render_wgpu::window::{drain_input, inject_input};
 
 /// T-Stab-02：状态名映射（收束动机：实测一次 status=3 —— wgpu 的
 /// **Timeout**，瞬态可重试 —— 曾被报成"配置参数自相矛盾"并让示例进程
@@ -25,23 +26,23 @@ fn t_stab_02_surface_status_names() {
     assert_eq!(surface_status_name(99), "未知状态");
 }
 
-/// T-Stab-03：队列容量上限（4096）—— 宿主不排空时内存也不无界增长；
-/// 满时丢新保旧（键盘语义），drain 取走清空。
+/// T-Stab-03：事件队列容量上限（S7.2 起为中性事件队列，1024）——
+/// 宿主不排空时内存也不无界增长；满时丢新保旧（FIFO），drain 取走清空。
 #[test]
 fn t_stab_03_typed_queue_bounded() {
-    let _ = drain_chars(); // 清前置状态（测试进程共享静态队列）
+    let _ = drain_input(); // 清前置状态（测试进程共享静态队列）
     for i in 0..5000u32 {
-        inject_char(32 + i % 90);
+        inject_input(InputEvent::Char(32 + i % 90));
     }
-    let drained = drain_chars();
-    assert_eq!(drained.len(), 4096, "封顶在 4096");
-    assert_eq!(drained[0], 32, "FIFO 头保留（最早的字符在队首）");
+    let drained = drain_input();
+    assert_eq!(drained.len(), 1024, "封顶在 1024");
+    assert_eq!(drained[0], InputEvent::Char(32), "FIFO 头保留（最早的事件在队首）");
     assert_eq!(
         drained.last().copied(),
-        Some(32 + 4095 % 90),
-        "丢的是后到的溢出字符"
+        Some(InputEvent::Char(32 + 1023 % 90)),
+        "丢的是后到的溢出事件"
     );
-    assert!(drain_chars().is_empty(), "drain 取走清空");
+    assert!(drain_input().is_empty(), "drain 取走清空");
 }
 
 /// T-Stab-04：BMP 尺寸算术 checked + usize 域 —— 恶构头（尺寸近 i32

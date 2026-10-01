@@ -2,11 +2,12 @@
 //!
 //! | 编号 | 契约 |
 //! |---|---|
-//! | T-Panel-R1 | 窗口运行时：`inject_char` 键入（WM_CHAR 队列的生产路径）-> 宿主编辑解释 -> 回车提交 -> `poll_reloads` 热重载 -> 下一帧精灵像素换位；坏脚本 last-good（旧行为保持）；面板 Label 字形有墨 |
+//! | T-Panel-R1 | 窗口运行时：注入字符事件（S7.2 起走中性事件队列）-> `collect_input` 快照 text -> 宿主编辑解释 -> 回车提交 -> `poll_reloads` 热重载 -> 下一帧精灵像素换位；坏脚本 last-good（旧行为保持）；面板 Label 字形有墨 |
 
 use nes_render_api::{FrameInfo, Vec2};
 use nes_render_extract::{PROP_LABEL_TEXT, PROP_TEXTURE};
-use nes_render_wgpu::window::{drain_chars, inject_char};
+use nes_render_api::input::InputEvent;
+use nes_render_wgpu::window::inject_input;
 use nes_render_wgpu::{bmp, FontParams};
 use nes_runtime::{write_bmp_rgba, NesRuntime};
 use nes_scene::{NodeKind, ScriptVm, Transform2D, Value};
@@ -98,7 +99,7 @@ impl Panel {
 }
 
 /// T-Panel-R1：编辑器面板全链（窗口模式）。键入经 WM_CHAR 队列
-/// （`inject_char` 与 T-In-01 的 PostMessageW 落进同一静态队列），
+/// （`inject_input` 与真实消息落进同一事件队列，S7.2 口径），
 /// 回车提交把 `source` 属性换成缓冲文本，`poll_reloads` 重编译重挂载，
 /// 下一次 "step" 精灵钉在新位 —— 窗口表面呈现、离屏读数断言（同一
 /// 消费器语义）。坏脚本如实失败且旧行为保持（last-good）。
@@ -152,7 +153,7 @@ fn t_panel_r1_typed_script_hot_reloads_to_pixels() {
     let mut panel = Panel { input: String::new() };
     for i in 0..2 {
         rt.tree_mut().emit_signal("step", Value::I64(0));
-        drain_chars(); // 清干净（无键入）
+        let _ = rt.collect_input(); // 清干净（无键入）
         rt.frame_windowed_with(&frame(i), &mut vm).unwrap().unwrap();
     }
     let f0 = rt.frame_with(&frame(2), &mut vm).unwrap();
@@ -160,13 +161,13 @@ fn t_panel_r1_typed_script_hot_reloads_to_pixels() {
 
     // 键入 B 脚本 + 回车（生产路径：字符队列）。
     for ch in format!("on \"step\" {{ sprite.pos = ({}, {}) }}", B.0, B.1).chars() {
-        inject_char(ch as u32);
+        inject_input(InputEvent::Char(ch as u32));
     }
-    inject_char(0x0D);
+    inject_input(InputEvent::Char(0x0D));
     let mut committed = None;
     for i in 3..5 {
         rt.tree_mut().emit_signal("step", Value::I64(0));
-        for code in drain_chars() {
+        for code in rt.collect_input().text {
             if panel.feed(code) {
                 let src = panel.input.clone();
                 rt.tree_mut()
@@ -188,11 +189,11 @@ fn t_panel_r1_typed_script_hot_reloads_to_pixels() {
     // last-good：坏脚本（编译失败）如实报错、行为保持 B。
     panel.input.clear();
     for ch in "on \"step\" { sprite.pos = ) }".chars() {
-        inject_char(ch as u32);
+        inject_input(InputEvent::Char(ch as u32));
     }
-    inject_char(0x0D);
+    inject_input(InputEvent::Char(0x0D));
     rt.tree_mut().emit_signal("step", Value::I64(0));
-    for code in drain_chars() {
+    for code in rt.collect_input().text {
         if panel.feed(code) {
             rt.tree_mut()
                 .set_prop(brain, "source", Value::Str(panel.input.clone()))
