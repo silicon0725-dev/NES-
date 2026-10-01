@@ -619,6 +619,23 @@ cargo run --example s41_visual_closure
 >（与 S9-1 指纹同三元组 —— 编辑器与确定性共用结构观；展示 = 前序
 >  = children 结构序）。全部建在 uid/transaction/handle/component
 > 之上，零新 VM。文档见 `NES2.0_S9.3编辑器对象模型契约_v1.md`。
+> **v1.68 注记（S9-3a 编辑器核心状态层）**：契约补裁决 **Selection
+> 不属于 Transaction**（选择是会话态 —— undo 恢复文档不恢复选择）。
+> 实现三件：`Selection`（uid 有序集/悬空保留/live+primary 解析/
+> 不落盘）+ `Inspector` 适配器（modify_name/local/prop 全记
+> Modified；gizmo preview 适配器外直写、落点一次记账 = 一条事务）
+> + `Hierarchy` 适配器（drag_to 重排/移父一条 Reparented、
+> create_child/delete_subtree 子树快照）。**T-SEL-01/02、
+> T-INS-01/02、T-HIER-01/02 全过**（悬空往返恢复、100 帧拖拽恰
+> 一条事务、uid 跨拖拽/undo/redo/保存重载不变、兄弟序往返一致）。
+> scene 升至 208（全仓合计 470）。零新 VM。
+> **v1.69 注记（S9-3b Editor Shell）**：`editor_shell.rs` —— 建在
+> S9-3a 状态模型上的编辑器 UI（768x432：左 Hierarchy 投影 / 右
+> Inspector 投影 / 中 Viewport + 选中高亮 z_index=5 / 底状态栏）。
+> **UI 只消费状态模型零自有语义**：树面板 = SceneTree 前序投影，
+> Inspector = 选择节点数据投影，一切修改经适配器 → TransactionLog。
+> 操作：Tab 循环选择 / 方向键移动 / Delete 删子树 / Ctrl+Z·Y
+> undo·redo。**T-ESH-01** 无头验证状态模型全链。全仓 471 绿。
 
 | 事项 | 状态 |
 |---|---|

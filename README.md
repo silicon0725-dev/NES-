@@ -46,6 +46,7 @@ cargo run --example engine_window      # 真窗口帧循环 + 动画（SceneObse
 cargo run --example script_panel       # 编辑器脚本面板（窗口键入 -> 提交 -> 热重载 -> 同帧像素）
 cargo run --example first_game        # 首个真实游戏 Dodge（方向键走位，场景+行为全在 first_game.ron）
 cargo run --example dungeon_game      # 移植压力测试 Mini Dungeon（走位+射击+拾取+门）
+cargo run --example editor_shell      # Editor Shell（S9-3b：层级/检查器/视口/选择/undo）
 cargo build -p nes-runtime --release --bin nes   # headless CLI
 ./nes-runtime/target/release/nes.exe --headless scene.ron --frames 300   # 逐帧状态哈希（确定性）
 cargo run --example scene_disk         # 磁盘场景 -> 渲染 -> 回存
