@@ -282,9 +282,12 @@ fn run<'a, 'b>(
             Op::Mul => {
                 let b = pop_val!();
                 let a = pop_val!();
-                stack.push(StackVal::V(match (num_of(&a), num_of(&b)) {
-                    (Some(x), Some(y)) => Value::F32(x * y),
-                    _ => halt!("Mul 类型不符"),
+                stack.push(StackVal::V(match (a, b) {
+                    (Value::I64(x), Value::I64(y)) => Value::I64(x * y),
+                    (a, b) => match (num_of(&a), num_of(&b)) {
+                        (Some(x), Some(y)) => Value::F32(x * y),
+                        _ => halt!("Mul 类型不符"),
+                    },
                 }));
             }
             Op::Lt => {
@@ -299,7 +302,11 @@ fn run<'a, 'b>(
                 let b = stack.pop();
                 let a = stack.pop();
                 let eq = match (a, b) {
-                    (Some(StackVal::V(x)), Some(StackVal::V(y))) => x == y,
+                    // 数值按值比较（1 == 1.0 为真 —— 数值语言直觉）；其余严格。
+                    (Some(StackVal::V(x)), Some(StackVal::V(y))) => match (num_of(&x), num_of(&y)) {
+                        (Some(u), Some(v)) => u == v,
+                        _ => x == y,
+                    },
                     (Some(StackVal::N(x)), Some(StackVal::N(y))) => x == y,
                     _ => halt!("Eq 栈不足或混合"),
                 };
@@ -458,5 +465,509 @@ impl SceneObserver for ScriptVm {
         let mut locals = self.states.borrow_mut().remove(&node).unwrap_or_default();
         run(&script.ops, node, &mut locals, &mut VmCtx::Node(ctx), Value::F32(delta));
         self.states.borrow_mut().insert(node, locals);
+    }
+}
+
+// ---------- 文本语法与编译（S6.20） ----------
+//
+// 手写词法 + 递归下降编译器（与 scene_io 的 RON 解析器同一纪律）。
+// 语法（Rust-lite 最小集）：
+//
+// ```text
+// on "step" {                        // 入口：on "信号名" / every（process）
+//     n = n + 1                      // 局部赋值（裸标识符）
+//     sprite.pos = sprite.pos + arg  // 变换读写（节点.pos，arg=入口参数）
+//     sprite.flip_h = true           // 属性读写（节点.属性名）
+//     if 2 < n { emit "done" n }     // 条件（无 else；比较单级）
+//     emit "tick" (1.0, 0.0)         // 发射（名 + 载荷；Vec2 字面量仅数字）
+// }
+// ```
+//
+// 栈序由编译器按构造保证（如 `x.pos = x.pos + d` 自然编译为
+// [N,GetT,d...,N,SetT] —— 节点压两次）；保留字：on/every/if/emit/
+// arg/this/true/false；`//` 行注释；语句以换行或 `;` 分隔。
+
+use crate::scene_io::ParseError;
+
+/// 编译文本脚本为 [`Script`]。语法/用词错误如实报错（行/列定位）；
+/// 类型错误不在此层（运行时停机兜底，见 §1.4）。
+pub fn compile_script(src: &str) -> Result<Script, ParseError> {
+    let toks = lex(src)?;
+    let mut p = TextParser { toks, pos: 0 };
+    p.script()
+}
+
+// ------------------------------------------------ 词法
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Ident(String),
+    /// 数值（值，是否整数字面量）。
+    Num(f64, bool),
+    Str(String),
+    /// 单字符符号。
+    Sym(char),
+    /// 双字符符号（目前只有 `==`）。
+    Sym2(String),
+    Newline,
+    Eof,
+}
+
+#[derive(Clone, Debug)]
+struct Spanned {
+    tok: Tok,
+    line: usize,
+    col: usize,
+}
+
+fn lex(src: &str) -> Result<Vec<Spanned>, ParseError> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0usize;
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let n = chars.len();
+    macro_rules! err {
+        ($msg:expr) => {
+            return Err(ParseError::new(line, col, $msg))
+        };
+    }
+    while i < n {
+        let c = chars[i];
+        match c {
+            ' ' | '\t' | '\r' => {
+                i += 1;
+                col += 1;
+            }
+            '\n' => {
+                out.push(Spanned {
+                    tok: Tok::Newline,
+                    line,
+                    col,
+                });
+                i += 1;
+                line += 1;
+                col = 1;
+            }
+            '/' if i + 1 < n && chars[i + 1] == '/' => {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '"' => {
+                let (s, adv) = lex_string(&chars[i + 1..], line, col)?;
+                out.push(Spanned {
+                    tok: Tok::Str(s),
+                    line,
+                    col,
+                });
+                i += 1 + adv;
+                col += 1 + adv;
+            }
+            '0'..='9' => {
+                let start = i;
+                let mut is_int = true;
+                while i < n && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                    if chars[i] == '.' {
+                        if !is_int {
+                            err!("数字里多余的 `.`");
+                        }
+                        is_int = false;
+                    }
+                    i += 1;
+                }
+                let text: String = chars[start..i].iter().collect();
+                let v: f64 = text.parse().map_err(|_| ParseError::new(line, col, "非法数字"))?;
+                out.push(Spanned {
+                    tok: Tok::Num(v, is_int),
+                    line,
+                    col,
+                });
+                col += i - start;
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < n && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let s: String = chars[start..i].iter().collect();
+                out.push(Spanned {
+                    tok: Tok::Ident(s),
+                    line,
+                    col,
+                });
+                col += i - start;
+            }
+            '=' | '<' if i + 1 < n && chars[i + 1] == '=' => {
+                out.push(Spanned {
+                    tok: Tok::Sym2("==".into()),
+                    line,
+                    col,
+                });
+                i += 2;
+                col += 2;
+            }
+            '{' | '}' | '(' | ')' | ',' | '.' | '=' | '+' | '-' | '*' | '<' | ';' => {
+                out.push(Spanned {
+                    tok: Tok::Sym(c),
+                    line,
+                    col,
+                });
+                i += 1;
+                col += 1;
+            }
+            other => err!(format!("非法字符 `{other}`")),
+        }
+    }
+    out.push(Spanned {
+        tok: Tok::Eof,
+        line,
+        col,
+    });
+    Ok(out)
+}
+
+/// 字符串字面量（到收尾引号；支持 `\"` `\` `\n` `\t`）。返回（值, 消耗数）。
+fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String, usize), ParseError> {
+    let mut s = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => return Ok((s, i + 1)),
+            '\n' => return Err(ParseError::new(line, col, "字符串没有收尾引号")),
+            '\\' => {
+                let e = chars.get(i + 1).copied().unwrap_or('?');
+                s.push(match e {
+                    'n' => '\n',
+                    't' => '\t',
+                    '"' => '"',
+                    '\\' => '\\',
+                    other => return Err(ParseError::new(line, col, format!("非法转义 \\{other}"))),
+                });
+                i += 2;
+                col += 2;
+            }
+            other => {
+                s.push(other);
+                i += 1;
+                col += 1;
+                if other == '\n' {
+                    line += 1;
+                    col = 1;
+                }
+            }
+        }
+    }
+    Err(ParseError::new(line, col, "字符串没有收尾引号"))
+}
+
+// ------------------------------------------------ 语法 -> Op
+
+const RESERVED: [&str; 8] = ["on", "every", "if", "emit", "arg", "this", "true", "false"];
+
+struct TextParser {
+    toks: Vec<Spanned>,
+    pos: usize,
+}
+
+impl TextParser {
+    fn peek(&self) -> &Spanned {
+        self.toks.get(self.pos).unwrap_or(&Spanned {
+            tok: Tok::Eof,
+            line: 0,
+            col: 0,
+        })
+    }
+
+    fn peek2(&self) -> &Spanned {
+        self.toks.get(self.pos + 1).unwrap_or(&Spanned {
+            tok: Tok::Eof,
+            line: 0,
+            col: 0,
+        })
+    }
+
+    fn next(&mut self) -> Spanned {
+        let t = self.peek().clone();
+        self.pos += 1;
+        t
+    }
+
+    fn err_here(&self, msg: impl Into<String>) -> ParseError {
+        let s = self.peek();
+        ParseError::new(s.line, s.col, msg)
+    }
+
+    fn skip_newlines(&mut self) {
+        while matches!(self.peek().tok, Tok::Newline | Tok::Sym(';')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect_sym(&mut self, c: char) -> Result<(), ParseError> {
+        if matches!(&self.peek().tok, Tok::Sym(s) if *s == c) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.err_here(format!("期望 `{c}`")))
+        }
+    }
+
+    fn expect_str(&mut self) -> Result<String, ParseError> {
+        match self.next().tok {
+            Tok::Str(s) => Ok(s),
+            _ => Err(self.err_here("期望字符串字面量")),
+        }
+    }
+
+    /// script := ("on" STRING | "every") "{" stmts "}"
+    fn script(&mut self) -> Result<Script, ParseError> {
+        self.skip_newlines();
+        let entry = match self.next().tok {
+            Tok::Ident(k) if k == "on" => ScriptEntry::Signal(self.expect_str()?),
+            Tok::Ident(k) if k == "every" => ScriptEntry::Process,
+            _ => return Err(self.err_here("期望 `on \"信号名\"` 或 `every`")),
+        };
+        self.expect_sym('{')?;
+        let mut ops = Vec::new();
+        self.stmts(&mut ops)?;
+        self.expect_sym('}')?;
+        self.skip_newlines();
+        if !matches!(self.peek().tok, Tok::Eof) {
+            return Err(self.err_here("脚本结尾后有多余内容"));
+        }
+        Ok(Script::new(entry, ops))
+    }
+
+    fn stmts(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek().tok, Tok::Sym('}') | Tok::Eof) {
+                return Ok(());
+            }
+            self.stmt(ops)?;
+            match &self.peek().tok {
+                Tok::Newline | Tok::Sym(';') | Tok::Sym('}') | Tok::Eof => {}
+                _ => return Err(self.err_here("语句后期望换行、`;` 或 `}`")),
+            }
+        }
+    }
+
+    fn stmt(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        match self.peek().tok.clone() {
+            Tok::Ident(k) if k == "if" => {
+                self.pos += 1;
+                self.expr(ops)?; // 条件（Bool）
+                let jif = ops.len();
+                ops.push(Op::JumpIfNot(0)); // 占位，块结束后回填
+                self.expect_sym('{')?;
+                self.stmts(ops)?;
+                self.expect_sym('}')?;
+                let end = ops.len();
+                ops[jif] = Op::JumpIfNot(end);
+                Ok(())
+            }
+            Tok::Ident(k) if k == "emit" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                self.expr(ops)?; // 载荷
+                ops.push(Op::Emit(name));
+                Ok(())
+            }
+            Tok::Ident(name) => {
+                // 保留字里只有 `this` 可作成员赋值目标（this.pos = ...）；
+                // 其余（arg = 1 之类）在裸局部路径拒绝。
+                let reserved = RESERVED.contains(&name.as_str());
+                if reserved && !(name == "this" && matches!(self.peek2().tok, Tok::Sym('.'))) {
+                    return Err(self.err_here(format!("`{name}` 是保留字")));
+                }
+                self.pos += 1;
+                if matches!(self.peek().tok, Tok::Sym('.')) {
+                    // 节点成员赋值：node.member = expr（member 为 pos -> SetT）。
+                    // 栈序：SetT/SetProp 弹值再弹节点 —— 节点必须**先压**（值之下）。
+                    self.pos += 1;
+                    let member = match self.next().tok {
+                        Tok::Ident(m) => m,
+                        _ => return Err(self.err_here("期望属性名或 `pos`")),
+                    };
+                    self.expect_sym('=')?;
+                    if name == "this" {
+                        ops.push(Op::This);
+                    } else {
+                        ops.push(Op::NodeByName(name));
+                    }
+                    self.expr(ops)?; // 值压在节点上
+                    if member == "pos" {
+                        ops.push(Op::SetT);
+                    } else {
+                        ops.push(Op::SetProp(member));
+                    }
+                    Ok(())
+                } else if matches!(self.peek().tok, Tok::Sym('=')) {
+                    self.pos += 1;
+                    self.expr(ops)?;
+                    ops.push(Op::SetLocal(name));
+                    Ok(())
+                } else {
+                    Err(self.err_here("期望 `=` 赋值"))
+                }
+            }
+            _ => Err(self.err_here("期望语句（赋值 / if / emit）")),
+        }
+    }
+
+    /// expr := add (("=="|"<") add)?（比较单级、不可链）。
+    fn expr(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.add(ops)?;
+        match self.peek().tok.clone() {
+            Tok::Sym2(s) if s == "==" => {
+                self.pos += 1;
+                self.add(ops)?;
+                ops.push(Op::Eq);
+            }
+            Tok::Sym('<') => {
+                self.pos += 1;
+                self.add(ops)?;
+                ops.push(Op::Lt);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn add(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.mul(ops)?;
+        loop {
+            match &self.peek().tok {
+                Tok::Sym('+') => {
+                    self.pos += 1;
+                    self.mul(ops)?;
+                    ops.push(Op::Add);
+                }
+                Tok::Sym('-') => {
+                    self.pos += 1;
+                    self.mul(ops)?;
+                    ops.push(Op::Sub);
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn mul(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        self.primary(ops)?;
+        while matches!(self.peek().tok, Tok::Sym('*')) {
+            self.pos += 1;
+            self.primary(ops)?;
+            ops.push(Op::Mul);
+        }
+        Ok(())
+    }
+
+    fn primary(&mut self, ops: &mut Vec<Op>) -> Result<(), ParseError> {
+        // 一元负号（最小集）：`-x` -> `0 - x`（先垫 0 再解析操作数，Sub 弹序恰好）。
+        if matches!(self.peek().tok, Tok::Sym('-')) {
+            self.pos += 1;
+            ops.push(Op::Const(Value::I64(0)));
+            self.primary(ops)?;
+            ops.push(Op::Sub);
+            return Ok(());
+        }
+        let sp = self.peek().clone();
+        match self.next().tok.clone() {
+            Tok::Num(v, true) => ops.push(Op::Const(Value::I64(v as i64))),
+            Tok::Num(v, false) => ops.push(Op::Const(Value::F32(v as f32))),
+            Tok::Str(s) => ops.push(Op::Const(Value::Str(s))),
+            Tok::Ident(k) => match k.as_str() {
+                "true" => ops.push(Op::Const(Value::Bool(true))),
+                "false" => ops.push(Op::Const(Value::Bool(false))),
+                "arg" => ops.push(Op::Arg),
+                // `this` / `this.pos`：后随 `.` 走成员访问（节点压栈换成 This）。
+                "this" => {
+                    if matches!(self.peek().tok, Tok::Sym('.')) {
+                        self.pos += 1;
+                        let member = match self.next().tok {
+                            Tok::Ident(m) => m,
+                            _ => return Err(self.err_here("期望属性名或 `pos`")),
+                        };
+                        ops.push(Op::This);
+                        if member == "pos" {
+                            ops.push(Op::GetT);
+                        } else {
+                            ops.push(Op::GetProp(member));
+                        }
+                    } else {
+                        ops.push(Op::This);
+                    }
+                }
+                other => {
+                    if RESERVED.contains(&other) {
+                        return Err(ParseError::new(sp.line, sp.col, format!("`{other}` 是保留字")));
+                    }
+                    if matches!(self.peek().tok, Tok::Sym('.')) {
+                        self.pos += 1;
+                        let member = match self.next().tok {
+                            Tok::Ident(m) => m,
+                            _ => return Err(self.err_here("期望属性名或 `pos`")),
+                        };
+                        ops.push(Op::NodeByName(other.to_string()));
+                        if member == "pos" {
+                            ops.push(Op::GetT);
+                        } else {
+                            ops.push(Op::GetProp(member));
+                        }
+                    } else {
+                        ops.push(Op::Local(other.to_string()));
+                    }
+                }
+            },
+            Tok::Sym('(') => {
+                // Vec2 字面量（数字字面量，槽位可带负号）或括号分组。
+                let num_ahead = |p: &Self, off: usize| -> Option<f64> {
+                    let t = &p.toks.get(p.pos + off)?.tok;
+                    match t {
+                        Tok::Num(v, _) => Some(*v),
+                        _ => None,
+                    }
+                };
+                if let Some(x) = num_ahead(self, 0) {
+                    if matches!(self.peek2().tok, Tok::Sym(',')) {
+                        self.pos += 2;
+                        let y = if let Some(y) = num_ahead(self, 0) {
+                            self.pos += 1;
+                            y
+                        } else if matches!(self.peek().tok, Tok::Sym('-')) {
+                            match num_ahead(self, 1) {
+                                Some(y) => {
+                                    self.pos += 2;
+                                    -y
+                                }
+                                None => return Err(self.err_here("Vec2 字面量第二位须是数字")),
+                            }
+                        } else {
+                            return Err(self.err_here("Vec2 字面量第二位须是数字"));
+                        };
+                        self.expect_sym(')')?;
+                        ops.push(Op::Const(Value::Vec2(Vec2::new(x as f32, y as f32))));
+                        return Ok(());
+                    }
+                }
+                self.expr(ops)?;
+                self.expect_sym(')')?;
+            }
+            _ => return Err(self.err_here("期望表达式")),
+        }
+        Ok(())
+    }
+}
+
+impl ScriptVm {
+    /// 登记（编译文本脚本）：语法错误的行/列经 [`ParseError`] 如实上报。
+    pub fn register_text(&mut self, key: &str, src: &str) -> Result<(), ParseError> {
+        let script = compile_script(src)?;
+        self.register(key, script);
+        Ok(())
     }
 }

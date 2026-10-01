@@ -102,7 +102,7 @@ nes-runtime 零改动（`frame_with(&mut vm)` 直接以 VM 为观察者）。
 
 | 事项 | 状态 |
 |---|---|
-| 文本脚本语法 + 编译到 `Op`（手写解析器纪律） | 未启动 |
+| 文本脚本语法 + 编译到 `Op` | ✅ S6.20（Rust-lite 文法，见 `NES2.0_S6文本脚本语法_v1.md`） |
 | 脚本序列化进场景文件（RON 的 Op 编码） | 未启动 |
 | `DUP`/`Swap` 等栈操作指令；字符串/比较族扩展 | 未启动（18 条最小集） |
 | process 入口的 Arg=delta（现为 0 占位 —— NodeCtx 不携带 delta） | 待 NodeCtx 携带或改入口签名 |

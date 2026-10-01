@@ -94,7 +94,9 @@ pub use scene_io::{
     ParseError, ResourceDoc, SceneDoc, FORMAT_VERSION, PROP_SUB_SCENE,
 };
 pub use schema::{EditorHint, NodeSchema, PropDesc};
-pub use script::{Op, Script, ScriptEntry, ScriptVm, StackVal, HALT_LOCAL, SCRIPT_MAX_STEPS};
+pub use script::{
+    compile_script, Op, Script, ScriptEntry, ScriptVm, StackVal, HALT_LOCAL, SCRIPT_MAX_STEPS,
+};
 pub use transform::{Affine, Transform2D, Vec2};
 pub use tree::{
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, ProcessMode, SceneObserver, SceneTree, Signal,
