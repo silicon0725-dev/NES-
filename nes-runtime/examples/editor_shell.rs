@@ -148,6 +148,8 @@ fn main() {
     let mut prev_del = false;
     let mut prev_tab = false;
     let mut prev_click = false;
+    // 框选拖拽状态（编辑器会话态 —— 不进事务/不落盘）。
+    let mut drag_start: Option<(f32, f32)> = None;
 
     let total: u64 = std::env::var("NES_EDIT_FRAMES")
         .ok()
@@ -228,6 +230,40 @@ fn main() {
                 } else {
                     sel.select(uid);
                 }
+                drag_start = None; // 点击命中：不是框选
+            } else if !mouse_shift {
+                // 空白处按下：开始框选（拖拽矩形）。
+                drag_start = Some((mx, my));
+                if !mouse_shift {
+                    sel.clear(); // 框选重置（Shift 保留已有选择）
+                }
+            }
+        }
+        // 框选拖拽中：mouse up → 选中矩形内全部 Sprite。
+        if let Some((sx, sy)) = drag_start {
+            if !mouse_left_held {
+                // 松开：框选完成。
+                let (ex, ey) = (snap.mouse.x, snap.mouse.y);
+                let (rx0, ry0) = (sx.min(ex), sy.min(ey));
+                let (rx1, ry1) = (sx.max(ex), sy.max(ey));
+                let in_rect: Vec<Uid> = {
+                    let tree = rt.tree_mut();
+                    tree.preorder()
+                        .into_iter()
+                        .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
+                        .filter(|&n| !matches!(tree.prop(n, "visible"), Some(Value::Bool(false))))
+                        .filter(|&n| {
+                            let w = tree.world(n).unwrap_or_default();
+                            let (cx, cy) = (w.tx + 8.0, w.ty + 8.0); // 中心
+                            cx >= rx0 && cx <= rx1 && cy >= ry0 && cy <= ry1
+                        })
+                        .filter_map(|n| tree.uid_of(n))
+                        .collect()
+                };
+                for uid in in_rect {
+                    sel.select(uid);
+                }
+                drag_start = None;
             }
         }
         prev_click = mouse_left_held;
@@ -329,7 +365,7 @@ fn main() {
 
             // 状态栏。
             let st = format!(
-                "st> undo:{} redo:{} sel:{} | Click=sel Shift+Click=multi Arrows=move Del=del Ctrl+Z/Y=undo/redo",
+                "st> undo:{} redo:{} sel:{} | Click=sel Shift+Click=multi Drag=box Arrows=move Del=del Ctrl+Z/Y=undo/redo",
                 if log.can_undo() { "Y" } else { "-" },
                 if log.can_redo() { "Y" } else { "-" },
                 sel.len(),

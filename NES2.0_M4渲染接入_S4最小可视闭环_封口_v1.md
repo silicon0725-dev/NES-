@@ -714,6 +714,11 @@ cargo run --example s41_visual_closure
 > 降序 Sprite2D 世界包围盒 + held 前沿检测）+ **Shift+点击多选**
 >（Selection.toggle）。S10-1 的 hit() 与 S9-3a 的 Selection 在编辑
 > 器真实语境闭环。Tab 循环保留（备用）。状态栏提示更新。475 绿。
+> **v1.80 注记（S10-2 第二项：框选落地）**：editor_shell 空白拖拽
+> → 框选矩形 → 松开选中矩形内全部可见 Sprite 中心（Selection 逐个
+> select，保持序 = 选择序）。拖拽状态是编辑器会话态（不进事务/不落盘，
+> D1 口径）。与 S9-3a Selection 模型完全一致（select 就是 select，
+> 框选只是输入法）。475 绿。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |
