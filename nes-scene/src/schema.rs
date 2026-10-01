@@ -235,13 +235,15 @@ fn clamp_to_hint(value: Value, hint: &EditorHint) -> Value {
 fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
     use EditorHint as H;
     match tag {
-        NodeKindTag::Node => vec![PropDesc::new(
-            "visible",
-            ValueType::Bool,
-            Value::Bool(true),
-            H::None,
-            "是否参与显示与处理。隐藏节点仍参与变换与脚本逻辑。",
-        )],
+        NodeKindTag::Node => vec![
+            PropDesc::new(
+                "visible",
+                ValueType::Bool,
+                Value::Bool(true),
+                H::None,
+                "是否参与显示与处理。隐藏节点仍参与变换与脚本逻辑。",
+            ),
+        ],
         NodeKindTag::Node2D => vec![PropDesc::new(
             "z_index",
             ValueType::I64,

@@ -672,6 +672,14 @@ cargo run --example s41_visual_closure
 > T-HIT-01 验证：重叠区 z 优先、visible=false 排除、空白 false、
 > 后缀 .pos 直读。编辑器点击选择与游戏空间交互的基础就位。
 > scene 升至 209（全仓合计 473）。
+> **v1.74 注记（S10-1 第二项：per-entity 计时落地）**：
+> `NodeData.timer: u32` 一等字段（同 process_mode 层级 —— **调度
+> 数据不进属性表**，绕开 Cmd/微批次时序）；引擎每 tick 递减（到 0
+> 停住）；`set_timer`/`timer` 公共 API。T-TIMER-01 验证递减序列
+> 3→2→1→0→停。**架构裁决**：timer 是调度数据（与 process_mode
+> 同一裁决先例 —— 每帧读、不进属性表、不走 Cmd）。farm.ron 的
+> 6 个平行 g0..g5 局部将坍缩为 per-entity timer 属性（下一轮
+> farm 重构验证）。scene 升至 210（全仓合计 474）。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |

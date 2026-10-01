@@ -102,6 +102,9 @@ pub struct NodeData {
     /// 与 runtime NodeId(slot,gen) 严格分层：uid 是语义身份，不参与
     /// arena 执行安全。
     pub uid: Uid,
+    /// **每帧倒计时**（S10-1/F-2）：引擎每 tick -1，到 0 停。
+    /// 调度数据（同 process_mode 层级，不进属性表）。
+    pub timer: u32,
 }
 
 /// 持久语义身份（S9-0）：128 位 UUID v4 的十六进制 32 字符形态。
@@ -239,6 +242,7 @@ impl NodeData {
             overrides: Vec::new(),
             flags: NodeFlags::DIRTY_XFORM,
             uid: Uid::new_v4(),
+            timer: 0,
         }
     }
 
@@ -952,6 +956,7 @@ impl SceneTree {
             process_mode: ProcessMode::default(),
             overrides: Vec::new(),
             uid: Uid::new_v4(),
+            timer: 0,
             flags: NodeFlags::IN_TREE | NodeFlags::DIRTY_XFORM,
         });
         Self {
@@ -1465,6 +1470,18 @@ impl SceneTree {
     }
 
     /// 读节点持久身份（uid_of(handle) 通道）。
+    /// 设置节点倒计时（S10-1/F-2；调度数据，不走属性/Cmd）。
+    pub fn set_timer(&mut self, node: NodeId, ticks: u32) {
+        if let Some(nd) = self.nodes.get_mut(node) {
+            nd.timer = ticks;
+        }
+    }
+
+    /// 读节点倒计时。
+    pub fn timer(&self, node: NodeId) -> Option<u32> {
+        self.nodes.get(node).map(|nd| nd.timer)
+    }
+
     pub fn uid_of(&self, node: NodeId) -> Option<Uid> {
         self.nodes.get(node).map(|nd| nd.uid.clone())
     }
@@ -1713,6 +1730,20 @@ impl SceneTree {
                 payload: Value::Bool(true),
                 event: Some(ev.clone()),
             });
+        }
+
+        // 1.5 timer 递减（S10-1/F-2）：所有 timer > 0 的节点每 tick -1
+        //     （到 0 停住）。结构落地后、生命周期/过程前 —— 同帧设 N
+        //     即从此帧开始倒数；脚本在 process/信号里读 timer == 0
+        //     即"刚到时"。per-entity 定时的引擎侧支撑，消除管理器
+        //     平行计时局部（farm 的 g0..g5 形态）。
+        let ids: Vec<NodeId> = self.nodes.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            if let Some(nd) = self.nodes.get_mut(id) {
+                if nd.timer > 0 {
+                    nd.timer -= 1;
+                }
+            }
         }
 
         // 2. enter_tree（自顶向下）
@@ -1969,8 +2000,9 @@ impl SceneTree {
             Cmd::Tree(op) => self.pending.push(op),
             Cmd::SetLocal { node, t } => self.set_local(node, t),
             Cmd::SetProp { node, name, value } => {
-                // 静默忽略失败：`apply_cmd` 没有事件通道，且脚本写错属性不该崩帧。
-                let _ = self.set_prop(node, &name, value);
+                if let Err(e) = self.set_prop(node, &name, value.clone()) {
+                    eprintln!("[apply_cmd] {:?} {} {:?} Err {:?}", node, name, value, e);
+                }
             }
             Cmd::Spawn { parent, name, kind } => {
                 // 只占 arena 槽位，结构变更依旧走 pending —— 保持"帧首统一落地"的纪律。

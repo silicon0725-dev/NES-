@@ -256,3 +256,27 @@ fn t_hit_01_spatial_query() {
     assert_eq!(l.get("bx"), Some(&Value::F32(12.0)), "hit().pos.x");
     let _ = (uid_a, uid_b);
 }
+
+/// T-TIMER-01（S10-1/F-2）：**per-entity 计时** —— NodeData.timer
+/// 由引擎每 tick 递减（到 0 停住）；树 API 直接读写（调度数据，
+/// 同 process_mode 层级，不进属性表）。
+#[test]
+fn t_timer_01_per_entity_countdown() {
+    let mut t = SceneTree::new("root");
+    t.apply_pending();
+    let a = t.add_node(t.root(), "a", NodeKind::Sprite2D);
+    t.apply_pending();
+
+    // 设 3 → 每 tick -1 → 到 0 停。
+    t.set_timer(a, 3);
+    assert_eq!(t.timer(a), Some(3));
+    let _ = t.tick(1.0 / 60.0, &mut nes_scene::NoObserver);
+    assert_eq!(t.timer(a), Some(2), "帧 1：3-1=2");
+    let _ = t.tick(1.0 / 60.0, &mut nes_scene::NoObserver);
+    assert_eq!(t.timer(a), Some(1), "帧 2");
+    let _ = t.tick(1.0 / 60.0, &mut nes_scene::NoObserver);
+    assert_eq!(t.timer(a), Some(0), "帧 3：到 0");
+    let _ = t.tick(1.0 / 60.0, &mut nes_scene::NoObserver);
+    assert_eq!(t.timer(a), Some(0), "停在 0（不循环）");
+}
+
