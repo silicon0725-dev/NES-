@@ -13,8 +13,9 @@
 //! 开发目录。纹理缺失自动生成（纯色 16x16）。
 //!
 //! **显示 2x**：场景世界是 384x216（引擎基准坐标系），窗口开 768x432、
-//! 相机局部 scale 覆写为 2 —— 同一世界区域放大一倍渲染；鼠标坐标经
-//! [`ScaledView`] 除以 2 映射回世界系（场景脚本零改动、语义不变）。
+//! 相机 `zoom` 属性覆写为 2（投影：屏幕 = (世界-center)*zoom + 视口/2）——
+//! 同一世界区域放大一倍渲染；鼠标坐标经 [`ScaledView`] 除以 2 映射回
+//! 世界系（场景脚本零改动、语义不变）。
 //!
 //! 确定性验证走 headless CLI（与本宿主同一场景文件）：
 //!
@@ -33,7 +34,7 @@ use nes_render_api::{FrameInfo, Vec2};
 use nes_render_wgpu::bmp;
 use nes_render_wgpu::FontParams;
 use nes_runtime::{write_bmp_rgba, NesRuntime};
-use nes_scene::{InputView, ScriptVm, Transform2D};
+use nes_scene::{InputView, ScriptVm};
 
 /// 单色 16x16 纹理。
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
@@ -158,23 +159,16 @@ fn main() {
     }
 
     rt.load_scene("tower_defense.ron").expect("加载场景");
-    // 显示 2x：相机局部 scale 覆写（宿主层展示选择 —— 场景文件与
-    // headless 语义不动）。cam(192,108) 是世界中心 -> 屏幕中心，
-    // scale 2 后世界 (0,0) 仍落屏幕 (0,0)，整场 384x216 放大一倍。
+    // 显示 2x：相机 **zoom 属性** 覆写（宿主层展示选择 —— 场景文件与
+    // headless 语义不动）。投影公式 屏幕 = (世界 - center)*zoom + 视口/2：
+    // center(192,108)、zoom 2、视口 768x432 时世界 (0,0)->(0,0)、
+    // (384,216)->(768,432)，整场恰好放大一倍。注意相机的**变换 scale
+    // 分量不参与投影**（S11-2 实测：改 scale 无效，画面被推向右下象限）。
     {
-        let cam = rt
-            .tree_mut()
-            .find_by_name("cam")
-            .expect("相机节点 cam");
-        rt.tree_mut().set_local(
-            cam,
-            Transform2D {
-                pos: nes_scene::Vec2::new(192.0, 108.0),
-                rot: 0.0,
-                scale: nes_scene::Vec2::new(VIEW_SCALE, VIEW_SCALE),
-                skew: 0.0,
-            },
-        );
+        let cam = rt.tree_mut().find_by_name("cam").expect("相机节点 cam");
+        rt.tree_mut()
+            .set_prop(cam, "zoom", nes_scene::Value::F32(VIEW_SCALE))
+            .expect("设置相机 zoom");
     }
     let mut vm = ScriptVm::new();
     {
