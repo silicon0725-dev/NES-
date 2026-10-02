@@ -64,10 +64,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use nes_render_api::{
-    Affine2, Camera2DState, ControlState, Flip, FrameInfo, ItemHandle, LabelState, RenderAssetKey,
-    RenderCommand, RenderServer, Vec2,
+    Affine2, Camera2DState, ControlState, Flip, FrameInfo, ItemHandle, LabelState, ListAxis,
+    ListState, Rect, RenderAssetKey, RenderCommand, RenderServer, ScrollBar, Vec2,
 };
-use nes_scene::ui::{ThemeColors, UiStates, WidgetState};
+use nes_scene::ui::{ThemeColors, UiStates, WidgetState, scroll_context_of, scroll_max_of};
 use nes_scene::{Affine, NodeId, NodeKindTag, ResId, SceneTree, Value};
 
 use crate::bridge::{affine2_of, flip_of, vec2_of};
@@ -104,6 +104,14 @@ pub const DEFAULT_LABEL_FONT_SIZE: f32 = 16.0;
 
 /// `Control` 尺寸缺省值（与场景层 schema 的 `size` 缺省一致）。
 pub const DEFAULT_CONTROL_SIZE: (f32, f32) = (100.0, 100.0);
+
+/// 列表/页签字号（S12.0 设计语言：等宽 16px 冻结口径，与按钮/输入框文字同款）。
+const LIST_FONT_SIZE: f32 = 16.0;
+/// ListView 行高缺省（与场景层 schema `row_h` 缺省及 `nes_scene::ui` 的
+/// 滚动测算口径一致 —— 两处只对表，不改算式）。
+const LIST_ROW_H_DEFAULT: f32 = 18.0;
+/// Tabs 页签宽缺省（与场景层 schema `tab_w` 缺省一致）。
+const TABS_TAB_W_DEFAULT: f32 = 64.0;
 
 /// 一帧提取的记账（测试与调优用；不参与渲染决策）。
 ///
@@ -253,6 +261,12 @@ impl RenderExtractor {
             }
         }
         let ui = self.ui.as_ref().map(|u| u.borrow());
+        // 滚动上下文的只读面（S12-3 任务 4）：无 UI 共享面时用空表兜底
+        //（三个空 HashMap 零堆分配）。空表 = 滚动偏移和恒 0（"无 UI =
+        // 无滚动"），而祖先 ScrollView 交集只依赖树结构照算 —— D6 的
+        // 结构性裁剪不因缺 UI 而失效。
+        let empty_states = UiStates::new();
+        let ui_states: &UiStates = ui.as_deref().unwrap_or(&empty_states);
         // 光标闪的节拍（S12-2）：提取帧序每 30 帧一个半拍（可见/隐藏
         // 交替）—— 纯渲染侧动画，不进 tick 语义，也不进任何模拟状态。
         let caret_visible = stamp / 30 % 2 == 0;
@@ -272,7 +286,7 @@ impl RenderExtractor {
             // 准入条件：Sprite2D 有非空纹理键 / Label 有非空文本 / Control 恒准入。
             // 非渲染节点（Node / Node2D 容器 / Camera2D / Script …，以及纹理
             // 未绑定的 Sprite2D、空文本的 Label）一律跳过。
-            let Some(admission) =
+            let Some(mut admission) =
                 admit(tree, node, source, &theme, ui.as_deref(), caret_visible)
             else {
                 // 本帧不可渲染：若上一帧建过条目，必须销毁，否则留下悬垂渲染物。
@@ -332,9 +346,84 @@ impl RenderExtractor {
             server.set_flip(handle, flip_of(flip_h, flip_v));
             server.set_z(handle, z, node_order);
             server.set_visible(handle, visible);
-            // 类型专属属性：Label 的文本状态 / Control 的锚点状态。
-            // 没有这一层，Label 就会以"有渲染物但没文字"的空壳上屏，
-            // Control 则连尺寸都没有 —— 这正是 S3 要补的两项缺口。
+            // —— S12-3 任务 4：滚动烘焙 + 滚动条 + 自动裁剪（D6）——
+            // 前序遍历的每个节点都取一次滚动上下文（纯函数：祖先滚动
+            // 偏移和 + 祖先 ScrollView 视口矩形交集）。四类承载
+            // ControlState 的准入（Control / Button / TextInput / List）
+            // 在推送前完成：① 烘焙祖先滚动平移；② ScrollView 自身发
+            // 滚动条视觉状态；③ 按类型推 SetClip。纯 Label 不参与 ——
+            // 自由文本既有观感不变。
+            let viewport = (frame.viewport.x, frame.viewport.y);
+            let (scroll_sum, ancestor_clip) =
+                scroll_context_of(tree, ui_states, node, viewport);
+            // 恒裁剪类型（无滚动祖先也推自身矩形）：摊平四类 + ScrollView
+            // 自身（ScrollView 走 Control 准入，按 kind 判定补上）。
+            let always_clip = matches!(
+                admission,
+                Admission::Button(..) | Admission::TextInput(..) | Admission::List(..)
+            ) || tree.kind_tag(node) == Some(NodeKindTag::ScrollView);
+            let mut clip: Option<Rect> = None;
+            match &mut admission {
+                Admission::Sprite(_) | Admission::Label(..) => {}
+                Admission::Control(_, layout)
+                | Admission::Button(_, layout, _)
+                | Admission::TextInput(_, layout, _)
+                | Admission::List(_, layout, _) => {
+                    // ① 滚动烘焙：祖先 ScrollView 把内容**向上**平移
+                    //    scroll 渲染（坐标约定单处实现于 nes_scene::ui），
+                    //    四边 offset 折进 +(0, -scroll_y) —— P1 冻结规则：
+                    //    内容按视口锚定创作，契约矩形不动，渲染与命中读到的
+                    //    都是平移后的同一矩形。偏移和为 0 不写（加性缺省）。
+                    if scroll_sum != 0.0 {
+                        layout.offset_top -= scroll_sum;
+                        layout.offset_bottom -= scroll_sum;
+                    }
+                    // ② 滚动条视觉状态（仅 ScrollView 自身；ListView/Tabs
+                    //    的行进滚动不配条 —— 任务冻结口径）。
+                    if tree.kind_tag(node) == Some(NodeKindTag::ScrollView) {
+                        let own_h = layout.resolve(frame.viewport).h;
+                        let scroll_max = scroll_max_of(tree, ui_states, node, viewport);
+                        let extent = own_h + scroll_max;
+                        let scroll = ui_states.scrolls.get(&node).copied().unwrap_or(0.0);
+                        let (frac, pos) = if extent <= own_h {
+                            // 除零防：内容装得下 = 满长滑块、归零位。
+                            (1.0_f32, 0.0_f32)
+                        } else {
+                            (
+                                (own_h / extent).clamp(0.0, 1.0),
+                                (scroll / (extent - own_h)).clamp(0.0, 1.0),
+                            )
+                        };
+                        // 滑块色用边框槽解析色（与容器同色系，不另开色源）。
+                        layout.scroll_bar = Some(ScrollBar {
+                            frac,
+                            pos,
+                            color: layout.border,
+                        });
+                    }
+                    // ③ 自动裁剪（D6）：
+                    //   - 有滚动祖先（结构性判定，与当前偏移值无关）：
+                    //     clip = 自身矩形 ∩ 祖先交集（交空 = 零矩形仍推 →
+                    //     全裁 —— wgpu 侧零尺寸裁剪条目不发实例）；
+                    //   - 无滚动祖先：恒裁剪类型仍推自身矩形（含边框 ——
+                    //     文本 + 4 内衬本来在界内，防窄窗溢出的根修）；
+                    //     裸 Control 不推 —— 既有输出逐位不变。
+                    let own = layout.resolve(frame.viewport);
+                    clip = match ancestor_clip {
+                        Some(anc) => {
+                            let (cx, cy, cw, ch) =
+                                rect_intersect((own.x, own.y, own.w, own.h), anc);
+                            Some(Rect::new(cx, cy, cw, ch))
+                        }
+                        None if always_clip => Some(own),
+                        None => None,
+                    };
+                }
+            }
+
+            // 类型专属属性：Label 的文本状态 / Control 的锚点状态 / List
+            // 的行状态。命令流里的输出序由服务端冻结（SetText → SetList
+            // → SetRect → SetClip），推送侧的调用次序不影响命令流。
             match &admission {
                 Admission::Sprite(_) => {}
                 Admission::Label(_, text) => server.set_text(handle, text),
@@ -352,6 +441,15 @@ impl RenderExtractor {
                     server.set_rect(handle, layout);
                     server.set_text(handle, text);
                 }
+                // 列表/页签摊平（S12-3 任务 4）：单节点单渲染物三件套。
+                Admission::List(_, layout, rows) => {
+                    server.set_list(handle, rows);
+                    server.set_rect(handle, layout);
+                }
+            }
+            // 裁剪恒在对应条目的 SetRect 之后推送（D1 推送序）。
+            if let Some(clip) = clip {
+                server.set_clip(handle, Some(clip));
             }
             stats.pushed += 1;
         }
@@ -422,6 +520,11 @@ enum Admission {
     /// 文本取 UiStates 草稿表的编辑会话（无会话 = 已提交值），光标走
     /// [`LabelState::caret`]（`None` = 不画 —— 闪隐的"隐"半拍）。
     TextInput(RenderAssetKey, ControlState, LabelState),
+    /// 列表/页签（S12-3 任务 4）：同句柄摊平 rows + rect —— 单渲染物
+    /// 三件套 `SetList` + `SetRect` + `SetClip`（输出序冻结）。ListView
+    /// 垂直轴 / Tabs 水平轴共用一个变体，方向由 [`ListState::axis`]
+    /// 承载；滚动偏移当帧值经 UiStates 共享面折进 [`ListState::scroll`]。
+    List(RenderAssetKey, ControlState, ListState),
 }
 
 impl Admission {
@@ -432,6 +535,7 @@ impl Admission {
             Admission::Label(key, _) => *key,
             Admission::Control(key, _) => *key,
             Admission::Button(key, _, _) | Admission::TextInput(key, _, _) => *key,
+            Admission::List(key, _, _) => *key,
         }
     }
 }
@@ -491,6 +595,18 @@ fn admit(
         // 节拍裁决（渲染侧零动画状态 —— 动画只在这一个判定点）。
         let (layout, text) = text_input_states_of(tree, node, theme, ui, caret_visible);
         Some(Admission::TextInput(node_key(node), layout, text))
+    } else if tag.is_a(NodeKindTag::ListView) {
+        // 列表（S12-3 任务 4）：恒准入（同 Control —— 空列表也要有框
+        // 与滚动条可点）；行文本/行高/选中/滚动一次摊平。
+        let layout = themed_control(tree, node, control_state_of(tree, node), theme);
+        let rows = list_state_of(tree, node, theme, ui, ListAxis::Vertical);
+        Some(Admission::List(node_key(node), layout, rows))
+    } else if tag.is_a(NodeKindTag::Tabs) {
+        // 页签（S12-3 任务 4）：与 ListView 同变体，仅轴与属性名不同
+        //（tabs / tab_w / active；水平轴忽略 scroll）。
+        let layout = themed_control(tree, node, control_state_of(tree, node), theme);
+        let rows = list_state_of(tree, node, theme, ui, ListAxis::Horizontal);
+        Some(Admission::List(node_key(node), layout, rows))
     } else if tag.is_a(NodeKindTag::Label) {
         let state = label_state_of(tree, node)?;
         Some(Admission::Label(
@@ -636,6 +752,61 @@ fn text_input_states_of(
     (layout, label)
 }
 
+/// 列表/页签摊平载荷（S12-3 任务 4）：[`ListState`] 一次备齐 ——
+///
+/// - **文本**：ListView 取 `rows` 属性、Tabs 取 `tabs` 属性（`'\n'` 分隔，
+///   与场景层 `rows_count` 同口径）；
+/// - **方向与几何**：`axis` 由准入分支给定；`row_h`（`row_h` 属性，I64，
+///   缺省 18、下限 1 —— 与场景层 [`nes_scene::ui`] 的行高口径一致）只对
+///   垂直轴生效，`tab_w`（`tab_w` 属性，I64，缺省 64）只对水平轴生效；
+/// - **滚动**：`UiStates::scrolls` 的当帧值（经 `attach_ui` 共享面；
+///   无记录 = 0 —— 滚轮没动过的列表不虚构滚动）；
+/// - **选中**：`selected`（ListView）/ `active`（Tabs）属性，`>= 0` 才
+///   `Some`（`-1` = 无选中是 schema 缺省）；越出 u16 的值饱和截断；
+/// - **着色**：`text_slot`（缺省 text）与 `sel_fill_slot`（缺省 selected）
+///   双主题槽解析。
+fn list_state_of(
+    tree: &SceneTree,
+    node: NodeId,
+    theme: &ThemeColors,
+    ui: Option<&UiStates>,
+    axis: ListAxis,
+) -> ListState {
+    let (text_prop, index_prop) = match axis {
+        ListAxis::Vertical => ("rows", "selected"),
+        ListAxis::Horizontal => ("tabs", "active"),
+    };
+    let text = match tree.prop(node, text_prop) {
+        Some(Value::Str(v)) => v.clone(),
+        _ => String::new(),
+    };
+    let mut rows = ListState::new(text.as_str(), LIST_FONT_SIZE);
+    rows.axis = axis;
+    rows.scroll = ui
+        .and_then(|u| u.scrolls.get(&node).copied())
+        .unwrap_or(0.0);
+    rows.selected = match tree.prop(node, index_prop).and_then(|v| v.as_i64()) {
+        Some(v) if v >= 0 => Some(u16::try_from(v).unwrap_or(u16::MAX)),
+        _ => None,
+    };
+    match axis {
+        ListAxis::Vertical => {
+            rows.row_h = f32_prop(tree, node, "row_h", LIST_ROW_H_DEFAULT).max(1.0);
+        }
+        ListAxis::Horizontal => {
+            rows.tab_w = f32_prop(tree, node, "tab_w", TABS_TAB_W_DEFAULT);
+        }
+    }
+    let text_slot = slot_prop(tree, node, "text_slot", "text");
+    rows.text_color = theme.slot(&text_slot).unwrap_or(rows.text_color);
+    let sel_fill_slot = slot_prop(tree, node, "sel_fill_slot", "selected");
+    rows.sel_fill = theme
+        .slot(&sel_fill_slot)
+        .or_else(|| theme.slot("selected"))
+        .unwrap_or(rows.sel_fill);
+    rows
+}
+
 /// 从 `Camera2D` 节点解析契约层的相机状态（[`RenderServer::set_camera`] 的实参）。
 ///
 /// 只做属性搬运与一次形状归一：`zoom` 在场景层是**标量**（schema 冻结），
@@ -755,6 +926,23 @@ fn bool_prop(tree: &SceneTree, node: NodeId, name: &str, default: bool) -> bool 
     tree.prop(node, name)
         .and_then(|value| value.as_bool())
         .unwrap_or(default)
+}
+
+/// 矩形求交（与 `nes_scene::ui` 命中测算的交集同式：空交 = 零尺寸
+/// 矩形）。用于 D6 自动裁剪的"自身矩形 ∩ 祖先 ScrollView 交集"；
+/// 零矩形推出去表示**全裁**（wgpu 侧零尺寸裁剪条目整条省略实例）。
+fn rect_intersect(
+    a: (f32, f32, f32, f32),
+    b: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    if x1 <= x0 || y1 <= y0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    (x0, y0, x1 - x0, y1 - y0)
 }
 
 /// 取 `z_index`（缺失 / 类型不对 → `0`；schema 已把范围 clamp 到 ±4096）。

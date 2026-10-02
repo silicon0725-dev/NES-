@@ -1201,6 +1201,10 @@ wgpu_api! {
         (*mut c_void, u32, *mut c_void, u64, u64);
     render_pass_encoder_draw: "wgpuRenderPassEncoderDraw",
         (*mut c_void, u32, u32, u32, u32);
+    // 裁剪矩形（E-2 / S12-3）：wgpuRenderPassEncoderSetScissorRect(pass, x, y, w, h)，
+    // 帧缓冲像素坐标、半开区间。符号存在性已对本机 wgpu_native.dll 导出表实测验证。
+    render_pass_encoder_set_scissor_rect: "wgpuRenderPassEncoderSetScissorRect",
+        (*mut c_void, u32, u32, u32, u32);
     render_pass_encoder_end: "wgpuRenderPassEncoderEnd", (*mut c_void);
     queue_submit: "wgpuQueueSubmit", (*mut c_void, usize, *const *mut c_void);
     queue_write_buffer: "wgpuQueueWriteBuffer",

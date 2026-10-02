@@ -58,9 +58,9 @@ use std::path::Path;
 use nes_render_api::command::{FrameInfo, RenderCommand};
 use nes_render_api::handle::{ItemHandle, RenderAssetKey};
 use nes_render_api::item::RenderItem;
-use nes_render_api::math::Affine2;
+use nes_render_api::math::{Affine2, Rect};
 use nes_render_api::server::RenderServer;
-use nes_render_api::state::{Camera2DState, ControlState, Flip, LabelState};
+use nes_render_api::state::{Camera2DState, ControlState, Flip, LabelState, ListAxis, ListState};
 
 use crate::error::BackendError;
 use crate::ffi;
@@ -87,12 +87,12 @@ pub const CLEAR_COLOR: ffi::ClearColor = ffi::ClearColor {
 /// 绑定得比声明小，驱动会在创建绑定组时判定布局不兼容。
 const VIEW_UNIFORM_BYTES: u64 = 8 * core::mem::size_of::<f32>() as u64;
 
-/// 单个精灵实例的字节跨度（16 个 `f32`：2x3 世界矩阵 + UV 矩形 + 采样
-/// 来源 + 着色 RGBA —— E-1 颜色通道，S12.1）。
+/// 单个精灵实例的字节跨度（20 个 `f32`：2x3 世界矩阵 + UV 矩形 + 采样来源 +
+/// 着色 RGBA（E-1 颜色通道，S12.1）+ 视口空间裁剪矩形（E-2 裁剪契约，S12-3））。
 ///
 /// 与 `gpu::Sizes` 系（图集侧声明的视图缓冲尺寸）同一纪律：布局声明与
 /// CPU 打包必须同步，扩字段时两处一起改。
-const INSTANCE_STRIDE: u64 = 16 * core::mem::size_of::<f32>() as u64;
+const INSTANCE_STRIDE: u64 = 20 * core::mem::size_of::<f32>() as u64;
 
 /// 初始实例容量（64 个精灵 = 2 KiB；不足时按需倍增重建缓冲）。
 const INITIAL_INSTANCE_CAPACITY: u32 = 64;
@@ -100,7 +100,7 @@ const INITIAL_INSTANCE_CAPACITY: u32 = 64;
 /// 精灵着色器（WGSL）。
 ///
 /// 几何由 `vertex_index` 生成（两个三角形拼一个四边形，**不需要顶点缓冲存几何**），
-/// 每精灵数据走实例步进的 8 个 `f32`。着色器里的字面量 `4.0` 是图集每边格数
+/// 每精灵数据走实例步进的 20 个 `f32`。着色器里的字面量 `4.0` 是图集每边格数
 /// （[`gpu::ATLAS_CELLS`]），构建期有 `debug_assert` 钉住同步。
 const SPRITE_WGSL: &str = r#"
 // 单个精灵的绘制边长（像素）= gpu::CELL_PX（构建期 debug_assert 钉住同步）。
@@ -115,14 +115,17 @@ struct ViewParams {
     col2: vec2<f32>,
     viewport: vec2<f32>,
 };
-// 每精灵实例数据（实例步进顶点缓冲，16 个 f32 = 64 字节）：
+// 每精灵实例数据（实例步进顶点缓冲，20 个 f32 = 80 字节）：
 //   loc0..2 = 世界矩阵三列（已含 flip 的子局部后乘）；
 //   loc3    = UV 矩形 (u0, v0, us, vs)；
 //   loc4    = 采样来源 (瓦片号, 类型)：类型 0 = 内建图集、1 = 注册表瓦片
 //             （注册表是单张平铺大纹理，位置全在 UV 矩形里；瓦片号仅作
 //             实例侧留档，着色器当前不读它）；
 //   loc5    = 着色 RGBA（直 alpha，归一化 0..1；E-1 —— 采样色 x tint，
-//             中性 [1,1,1,1] 与 E-1 之前逐位相同）。
+//             中性 [1,1,1,1] 与 E-1 之前逐位相同）；
+//   loc6    = 视口空间裁剪矩形 (x, y, w, h)（E-2 / S12-3）：裁剪经 encoder
+//             侧 scissor 执行，着色器**不读**它 —— 实例布局保持自洽，
+//             便于实例侧对账与后续扩展。
 struct SpriteData {
     @location(0) col0: vec2<f32>,
     @location(1) col1: vec2<f32>,
@@ -130,6 +133,7 @@ struct SpriteData {
     @location(3) uv_rect: vec4<f32>,
     @location(4) source: vec2<f32>,
     @location(5) tint: vec4<f32>,
+    @location(6) clip: vec4<f32>,
 };
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
@@ -212,7 +216,12 @@ pub struct WgpuRenderServer {
     next_handle: u64,
     items: BTreeMap<ItemHandle, RenderItem>,
     labels: BTreeMap<ItemHandle, LabelState>,
+    /// 列表/页签簿记（S12-3 任务 4，与 `NullRenderServer` 同构）。
+    lists: BTreeMap<ItemHandle, ListState>,
     rects: BTreeMap<ItemHandle, ControlState>,
+    /// 裁剪簿记（E-2 / D1，与 `NullRenderServer` 同构）：`Some(rect)` 存、
+    /// `None`/销毁移除；`submit_into` 在对应条目的 `SetRect` 之后追加 `SetClip`。
+    clips: BTreeMap<ItemHandle, Rect>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
 }
@@ -268,7 +277,9 @@ impl RenderServer for WgpuRenderServer {
             return;
         }
         self.labels.remove(&handle);
+        self.lists.remove(&handle);
         self.rects.remove(&handle);
+        self.clips.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
     }
 
@@ -307,9 +318,31 @@ impl RenderServer for WgpuRenderServer {
         }
     }
 
+    fn set_list(&mut self, handle: ItemHandle, rows: &ListState) {
+        if self.items.contains_key(&handle) {
+            self.lists.insert(handle, rows.clone());
+        }
+    }
+
     fn set_rect(&mut self, handle: ItemHandle, rect: &ControlState) {
         if self.items.contains_key(&handle) {
             self.rects.insert(handle, *rect);
+        }
+    }
+
+    fn set_clip(&mut self, handle: ItemHandle, rect: Option<Rect>) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1 口径）。
+            return;
+        }
+        match rect {
+            Some(rect) => {
+                self.clips.insert(handle, rect);
+            }
+            None => {
+                // `None` = 清除裁剪（本来就没有也是合法的清除）。
+                self.clips.remove(&handle);
+            }
         }
     }
 
@@ -352,10 +385,25 @@ impl RenderServer for WgpuRenderServer {
                     text: text.clone(),
                 });
             }
+            // 列表/页签（S12-3 任务 4）：输出序冻结 SetText → SetList →
+            // SetRect → SetClip（与 `NullRenderServer` 严格同序）。
+            if let Some(rows) = self.lists.get(&item.handle) {
+                out.push(RenderCommand::SetList {
+                    handle: item.handle,
+                    rows: rows.clone(),
+                });
+            }
             if let Some(rect) = self.rects.get(&item.handle) {
                 out.push(RenderCommand::SetRect {
                     handle: item.handle,
                     rect: *rect,
+                });
+            }
+            // 裁剪恒在 SetRect 之后（E-2 / D1 推送序）；仅当该条目存在裁剪时追加。
+            if let Some(clip) = self.clips.get(&item.handle) {
+                out.push(RenderCommand::SetClip {
+                    handle: item.handle,
+                    rect: Some(*clip),
                 });
             }
         }
@@ -377,7 +425,7 @@ pub struct FrameStats {
     /// `DestroyItem` 命中数。
     pub destroys: u64,
     /// 命中已知句柄的属性命令数（`SetTransform` / `SetFlip` / `SetZ` /
-    /// `SetVisible` / `SetText` / `SetRect`）。
+    /// `SetVisible` / `SetText` / `SetList` / `SetRect` / `SetClip`）。
     pub updates: u64,
     /// 因空句柄 / 未知句柄被静默忽略的命令数（契约 I1 的可观测计数）。
     pub ignored: u64,
@@ -389,7 +437,7 @@ pub struct FrameStats {
     pub controls: u64,
     /// 其中从纹理注册表采样真实纹理的精灵数（不含字形；字形单列）。
     pub from_registry: u64,
-    /// 其中字形四边形数（`SetText` 展开的文本像素）。
+    /// 其中字形四边形数（`SetText` / `SetList` 展开的文本像素）。
     pub glyphs: u64,
     /// 是否应用了相机（相机存在、启用且视口合法）。
     pub camera_applied: bool,
@@ -420,7 +468,7 @@ impl FrameOutcome {
 
 // ------------------------------------------------------------ SpritePipeline
 
-/// 一条精灵绘制记录（实例缓冲的单条数据，16 个 `f32`）。
+/// 一条精灵绘制记录（实例缓冲的单条数据，20 个 `f32`）。
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct SpriteInstance {
     /// 渲染物句柄（不进 GPU，仅供帧对账与诊断）。
@@ -436,9 +484,17 @@ pub struct SpriteInstance {
     /// 着色 RGBA（直 alpha 归一化 0..1；E-1 颜色通道，S12.1）。
     /// 缺省 `[1,1,1,1]` 中性 —— 与 E-1 之前逐位相同。
     pub tint: [f32; 4],
+    /// 视口空间裁剪矩形 `[x, y, w, h]`（E-2 裁剪契约，S12-3）。
+    /// 缺省 [`Self::NO_CLIP`] 哨兵 = 无裁剪（输出与裁剪机制之前逐位相同）；
+    /// 裁剪由 `render` 按"连续相同 clip 值分段 + encoder 侧 scissor"执行，
+    /// 该值进实例缓冲是为保持实例布局自洽（着色器声明与对账可读）。
+    pub clip: [f32; 4],
 }
 
 impl SpriteInstance {
+    /// 无裁剪哨兵：视口空间 `[0,0,0,0]`，折算为"全目标 scissor"。
+    pub const NO_CLIP: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
     /// RGBA8（直 alpha）-> 实例着色（归一化）。
     pub fn tint_of(rgba: [u8; 4]) -> [f32; 4] {
         [
@@ -465,6 +521,125 @@ fn cell_uv_rect(key: RenderAssetKey) -> [f32; 4] {
         cell,
         cell,
     ]
+}
+
+/// 发一行/一页签的实例（S12-3 任务 4；垂直轴与水平轴共用的发射子程序）：
+///
+/// 1. 选中填充条（`selected` 为真时）：铺在 `band` 处，tint = `sel_fill`
+///    （选中行的观感差异来自这条填充条；字形若再用 sel_fill 会与条同色
+///    隐形，故字形 tint 恒取 `text_color`）；
+/// 2. 字形序列：等宽推进、空格与表外字符只推进笔位；`max_chars` 截断
+///    （水平轴页签用 `(tab_w - 8) / 16`，垂直轴不截断传 `usize::MAX`）；
+///    字格 UV 按纹理实际尺寸折算（与文本分支同一算式，S8.2 实证修复）。
+#[allow(clippy::too_many_arguments)]
+fn push_list_row(
+    sprites: &mut Vec<SpriteInstance>,
+    handle: ItemHandle,
+    item_clip: [f32; 4],
+    inv: &Affine2,
+    fill_uv: [f32; 4],
+    font: FontEntry,
+    sheet_uv: [f32; 4],
+    tile: u32,
+    sel_fill: [u8; 4],
+    text_color: [u8; 4],
+    pen: (f32, f32),
+    band: (f32, f32, f32, f32),
+    selected: bool,
+    line: &str,
+    max_chars: usize,
+    glyphs: &mut u64,
+) {
+    // ① 选中填充条（填充格 + sel_fill 着色；退化条不画）。
+    if selected {
+        let (bx, by, bw, bh) = band;
+        if bw > 0.0 && bh > 0.0 {
+            let quad = Affine2::translation(bx, by).mul(&Affine2::scale(
+                bw / gpu::CELL_PX as f32,
+                bh / gpu::CELL_PX as f32,
+            ));
+            sprites.push(SpriteInstance {
+                handle,
+                world: inv.mul(&quad).to_array(),
+                uv_rect: fill_uv,
+                source: [0.0, 0.0],
+                tint: SpriteInstance::tint_of(sel_fill),
+                clip: item_clip,
+            });
+        }
+    }
+    // ② 字形序列。
+    let cell_us = sheet_uv[2] * font.cell.0 / font.tex.0;
+    let cell_vs = sheet_uv[3] * font.cell.1 / font.tex.1;
+    let text_tint = SpriteInstance::tint_of(text_color);
+    let glyph_scale = Affine2::scale(
+        font.cell.0 / gpu::CELL_PX as f32,
+        font.cell.1 / gpu::CELL_PX as f32,
+    );
+    for (char_index, ch) in line.chars().take(max_chars).enumerate() {
+        // 空格无墨，只推进笔位（笔位由 char_index 决定，跳过不影响后续落字）。
+        let code = ch as u32;
+        if ch == ' ' || !(font.first_char..font.first_char + font.count).contains(&code) {
+            continue;
+        }
+        let index = code - font.first_char;
+        let col = index % font.cols;
+        let row = index / font.cols;
+        let quad = inv
+            .mul(&Affine2::translation(
+                pen.0 + char_index as f32 * font.advance,
+                pen.1,
+            ))
+            .mul(&glyph_scale);
+        sprites.push(SpriteInstance {
+            handle,
+            world: quad.to_array(),
+            uv_rect: [
+                sheet_uv[0] + col as f32 * cell_us,
+                sheet_uv[1] + row as f32 * cell_vs,
+                cell_us,
+                cell_vs,
+            ],
+            source: [tile as f32, 1.0],
+            tint: text_tint,
+            clip: item_clip,
+        });
+        *glyphs += 1;
+    }
+}
+
+/// 视口空间裁剪矩形 -> 帧缓冲像素 scissor（E-2 裁剪契约，S12-3）。
+///
+/// 折算规则（冻结）：
+/// - 哨兵 [`SpriteInstance::NO_CLIP`]（`[0,0,0,0]`）= 全目标 scissor ——
+///   每段显式设置，不依赖跨段状态；
+/// - 其余按 `target_size / viewport` 比例缩放、`floor` 取整成**半开区间**
+///   `[x0, x1) x [y0, y1)`，再与目标边界求交（保守包含亚像素覆盖的边界像素，
+///   像素内部由光栅器精确裁剪）；
+/// - 交集为空（或视口退化 / 裁剪值非有限）返回 `None`，调用方整段跳过。
+fn clip_to_scissor(
+    clip: [f32; 4],
+    viewport: (f32, f32),
+    target: (u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    if clip == SpriteInstance::NO_CLIP {
+        return Some((0, 0, target.0, target.1));
+    }
+    if viewport.0 <= 0.0 || viewport.1 <= 0.0 || clip.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let scale_x = target.0 as f32 / viewport.0;
+    let scale_y = target.1 as f32 / viewport.1;
+    let fx = clip[0] * scale_x;
+    let fy = clip[1] * scale_y;
+    let x0 = fx.floor().max(0.0);
+    let y0 = fy.floor().max(0.0);
+    let x1 = (fx + clip[2] * scale_x).floor().min(target.0 as f32);
+    let y1 = (fy + clip[3] * scale_y).floor().min(target.1 as f32);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
 /// 释放管线句柄所需的函数指针（理由同 `gpu::TargetOps`：让 `Drop` 独立成立）。
@@ -557,7 +732,9 @@ impl SpritePipeline {
             return Err(BackendError::NullHandle("WGPUPipelineLayout(sprite)"));
         }
 
-        // 4) 渲染管线的顶点属性表：三列矩阵 + UV 矩形 + 采样来源（步长 48 字节）。
+        // 4) 渲染管线的顶点属性表：三列矩阵 + UV 矩形 + 采样来源 + 着色 RGBA +
+        //    裁剪矩形（跨度 INSTANCE_STRIDE = 80 字节；loc6 与 WGSL 的
+        //    SpriteData::clip 对应 —— 布局声明与 CPU 打包同步扩展）。
         let attributes = [
             ffi::VertexAttribute {
                 next_in_chain: ptr::null_mut(),
@@ -594,6 +771,12 @@ impl SpritePipeline {
                 format: ffi::WGPU_VERTEX_FORMAT_FLOAT32X4,
                 offset: 48,
                 shader_location: 5,
+            },
+            ffi::VertexAttribute {
+                next_in_chain: ptr::null_mut(),
+                format: ffi::WGPU_VERTEX_FORMAT_FLOAT32X4,
+                offset: 64,
+                shader_location: 6,
             },
         ];
         let buffers = [ffi::VertexBufferLayout {
@@ -708,8 +891,21 @@ impl SpritePipeline {
     /// `view` 是 8 个 `f32`：`[a, b, c, d, tx, ty, viewport_w, viewport_h]`
     /// （视图矩阵来自契约的 `Camera2DState::view_matrix`，本层不另行推导）。
     /// `registry` 提供第二绑定组（group 1），按实例数据在内建图集与注册表
-    /// 之间选择采样来源。无精灵时仍执行清屏与存储 —— "空帧也要有合法像素"
-    /// 是读回的前提。
+    /// 之间选择采样来源。`target_size` 是帧缓冲的像素尺寸（scissor 折算
+    /// 比例的分母口径用 `view` 里的视口、分子用本参数）。无精灵时仍执行
+    /// 清屏与存储 —— "空帧也要有合法像素"是读回的前提。
+    ///
+    /// # E-2 裁剪（S12-3）
+    ///
+    /// 精灵列表按**连续相同 `clip` 值**划段，每段先显式设 scissor 再
+    /// `draw`：哨兵 [`SpriteInstance::NO_CLIP`] = 全目标 scissor（每段都
+    /// 显式设置，状态不跨段继承，无"上一段裁剪泄漏到下一段"的时序隐患）；
+    /// 真实裁剪值按 `target_size / viewport` 比例折算成帧缓冲像素、`floor`
+    /// 取整为半开区间后与目标边界求交，交集为空的段整段跳过（一次 draw
+    /// 都不发）。缺省路径（全部实例无裁剪）与单次整批 draw 逐位相同。
+    ///
+    /// 返回**实际经 `draw` 提交**的实例数（被空交集跳过的段不计入 ——
+    /// `FrameStats::drawn` 的"实际提交"口径由此保证）。
     pub fn render(
         &mut self,
         ctx: &GpuContext,
@@ -717,7 +913,8 @@ impl SpritePipeline {
         registry: &gpu::TextureRegistry,
         view: &[f32; 8],
         sprites: &[SpriteInstance],
-    ) -> Result<(), BackendError> {
+        target_size: (u32, u32),
+    ) -> Result<u64, BackendError> {
         self.ensure_capacity(ctx, sprites.len() as u32)?;
         let api = ctx.api();
 
@@ -734,6 +931,7 @@ impl SpritePipeline {
         }
 
         // 2) 打包并上传实例数据（staging 跨帧复用，稳态零分配）。
+        //    链序 = 顶点属性表序：world -> uv_rect -> source -> tint -> clip。
         self.staging.clear();
         for sprite in sprites {
             for f in sprite
@@ -742,6 +940,7 @@ impl SpritePipeline {
                 .chain(sprite.uv_rect.iter())
                 .chain(sprite.source.iter())
                 .chain(sprite.tint.iter())
+                .chain(sprite.clip.iter())
             {
                 self.staging.extend_from_slice(&f.to_ne_bytes());
             }
@@ -791,6 +990,8 @@ impl SpritePipeline {
             unsafe { (api.command_encoder_release)(encoder) };
             return Err(BackendError::NullHandle("WGPURenderPassEncoder(sprite)"));
         }
+        // 实际提交的实例数（空交集段不计）。
+        let mut submitted: u64 = 0;
         // SAFETY: pass 由上一行返回且非空；本块内不再并发使用 encoder。
         unsafe {
             (api.render_pass_encoder_set_pipeline)(pass, self.pipeline);
@@ -810,7 +1011,26 @@ impl SpritePipeline {
                     0,
                     self.staging.len() as u64,
                 );
-                (api.render_pass_encoder_draw)(pass, 6, sprites.len() as u32, 0, 0);
+                // E-2 裁剪（S12-3）：按连续相同 clip 值把实例划成段，每段先
+                // 显式设 scissor 再画（哨兵段也显式设回全目标 —— 状态不跨段
+                // 继承，无泄漏）。缺省路径（全部哨兵）只有一段，等价于整批 draw。
+                let mut start = 0usize;
+                while start < sprites.len() {
+                    let clip = sprites[start].clip;
+                    let mut end = start + 1;
+                    while end < sprites.len() && sprites[end].clip == clip {
+                        end += 1;
+                    }
+                    if let Some((x, y, w, h)) =
+                        clip_to_scissor(clip, (view[6], view[7]), target_size)
+                    {
+                        (api.render_pass_encoder_set_scissor_rect)(pass, x, y, w, h);
+                        (api.render_pass_encoder_draw)(pass, 6, (end - start) as u32, 0, start as u32);
+                        submitted += (end - start) as u64;
+                    }
+                    // 交集为空的段整段跳过：不可见内容一次 draw 都不发。
+                    start = end;
+                }
             }
             (api.render_pass_encoder_end)(pass);
             (api.render_pass_encoder_release)(pass);
@@ -826,7 +1046,7 @@ impl SpritePipeline {
             (api.queue_submit)(ctx.queue(), 1, &command_buffer);
             (api.command_buffer_release)(command_buffer);
         }
-        Ok(())
+        Ok(submitted)
     }
 }
 
@@ -900,6 +1120,10 @@ pub struct CommandConsumer {
     /// 跨帧文本状态登记表（`SetText` 建、`DestroyItem` 删）。有 `SetText` 状态的
     /// 渲染物按字形表展开成文本（S4.4，见模块文档）。
     texts: BTreeMap<ItemHandle, LabelState>,
+    /// 跨帧列表/页签登记表（`SetList` 建、`DestroyItem` 删；S12-3 任务 4）。
+    /// 有 `SetList` 状态的渲染物按行/页签展开成字形序列（笔起点 = 矩形
+    /// 左上 + 4 内衬，行 y 随 `ListState::scroll` 平移）。
+    lists: BTreeMap<ItemHandle, ListState>,
     /// 字体登记表：资源键 -> 排版参数（字形表本体作为纹理住在注册表里）。
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
@@ -989,6 +1213,7 @@ impl CommandConsumer {
             items: BTreeMap::new(),
             rects: BTreeMap::new(),
             texts: BTreeMap::new(),
+            lists: BTreeMap::new(),
             fonts: BTreeMap::new(),
             pipeline,
             atlas,
@@ -1123,6 +1348,21 @@ impl CommandConsumer {
         &self.pipeline
     }
 
+    /// 字体解析（T-Text-07/08 口径）：`font == NIL` 或指向未登记键 ->
+    /// 默认字体；指向已登记键 -> 该字体。两种都拿不到时返回 `None`。
+    /// 文本（SetText）与列表/页签（SetList）两条展开路径共用 —— 解析
+    /// 只有这一处实现。
+    fn resolve_font(&self, font: RenderAssetKey) -> Option<(RenderAssetKey, FontEntry)> {
+        if font.is_nil() {
+            self.fonts.get(&DEFAULT_FONT_KEY).map(|e| (DEFAULT_FONT_KEY, *e))
+        } else {
+            self.fonts
+                .get(&font)
+                .map(|e| (font, *e))
+                .or_else(|| self.fonts.get(&DEFAULT_FONT_KEY).map(|e| (DEFAULT_FONT_KEY, *e)))
+        }
+    }
+
     /// 驱动侧未捕获错误快照（`FrameStats::driver_errors` 的原文出处）。
     pub fn errors_snapshot(&self) -> Vec<String> {
         self.ctx.errors_snapshot()
@@ -1160,6 +1400,12 @@ impl CommandConsumer {
         let mut stats = FrameStats::default();
         let mut camera: Option<Camera2DState> = None;
         let errors_before = self.ctx.errors_len();
+        // 裁剪表是**帧本地**的（E-2 / D1）：每帧的裁剪状态只来自本帧命令流。
+        // 与 rects/texts 的跨帧登记表刻意不同 —— 契约侧的 `set_clip(h, None)`
+        // 清除后，后续帧的全量快照里不再出现该条目的 `SetClip`，帧本地表让
+        // "未被重申的裁剪 = 本帧不裁"自然成立（缺省路径因此与裁剪机制之前
+        // 逐位相同）；`SetClip { rect: None }` 在帧内同样按"清除"处理。
+        let mut clips: BTreeMap<ItemHandle, Rect> = BTreeMap::new();
 
         for command in commands {
             stats.commands += 1;
@@ -1173,6 +1419,7 @@ impl CommandConsumer {
                     if self.items.remove(handle).is_some() {
                         self.rects.remove(handle);
                         self.texts.remove(handle);
+                        self.lists.remove(handle);
                         stats.destroys += 1;
                     } else {
                         stats.ignored += 1;
@@ -1224,6 +1471,23 @@ impl CommandConsumer {
                         stats.ignored += 1;
                     }
                 }
+                // SetClip：登记/清除裁剪矩形（E-2 / D1）。入帧本地表（见其声明
+                // 处的说明）；空句柄 / 未知句柄静默忽略（契约 I1 口径）。
+                RenderCommand::SetClip { handle, rect } => {
+                    if self.items.contains_key(handle) {
+                        match rect {
+                            Some(rect) => {
+                                clips.insert(*handle, *rect);
+                            }
+                            None => {
+                                clips.remove(handle);
+                            }
+                        }
+                        stats.updates += 1;
+                    } else {
+                        stats.ignored += 1;
+                    }
+                }
                 RenderCommand::SetText { handle, text } => {
                     if self.items.contains_key(handle) {
                         // 有 SetText 状态的渲染物按文本对待（同理不依赖纹理键）。
@@ -1233,12 +1497,22 @@ impl CommandConsumer {
                         stats.ignored += 1;
                     }
                 }
+                // SetList：登记列表/页签状态（S12-3 任务 4），绘制阶段按
+                // 行/页签展开成字形序列（与 SetText 同一字形机制）。
+                RenderCommand::SetList { handle, rows } => {
+                    if self.items.contains_key(handle) {
+                        self.lists.insert(*handle, rows.clone());
+                        stats.updates += 1;
+                    } else {
+                        stats.ignored += 1;
+                    }
+                }
                 RenderCommand::Submit { .. } => {} // 终止标记，已在入口校验。
             }
         }
 
-        // 绘制列表：可见，且（精灵：资源键已绑定 / 控件：有 SetRect / 文本：有
-        // SetText），按 DrawKey 升序（契约 I5）。
+        // 绘制列表：可见，且（精灵：资源键已绑定 / 控件：有 SetRect / 文本：
+        // 有 SetText / 列表：有 SetList），按 DrawKey 升序（契约 I5）。
         let mut draw_list: Vec<&RenderItem> = self
             .items
             .values()
@@ -1246,7 +1520,8 @@ impl CommandConsumer {
                 item.visible
                     && (!item.key.is_nil()
                         || self.rects.contains_key(&item.handle)
-                        || self.texts.contains_key(&item.handle))
+                        || self.texts.contains_key(&item.handle)
+                        || self.lists.contains_key(&item.handle))
             })
             .collect();
         draw_list.sort_by_key(|item| item.draw_key());
@@ -1288,6 +1563,21 @@ impl CommandConsumer {
             cell_uv,
         ];
         for item in draw_list {
+            // E-2 裁剪：该条目本帧的视口空间裁剪矩形（帧本地表，无则哨兵），
+            // 条目的全部实例共享同一裁剪 —— render 侧按连续相同 clip 值分段设 scissor。
+            let clip_entry = clips.get(&item.handle);
+            // D6 全裁（S12-3 任务 4）：零尺寸/负尺寸裁剪矩形 = 本帧什么都不画
+            //（空交集条目）。实例侧的零矩形与 NO_CLIP 哨兵（[0,0,0,0] = 全目标
+            // scissor）在表示上不可区分，"空交 = 全裁"必须在这里提前拦下 ——
+            // 该条目的实例整条省略，效果等同空 scissor。
+            if let Some(rect) = clip_entry {
+                if rect.w <= 0.0 || rect.h <= 0.0 {
+                    continue;
+                }
+            }
+            let item_clip = clip_entry
+                .map(|rect| rect.to_array())
+                .unwrap_or(SpriteInstance::NO_CLIP);
             if let (Some(rect_state), Some(inv)) = (self.rects.get(&item.handle), inv_view) {
                 let rect = rect_state.resolve(viewport);
                 // 填充（alpha == 0 不发 —— 缺省透明，与 E-1 之前同像素）。
@@ -1302,6 +1592,7 @@ impl CommandConsumer {
                         uv_rect: fill_uv,
                         source: [0.0, 0.0],
                         tint: SpriteInstance::tint_of(rect_state.fill),
+                        clip: item_clip,
                     });
                 }
                 // 边框：四条 border_w 宽的填充条（上/下/左/右）。
@@ -1328,25 +1619,137 @@ impl CommandConsumer {
                             uv_rect: fill_uv,
                             source: [0.0, 0.0],
                             tint: border_tint,
+                            clip: item_clip,
                         });
                     }
                 }
+                // 滚动条（S12-3 任务 4）：`ControlState::scroll_bar` 为 Some
+                // 时在矩形**右缘内侧**画 4px 宽竖向滑块（x = rect.x+rect.w-5），
+                // 滑块长 max(8, frac*(h-2))，行程 = h-2-滑块长、按 pos 取位，
+                // y 基点 = rect.y+1（上下各让 1px 内衬）。填充格 + tint =
+                // bar.color（提取层算好的视觉状态，本层零再计算）。
+                if let Some(bar) = rect_state.scroll_bar {
+                    let thumb_h = (bar.frac * (rect.h - 2.0)).max(8.0);
+                    let bar_x = rect.x + rect.w - 5.0;
+                    let bar_y = rect.y + 1.0 + bar.pos * (rect.h - 2.0 - thumb_h);
+                    let quad = Affine2::translation(bar_x, bar_y).mul(&Affine2::scale(
+                        4.0 / gpu::CELL_PX as f32,
+                        thumb_h / gpu::CELL_PX as f32,
+                    ));
+                    sprites.push(SpriteInstance {
+                        handle: item.handle,
+                        world: inv.mul(&quad).to_array(),
+                        uv_rect: fill_uv,
+                        source: [0.0, 0.0],
+                        tint: SpriteInstance::tint_of(bar.color),
+                        clip: item_clip,
+                    });
+                }
                 stats.controls += 1;
             }
-            if let Some(label) = self.texts.get(&item.handle) {
+            if let Some(rows) = self.lists.get(&item.handle) {
+                // 列表/页签展开（S12-3 任务 4）：与文本分支同构 —— 复用
+                // 同一套字体解析与字格 UV 机制，每行/页签一段字形序列。
+                // 笔起点 = 解析矩形左上 + 4 内衬（滚动烘焙已在 ControlState
+                // 的 offset 里，直接用解析矩形）。矩形缺席或视图退化时
+                // 不画（行进几何与裁剪都要矩形；摊平路径恒有 SetRect）。
+                if let (Some(rect_state), Some(inv)) = (self.rects.get(&item.handle), inv_view) {
+                    let rect = rect_state.resolve(viewport);
+                    if let Some((font_key, font)) = self.resolve_font(rows.font) {
+                        if let Some((tile, sheet_uv)) = self.registry.sample_info(font_key) {
+                            match rows.axis {
+                                ListAxis::Vertical => {
+                                    // 垂直轴（ListView）：行 i 的笔 y =
+                                    // 4 + i*row_h - scroll（scroll 已折进
+                                    // ListState —— 提取层当帧值；冻结算式）。
+                                    // 行完全超出矩形顶/底不画（clip 会裁，
+                                    // 这里省实例；continue 跳过但不影响
+                                    // 后续行的下标计数）。
+                                    for (i, line) in rows.text.split('\n').enumerate() {
+                                        let top =
+                                            rect.y + 4.0 + i as f32 * rows.row_h - rows.scroll;
+                                        if top >= rect.y + rect.h {
+                                            break; // 行超矩形底：其后各行更靠下。
+                                        }
+                                        if top + font.cell.1 <= rect.y {
+                                            continue; // 整行已在矩形顶之上。
+                                        }
+                                        let selected = rows.selected == Some(i as u16);
+                                        // 选中条：列表矩形内衬边框 1px
+                                        //（x+1..w-2），行带内衬 1px 高 row_h-2。
+                                        let band =
+                                            (rect.x + 1.0, top + 1.0, rect.w - 2.0, rows.row_h - 2.0);
+                                        push_list_row(
+                                            &mut sprites,
+                                            item.handle,
+                                            item_clip,
+                                            &inv,
+                                            fill_uv,
+                                            font,
+                                            sheet_uv,
+                                            tile,
+                                            rows.sel_fill,
+                                            rows.text_color,
+                                            (rect.x + 4.0, top),
+                                            band,
+                                            selected,
+                                            line,
+                                            usize::MAX,
+                                            &mut stats.glyphs,
+                                        );
+                                    }
+                                }
+                                ListAxis::Horizontal => {
+                                    // 水平轴（Tabs）：页签 i 的笔 x =
+                                    // 4 + i*tab_w（忽略 scroll —— 冻结口径）；
+                                    // 页签文本按 (tab_w - 8) / 16 个字符截断
+                                    //（16px 等宽冻结口径）。
+                                    let max_chars =
+                                        (((rows.tab_w - 8.0) / 16.0).floor().max(0.0)) as usize;
+                                    for (i, line) in rows.text.split('\n').enumerate() {
+                                        let left = rect.x + 4.0 + i as f32 * rows.tab_w;
+                                        if left >= rect.x + rect.w {
+                                            break; // 页签超矩形右缘：其后更靠右。
+                                        }
+                                        let selected = rows.selected == Some(i as u16);
+                                        // 选中条：页签格内衬边框 1px，高同行带。
+                                        let band = (
+                                            left + 1.0,
+                                            rect.y + 5.0,
+                                            rows.tab_w - 2.0,
+                                            rows.row_h - 2.0,
+                                        );
+                                        push_list_row(
+                                            &mut sprites,
+                                            item.handle,
+                                            item_clip,
+                                            &inv,
+                                            fill_uv,
+                                            font,
+                                            sheet_uv,
+                                            tile,
+                                            rows.sel_fill,
+                                            rows.text_color,
+                                            (left, rect.y + 4.0),
+                                            band,
+                                            selected,
+                                            line,
+                                            max_chars,
+                                            &mut stats.glyphs,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(label) = self.texts.get(&item.handle) {
                 // 文本（S4.4/S4.5）：世界变换 = 笔起点（首行首字格左上角），每字形
                 // 一个四边形，采样字形表对应字格。字距恒定（等宽口径）、
                 // 行高 = 基准 + line_spacing；空格与表外字符只推进笔位不画。
                 // 字体解析（T-Text-07/08 口径）：`font == NIL` 或指向未登记键
                 // -> 默认字体；指向已登记键 -> 该字体。两种都拿不到时不画。
-                let resolved_font = if label.font.is_nil() {
-                    self.fonts.get(&DEFAULT_FONT_KEY).map(|e| (DEFAULT_FONT_KEY, *e))
-                } else {
-                    self.fonts
-                        .get(&label.font)
-                        .map(|e| (label.font, *e))
-                        .or_else(|| self.fonts.get(&DEFAULT_FONT_KEY).map(|e| (DEFAULT_FONT_KEY, *e)))
-                };
+                let resolved_font = self.resolve_font(label.font);
                 if let Some((font_key, font)) = resolved_font {
                     if let Some((tile, sheet_uv)) = self.registry.sample_info(font_key) {
                         // 笔基点：纯 Label = 自身世界变换（既有行为）；
@@ -1401,6 +1804,7 @@ impl CommandConsumer {
                                     ],
                                     source: [tile as f32, 1.0],
                                     tint: text_tint,
+                                    clip: item_clip,
                                 });
                                 stats.glyphs += 1;
                             }
@@ -1425,6 +1829,7 @@ impl CommandConsumer {
                                 uv_rect: fill_uv,
                                 source: [0.0, 0.0],
                                 tint: text_tint,
+                                clip: item_clip,
                             });
                         }
                     }
@@ -1437,6 +1842,7 @@ impl CommandConsumer {
                     uv_rect,
                     source: [layer as f32, 1.0],
                     tint: [1.0, 1.0, 1.0, 1.0],
+                    clip: item_clip,
                 });
                 stats.from_registry += 1;
             } else if !self.rects.contains_key(&item.handle) {
@@ -1446,13 +1852,19 @@ impl CommandConsumer {
                     uv_rect: cell_uv_rect(item.key),
                     source: [0.0, 0.0],
                     tint: [1.0, 1.0, 1.0, 1.0],
+                    clip: item_clip,
                 });
             }
         }
 
-        self.pipeline
-            .render(&self.ctx, target_view, &self.registry, &view_params, &sprites)?;
-        stats.drawn = sprites.len() as u64;
+        stats.drawn = self.pipeline.render(
+            &self.ctx,
+            target_view,
+            &self.registry,
+            &view_params,
+            &sprites,
+            target_size,
+        )?;
         stats.driver_errors = self.ctx.errors_len().saturating_sub(errors_before) as u64;
         Ok(stats)
     }

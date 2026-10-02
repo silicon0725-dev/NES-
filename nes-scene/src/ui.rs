@@ -16,11 +16,24 @@
 //!   场景序轮转、点击空白 = 失焦 + 提交。输入框的**草稿与光标是
 //!   UiVm 瞬态**（[`TextState`]），回车提交 / Esc 回滚 / 失焦提交；
 //!   提交不直写属性表，只发 [`UiVm::on_commit`] 钩子。
+//! - **滚动与行点击（S12-3）**：ScrollView/ListView/Tabs 的垂直滚动
+//!   偏移是 UiVm 瞬态（[`UiStates::scrolls`]，与悬停/按下同款生灭
+//!   纪律）；滚轮（[`InputView::wheel`]，一次性）路由给前序序最后
+//!   命中的滚动控件，步进夹紧在 `[0, scroll_max]`。ListView 行点击
+//!   复用 Button 同款按下/抬键边沿机，抬键仍命中才回调
+//!   [`UiVm::on_row_activate`]（只回报告 (节点, 行下标)，选中落账
+//!   由宿主做 —— UiVm 零写权延续）。
 //!
 //! 命中口径：控件锚定**视口**（ControlState 单级锚定，S3 契约），
 //! UiVm 以 `anchor * viewport + offset`、尺寸 `size` 直算视口矩形，
 //! 无嵌套布局递归。命中优先级 = 前序序最后者（与提取层 last-write-wins
 //! 的相机/主题仲裁同款确定性规则）。
+//!
+//! 滚动坐标约定（S12-3，单处实现）：祖先 ScrollView 把内容**向上**
+//! 平移其滚动偏移渲染，命中矩形随之**减去**同一偏移
+//! （[`scroll_context_of`] 返回沿祖先链的偏移之和），再做祖先
+//! ScrollView 视口矩形交集裁剪（滚出容器的内容不可命中）。无滚动
+//! 祖先时上下文为 `(0.0, None)`，既有 Button/TextInput 命中零变化。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -129,14 +142,19 @@ pub struct TextState {
 
 /// 全部控件节点的瞬态状态表（UiVm 与提取层共享的只读面）。
 ///
-/// 两张子表：`widgets` 是悬停/按下等小旗标（`Copy`），`texts` 是
-/// TextInput 的编辑会话（草稿/光标，非 `Copy`）。
+/// 三张子表：`widgets` 是悬停/按下等小旗标（`Copy`），`texts` 是
+/// TextInput 的编辑会话（草稿/光标，非 `Copy`），`scrolls` 是
+/// ScrollView/ListView/Tabs 的垂直滚动偏移（S12-3）。
 #[derive(Default, Debug)]
 pub struct UiStates {
     /// 四态词汇（悬停/按下/选中/焦点）。
     pub widgets: HashMap<NodeId, WidgetState>,
     /// TextInput 编辑会话（仅持有焦点期间存在）。
     pub texts: HashMap<NodeId, TextState>,
+    /// 垂直滚动偏移（S12-3；仅滚轮实际改动过的滚动控件有记录）。
+    /// 与 widgets/texts 同款生灭纪律：死节点清扫、无输入视图全清、
+    /// 不序列化、不进语义指纹。
+    pub scrolls: HashMap<NodeId, f32>,
 }
 
 impl UiStates {
@@ -176,6 +194,9 @@ pub struct UiVm {
     /// 提交钩子（S12-2：TextInput 回车/失焦时回调整体草稿值；
     /// UiVm 零写权 —— 落不落属性表由宿主决定）。
     on_commit: Option<Box<dyn FnMut(NodeId, Value)>>,
+    /// 行点击钩子（S12-3：ListView 抬键仍命中时回调 (节点, 行下标)；
+    /// UiVm 零写权 —— 选中落账（写 `selected` 属性）由宿主做）。
+    on_row_activate: Option<Box<dyn FnMut(NodeId, u16)>>,
 }
 
 impl Default for UiVm {
@@ -199,6 +220,7 @@ impl UiVm {
             prev_escape: false,
             on_activate: None,
             on_commit: None,
+            on_row_activate: None,
         }
     }
 
@@ -216,6 +238,12 @@ impl UiVm {
     /// `(输入框节点, 提交值 Value::Str)`；后注册者覆盖）。
     pub fn on_commit(&mut self, f: impl FnMut(NodeId, Value) + 'static) {
         self.on_commit = Some(Box::new(f));
+    }
+
+    /// 注册行点击钩子（S12-3：ListView 抬键仍命中时回调
+    /// `(列表节点, 行下标 u16，0 起)`；后注册者覆盖）。
+    pub fn on_row_activate(&mut self, f: impl FnMut(NodeId, u16) + 'static) {
+        self.on_row_activate = Some(Box::new(f));
     }
 
     /// 状态表共享引用（提取层四态着色的只读面）。
@@ -258,6 +286,7 @@ impl UiVm {
             let mut states = self.states.borrow_mut();
             states.widgets.retain(|n, _| tree.contains(*n));
             states.texts.retain(|n, _| tree.contains(*n));
+            states.scrolls.retain(|n, _| tree.contains(*n));
             if let Some(f) = self.focus {
                 if !tree.contains(f) {
                     self.focus = None;
@@ -272,6 +301,7 @@ impl UiVm {
                 let mut states = self.states.borrow_mut();
                 states.widgets.clear();
                 states.texts.clear();
+                states.scrolls.clear();
             }
             self.focus = None;
             self.press_target = None;
@@ -290,32 +320,73 @@ impl UiVm {
 
         // 前序遍历收集可焦点控件（Button/TextInput，可见者）的命中与
         // 轮转序（前序 = 提取层同款确定性序，后者命中 —— 同一仲裁规则）。
+        // S12-3：滚动控件（ScrollView/ListView/Tabs，可见者）同轮收集，
+        // 命中矩形统一经祖先滚动上下文平移/裁剪（[`contextual_rect`]，
+        // 坐标约定见模块注释 —— 单处实现）；滚轮路由取前序序最后命中的
+        // 滚动控件，与 `hit` 同一条 last-write-wins 仲裁。
         let mut focusable: Vec<NodeId> = Vec::new();
         let mut hit: Option<NodeId> = None;
-        let mut stack = vec![tree.root()];
-        while let Some(node) = stack.pop() {
-            let tag = tree.kind_tag(node);
-            let is_widget = tag == Some(NodeKindTag::Button) || tag == Some(NodeKindTag::TextInput);
-            let visible = tree
-                .prop(node, "visible")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if is_widget && visible {
-                let rect = widget_rect(tree, node, viewport);
-                let inside = mx >= rect.0
-                    && my >= rect.1
-                    && mx < rect.0 + rect.2
-                    && my < rect.1 + rect.3;
-                if inside {
-                    hit = Some(node);
+        let mut scroll_hit: Option<(NodeId, (f32, f32, f32, f32))> = None;
+        let mut wheel_apply: Option<(NodeId, f32, f32)> = None;
+        {
+            let states = self.states.borrow();
+            let mut stack = vec![tree.root()];
+            while let Some(node) = stack.pop() {
+                let tag = tree.kind_tag(node);
+                let is_widget =
+                    tag == Some(NodeKindTag::Button) || tag == Some(NodeKindTag::TextInput);
+                let is_scroller = tag == Some(NodeKindTag::ScrollView)
+                    || tag == Some(NodeKindTag::ListView)
+                    || tag == Some(NodeKindTag::Tabs);
+                let visible = tree
+                    .prop(node, "visible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if (is_widget || is_scroller) && visible {
+                    let rect = contextual_rect(
+                        widget_rect(tree, node, viewport),
+                        scroll_context_of(tree, &states, node, viewport),
+                    );
+                    let inside = mx >= rect.0
+                        && my >= rect.1
+                        && mx < rect.0 + rect.2
+                        && my < rect.1 + rect.3;
+                    if inside {
+                        hit = Some(node);
+                        if is_scroller {
+                            scroll_hit = Some((node, rect));
+                        }
+                    }
+                    if is_widget {
+                        focusable.push(node);
+                    }
                 }
-                focusable.push(node);
-            }
-            if let Some(data) = tree.get(node) {
-                for &child in data.children.iter().rev() {
-                    stack.push(child);
+                if let Some(data) = tree.get(node) {
+                    for &child in data.children.iter().rev() {
+                        stack.push(child);
+                    }
                 }
             }
+
+            // 滚轮路由（wheel 一次性字段：当帧有效，无命中滚动控件即丢弃）。
+            // scroll = clamp(scroll − wheel.y * step, 0, scroll_max)：向上
+            // 滚（+y）内容回落向顶。夹紧上限是内容高度 − 视口高（下限 0）。
+            let wheel = input.wheel();
+            if wheel.1 != 0.0 {
+                if let Some((n, _)) = scroll_hit {
+                    let step = wheel_step(tree, n);
+                    let max = scroll_max_of(tree, &states, n, viewport);
+                    let old = states.scrolls.get(&n).copied().unwrap_or(0.0);
+                    let new = (old - wheel.1 * step).clamp(0.0, max);
+                    // 值无变化不落表：未滚动的控件不在 scrolls 里留 0.0 壳。
+                    if new != old {
+                        wheel_apply = Some((n, new, old));
+                    }
+                }
+            }
+        }
+        if let Some((n, new, _old)) = wheel_apply {
+            self.states.borrow_mut().scrolls.insert(n, new);
         }
 
         // —— 焦点路由（点击）——
@@ -341,17 +412,24 @@ impl UiVm {
             }
         }
         // 抬键沿：命中空白 = 失焦 + 提交（标准"点外面收起"语义）；
-        // 激活回调**仅 Button**（TextInput 点击是夺焦，不是激活 —— S12-2）。
+        // 激活回调**仅 Button**（TextInput 点击是夺焦，不是激活 —— S12-2）；
+        // ListView 走同款边沿机发行点击（S12-3）—— 抬键仍命中才结算。
         if release_edge {
             if hit.is_none() {
                 self.blur_commit(tree);
             }
             if let (Some(t), true) = (self.press_target, hit == self.press_target && hit.is_some())
             {
-                if tree.kind_tag(t) == Some(NodeKindTag::Button) {
-                    if let Some(cb) = self.on_activate.as_mut() {
-                        cb(t);
+                match tree.kind_tag(t) {
+                    Some(NodeKindTag::Button) => {
+                        if let Some(cb) = self.on_activate.as_mut() {
+                            cb(t);
+                        }
                     }
+                    Some(NodeKindTag::ListView) => {
+                        self.row_activate(tree, t, my, scroll_hit);
+                    }
+                    _ => {}
                 }
             }
             self.press_target = None;
@@ -504,6 +582,43 @@ impl UiVm {
             }
         }
     }
+
+    /// ListView 行点击结算（S12-3）：抬键仍命中同一列表时，把点击点
+    /// 换算回内容空间求行下标 —— 行 i 的屏上 y = 列表顶 + [`ROW_INSET`]
+    /// 内衬 + i × row_h − 自身滚动，反解 i = (my − 顶 − 4 + scroll) / row_h。
+    /// 顶内衬区（local < 0）与超出实际行数的下标不回调。
+    /// UiVm 零写权：只经 [`Self::on_row_activate`] 报告 (节点, 行下标)，
+    /// 选中落账（写 `selected` 属性）由宿主做。
+    fn row_activate(
+        &mut self,
+        tree: &SceneTree,
+        node: NodeId,
+        my: f32,
+        scroll_hit: Option<(NodeId, (f32, f32, f32, f32))>,
+    ) {
+        // 本帧命中矩形（已按祖先滚动上下文平移/裁剪 —— 与按下沿同源）。
+        let Some((_, rect)) = scroll_hit.filter(|(n, _)| *n == node) else {
+            return;
+        };
+        let scroll = self
+            .states
+            .borrow()
+            .scrolls
+            .get(&node)
+            .copied()
+            .unwrap_or(0.0);
+        let local = my - rect.1 - ROW_INSET + scroll;
+        if local < 0.0 {
+            return; // 顶内衬区：无行。
+        }
+        // local >= 0 时 `as u16` 即向下取整（Rust 浮点转整饱和截断）。
+        let row = (local / list_row_h(tree, node)) as u16;
+        if (row as usize) < rows_count(tree, node, "rows") {
+            if let Some(cb) = self.on_row_activate.as_mut() {
+                cb(node, row);
+            }
+        }
+    }
 }
 
 /// 取节点 `text` 属性的字符串值（缺失/类型错 = 空串）。
@@ -546,5 +661,182 @@ fn vec2_prop(tree: &SceneTree, node: NodeId, name: &str) -> crate::transform::Ve
     match tree.prop(node, name) {
         Some(Value::Vec2(v)) => *v,
         _ => crate::transform::Vec2::ZERO,
+    }
+}
+
+// —— S12-3 滚动/行命中测算（纯助手，提取层复用；单实现纪律）——
+
+/// 列表/页签行区顶内衬（像素）。行 i 的屏上 y = 列表视口顶 + 4 +
+/// i × row_h − 自身滚动（[`UiVm::row_activate`] 按此反解行下标）。
+const ROW_INSET: f32 = 4.0;
+/// 滚动内容总内衬（像素；上下各 4px，与 [`ROW_INSET`] 对应）。
+const SCROLL_PAD: f32 = 8.0;
+/// ListView 行高缺省（schema `row_h` 缺省同值；属性缺失/类型错回退到它）。
+const DEFAULT_ROW_H: f32 = 18.0;
+/// ScrollView 滚轮步进缺省（schema `step` 缺省同值）。
+const DEFAULT_STEP: f32 = 48.0;
+
+/// 节点的滚动上下文：`(沿祖先链的滚动偏移之和, 祖先 ScrollView 视口
+/// 矩形交集)`（S12-3）。命中测算、extent 测算与提取层烘焙三处共用，
+/// 坐标约定单处实现（矩形减偏移，见 [`contextual_rect`] 与模块注释）。
+///
+/// - 偏移和：祖先链上每个 ScrollView 在 [`UiStates::scrolls`] 里的
+///   偏移相加（无记录 = 0；不查可见性 —— 场景层无可见性继承，与命中
+///   循环逐节点判 visible 的口径一致）；
+/// - 矩形：祖先 ScrollView 视口矩形（`anchor * viewport + offset`）
+///   逐级求交；无 ScrollView 祖先 = `None`（此时偏移和必为 0 ——
+///   既有 Button/TextInput 命中零变化，additive 保证）。
+///
+/// 纯函数：只读树属性与瞬态表，不写任何状态。
+pub fn scroll_context_of(
+    tree: &SceneTree,
+    ui: &UiStates,
+    node: NodeId,
+    viewport: (f32, f32),
+) -> (f32, Option<(f32, f32, f32, f32)>) {
+    let mut sum = 0.0f32;
+    let mut clip: Option<(f32, f32, f32, f32)> = None;
+    let mut cur = tree.parent(node);
+    while let Some(p) = cur {
+        if tree.kind_tag(p) == Some(NodeKindTag::ScrollView) {
+            sum += ui.scrolls.get(&p).copied().unwrap_or(0.0);
+            let r = widget_rect(tree, p, viewport);
+            clip = Some(match clip {
+                None => r,
+                Some(c) => rect_intersect(c, r),
+            });
+        }
+        cur = tree.parent(p);
+    }
+    (sum, clip)
+}
+
+/// 把命中矩形放入滚动上下文（坐标约定**全 crate 仅此一处**）：祖先
+/// ScrollView 把内容向上平移 scroll 像素渲染，命中矩形 y 随之减去同一
+/// 偏移和，再做祖先视口矩形交集裁剪（滚出容器的内容不可命中）。
+/// 无滚动祖先（上下文 `(0.0, None)`）时原样返回 —— 既有行为零变化。
+pub fn contextual_rect(
+    rect: (f32, f32, f32, f32),
+    context: (f32, Option<(f32, f32, f32, f32)>),
+) -> (f32, f32, f32, f32) {
+    let (sum, clip) = context;
+    let shifted = (rect.0, rect.1 - sum, rect.2, rect.3);
+    match clip {
+        Some(c) => rect_intersect(shifted, c),
+        None => shifted,
+    }
+}
+
+/// 矩形求交（空交 = 零尺寸矩形，永不命中）。
+fn rect_intersect(
+    a: (f32, f32, f32, f32),
+    b: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    if x1 <= x0 || y1 <= y0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// 滚动上限（内容超出视口的高度，下限 0；纯函数）。
+///
+/// - ListView：行数 × row_h + 8 内衬 − 视口高（下限 0）；
+/// - Tabs：页签数 × 行高 + 8 内衬 − 视口高（Tabs 无 row_h 属性，按
+///   ListView 缺省行高 [`DEFAULT_ROW_H`] 口径）；
+/// - ScrollView：可见后代控件底缘最大值 − 自身底（下限 0）。按**固有
+///   坐标**测算（不含任何滚动偏移 —— 内容范围不随当前滚动变化）；
+///   嵌套滚动容器的子树被其裁剪，以容器自身矩形计入、不再下探；
+/// - 其他类型 = 0.0。
+///
+/// `ui` 参数与 [`scroll_context_of`] 保持同形（提取层同一调用点两种
+/// 测算），当前测算不读瞬态表。
+pub fn scroll_max_of(tree: &SceneTree, ui: &UiStates, node: NodeId, viewport: (f32, f32)) -> f32 {
+    let _ = ui;
+    let Some(tag) = tree.kind_tag(node) else {
+        return 0.0;
+    };
+    let rect = widget_rect(tree, node, viewport);
+    match tag {
+        NodeKindTag::ListView => {
+            let rows = rows_count(tree, node, "rows") as f32;
+            (rows * list_row_h(tree, node) + SCROLL_PAD - rect.3).max(0.0)
+        }
+        NodeKindTag::Tabs => {
+            let tabs = rows_count(tree, node, "tabs") as f32;
+            (tabs * DEFAULT_ROW_H + SCROLL_PAD - rect.3).max(0.0)
+        }
+        NodeKindTag::ScrollView => {
+            let own_bottom = rect.1 + rect.3;
+            let mut max_bottom = own_bottom;
+            let mut stack: Vec<NodeId> = tree.children(node).to_vec();
+            while let Some(n) = stack.pop() {
+                let Some(t) = tree.kind_tag(n) else { continue };
+                if t == NodeKindTag::ScrollView
+                    || t == NodeKindTag::ListView
+                    || t == NodeKindTag::Tabs
+                {
+                    // 嵌套滚动容器：自身矩形计入，其子树被裁剪不再下探。
+                    let r = widget_rect(tree, n, viewport);
+                    max_bottom = max_bottom.max(r.1 + r.3);
+                    continue;
+                }
+                let visible = tree
+                    .prop(n, "visible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if visible && t.is_a(NodeKindTag::Control) {
+                    let r = widget_rect(tree, n, viewport);
+                    max_bottom = max_bottom.max(r.1 + r.3);
+                }
+                if let Some(data) = tree.get(n) {
+                    for &child in data.children.iter() {
+                        stack.push(child);
+                    }
+                }
+            }
+            (max_bottom - own_bottom).max(0.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// 滚轮步进（像素/格）：ScrollView 取 `step` 属性，ListView 取 `row_h`
+/// 属性（行进列 —— 一次一格），Tabs 无行高属性按缺省行高。缺失/类型
+/// 错回缺省；下限 1.0 防除零/原地踏步。
+fn wheel_step(tree: &SceneTree, node: NodeId) -> f32 {
+    match tree.kind_tag(node) {
+        Some(NodeKindTag::ScrollView) => i64_prop(tree, node, "step")
+                .map(|v| (v as f32).max(1.0))
+                .unwrap_or(DEFAULT_STEP),
+        Some(NodeKindTag::ListView) => list_row_h(tree, node),
+        _ => DEFAULT_ROW_H,
+    }
+}
+
+/// ListView 行高（`row_h` I64；缺失/类型错回缺省 [`DEFAULT_ROW_H`]）。
+fn list_row_h(tree: &SceneTree, node: NodeId) -> f32 {
+    i64_prop(tree, node, "row_h")
+        .map(|v| (v as f32).max(1.0))
+        .unwrap_or(DEFAULT_ROW_H)
+}
+
+/// 取节点 I64 属性（缺失/类型错 = `None`）。
+fn i64_prop(tree: &SceneTree, node: NodeId, name: &str) -> Option<i64> {
+    match tree.prop(node, name) {
+        Some(Value::I64(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// 属性串按 '\n' 分隔的行数（空串/缺失/类型错 = 0 行；尾随分隔符按
+/// `split` 口径计一个空行）。
+fn rows_count(tree: &SceneTree, node: NodeId, prop: &str) -> usize {
+    match tree.prop(node, prop) {
+        Some(Value::Str(s)) if !s.is_empty() => s.split('\n').count(),
+        _ => 0,
     }
 }

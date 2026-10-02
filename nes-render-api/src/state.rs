@@ -294,11 +294,91 @@ impl LabelState {
     }
 }
 
+// ---------------------------------------------------------------- list
+
+/// 列表/页签的展开方向（S12-3 任务 4）。
+///
+/// 同一份 [`ListState`] 载荷服务两种节点：ListView 逐**行**向下
+///（[`ListAxis::Vertical`]），Tabs 逐**页签**向右（[`ListAxis::Horizontal`]）
+/// —— 展开算式的差异只在后端的这一个分臂上，契约层不再另开第二份状态。
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum ListAxis {
+    /// 垂直（ListView）：行 i 的笔起点 y = `4 + i * row_h - scroll`。
+    #[default]
+    Vertical,
+    /// 水平（Tabs）：页签 i 的笔起点 x = `4 + i * tab_w`（忽略 scroll）。
+    Horizontal,
+}
+
+/// 列表/页签的摊平状态（[`RenderCommand::SetList`](crate::RenderCommand::SetList)
+/// 载荷，S12-3 任务 4）。
+///
+/// 与 [`LabelState`] 同一条纪律：**排版属 CPU 侧，契约层只描述"要显示什么"**。
+/// 文本用 `'\n'` 分隔行（与场景层 `rows` / `tabs` 属性同口径），后端把它展开成
+/// "每行/每页签一段字形序列"；`scroll` 是当帧滚动偏移（提取层从 UiVm 瞬态表
+/// 折进载荷 —— 后端零动画/零交互状态）。
+#[derive(Clone, PartialEq, Debug)]
+pub struct ListState {
+    /// 行/页签文本（`'\n'` 分隔；与 [`LabelState::text`] 同款 `Arc<str>` 共享）。
+    pub text: Arc<str>,
+    /// 字体资源键；[`RenderAssetKey::NIL`] = 后端默认字体（与 Label 同口径）。
+    pub font: RenderAssetKey,
+    /// 字号（逻辑像素）。
+    pub font_size: f32,
+    /// 行高（像素；Vertical 轴行距，Horizontal 轴忽略）。
+    pub row_h: f32,
+    /// 单页签宽（像素；Horizontal 轴列距与截断宽，Vertical 轴忽略）。
+    pub tab_w: f32,
+    /// 展开方向（缺省 Vertical —— ListView 是主用例）。
+    pub axis: ListAxis,
+    /// 当帧垂直滚动偏移（提取层烘焙；后端按 `行 y -= scroll` 消费）。
+    pub scroll: f32,
+    /// 选中行/活动页签下标；`None` = 无（普通行 tint = 文字色）。
+    pub selected: Option<u16>,
+    /// 行文字着色（RGBA8 直 alpha）。
+    pub text_color: [u8; 4],
+    /// 选中行填充条着色（RGBA8 直 alpha）。
+    pub sel_fill: [u8; 4],
+}
+
+impl ListState {
+    /// 以行文本与字号构造（其余取默认：默认字体、18 行高 / 64 页签宽、
+    /// 垂直轴、无滚动、无选中、白字 + S12.0 `selected` 槽缺省蓝）。
+    pub fn new(text: impl Into<Arc<str>>, font_size: f32) -> Self {
+        Self {
+            text: text.into(),
+            font: RenderAssetKey::NIL,
+            font_size,
+            row_h: 18.0,
+            tab_w: 64.0,
+            axis: ListAxis::Vertical,
+            scroll: 0.0,
+            selected: None,
+            text_color: [255, 255, 255, 255],
+            sel_fill: [0x2E, 0x4A, 0x6B, 0xFF],
+        }
+    }
+}
+
 // ---------------------------------------------------------------- control
 
 /// 控件边框的缺省色（历史哨兵绿 —— E-1 之前内建图集边框格的观感，
 /// 保留为契约缺省使旧观感可经数据显式覆盖而非悄悄变化）。
 pub const CONTROL_BORDER_LEGACY: [u8; 4] = [0, 255, 0, 255];
+
+/// 滚动条的视觉状态（S12-3 任务 4；`ControlState::scroll_bar` 的载荷）。
+///
+/// 这是**渲染物属性**不是交互状态：`frac` / `pos` 由提取层按当帧内容范围与
+/// 滚动偏移算好（算式权威在提取层），后端只负责把它画成"右缘内侧竖条"。
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct ScrollBar {
+    /// 滑块长度占比：`视口高 / 内容总高`，已在提取层夹紧 `0..=1`。
+    pub frac: f32,
+    /// 滑块位置占比：`scroll / scroll_max`（`0.0..=1.0`；不可滚动 = 0）。
+    pub pos: f32,
+    /// 滑块着色（RGBA8 直 alpha）。
+    pub color: [u8; 4],
+}
 
 /// Control 的锚点布局状态（缺口契约之一）。
 ///
@@ -337,6 +417,10 @@ pub struct ControlState {
     pub border: [u8; 4],
     /// 边框线宽（像素；缺省 1 —— S12.0 设计语言：平直 1px 边框）。
     pub border_w: f32,
+    /// 滚动条视觉状态（S12-3 任务 4；加性缺省 `None` —— 不画，
+    /// 既有路径逐位不变）。`Some(bar)` 时后端在矩形右缘内侧补一条
+    /// 竖向滑块（算式见 [`ScrollBar`]）。
+    pub scroll_bar: Option<ScrollBar>,
 }
 
 impl ControlState {
@@ -354,6 +438,7 @@ impl ControlState {
         fill: [0, 0, 0, 0],
         border: CONTROL_BORDER_LEGACY,
         border_w: 1.0,
+        scroll_bar: None,
     };
 
     /// 左上角固定尺寸（四锚点 0，偏移里写尺寸）。
@@ -371,6 +456,7 @@ impl ControlState {
             fill: [0, 0, 0, 0],
             border: CONTROL_BORDER_LEGACY,
             border_w: 1.0,
+            scroll_bar: None,
         }
     }
 

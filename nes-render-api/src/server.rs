@@ -3,8 +3,8 @@
 use crate::command::{FrameInfo, RenderCommand};
 use crate::handle::{ItemHandle, RenderAssetKey};
 use crate::item::RenderItem;
-use crate::math::Affine2;
-use crate::state::{Camera2DState, ControlState, Flip, LabelState};
+use crate::math::{Affine2, Rect};
+use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 
 /// 渲染服务端。
 ///
@@ -26,7 +26,8 @@ use crate::state::{Camera2DState, ControlState, Flip, LabelState};
 ///    禁止依赖哈希迭代顺序；
 /// 5. **顺序固定**：生命周期动作（按发生顺序）→ `SetCamera`（若有）→ 各渲染物
 ///    的 `SetTransform` / `SetFlip` / `SetZ` / `SetVisible` →（Label 则追加
-///    `SetText`）→（Control 则追加 `SetRect`）→ `Submit`；
+///    `SetText`）→（List 则追加 `SetList`）→（Control 则追加 `SetRect`，随后
+///    **按需**追加 `SetClip` —— 裁剪恒在 `SetRect` 之后）→ `Submit`；
 /// 6. **属性流是全量快照**：不做"仅变化时推送"的增量省略，后端无需维护跨帧 diff。
 ///
 /// # 对象安全
@@ -60,9 +61,25 @@ pub trait RenderServer {
     /// 设置文本（Label 类渲染物）。
     fn set_text(&mut self, handle: ItemHandle, text: &LabelState);
 
+    /// 设置列表/页签状态（S12-3 任务 4；ListView / Tabs 摊平载荷）。
+    ///
+    /// 输出序冻结在对应条目的 `set_text` 之后、`set_rect` 之前
+    ///（SetText → SetList → SetRect → SetClip）。
+    fn set_list(&mut self, handle: ItemHandle, rows: &ListState);
+
     /// 设置控件布局（Control 类渲染物）。传入的是**未解析**的锚点状态，
     /// 解析公式见 [`ControlState::resolve`]。
     fn set_rect(&mut self, handle: ItemHandle, rect: &ControlState);
+
+    /// 设置裁剪矩形（E-2 裁剪契约，语义裁决 D1）。
+    ///
+    /// - 裁剪是**渲染物属性**，不是流式栈：与属性流的全量快照/跨帧幂等一致，
+    ///   嵌套裁剪由提取层沿祖先链求交集后以单条 `SetClip` 下发；
+    /// - `rect` 是**已解析的视口空间**矩形，后端负责按目标尺寸折算成像素 scissor；
+    /// - `None` = 清除该条目的裁剪；条目销毁时裁剪随条目消亡；
+    /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
+    /// - 本属性恒在对应条目的 `set_rect` 之后推送。
+    fn set_clip(&mut self, handle: ItemHandle, rect: Option<Rect>);
 
     /// 生成本帧命令序列写入 `out`（**先清空** `out`）。
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>);

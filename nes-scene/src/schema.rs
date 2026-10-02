@@ -410,6 +410,99 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 "占位提示文本（P0 仅存储，不参与渲染）。",
             ),
         ],
+        NodeKindTag::ScrollView => vec![PropDesc::new(
+            "step",
+            ValueType::I64,
+            Value::I64(48),
+            H::Number {
+                min: 1.0,
+                max: 512.0,
+                step: 1.0,
+            },
+            "每格滚轮滚动的像素数（S12-3）。",
+        )],
+        NodeKindTag::ListView => vec![
+            PropDesc::new(
+                "rows",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::Multiline,
+                "行文本，'\\n' 分隔（空串 = 无行）。",
+            ),
+            PropDesc::new(
+                "row_h",
+                ValueType::I64,
+                Value::I64(18),
+                H::Number {
+                    min: 4.0,
+                    max: 128.0,
+                    step: 1.0,
+                },
+                "行高（像素）；滚轮步进同此值。",
+            ),
+            PropDesc::new(
+                "selected",
+                ValueType::I64,
+                Value::I64(-1),
+                H::None,
+                "选中行下标（-1 = 无选中）；落账由宿主经 on_row_activate 回调自做。",
+            ),
+            PropDesc::new(
+                "text_slot",
+                ValueType::Str,
+                Value::Str("text".into()),
+                H::None,
+                "行文字槽位名（主题解析）。",
+            ),
+            PropDesc::new(
+                "sel_fill_slot",
+                ValueType::Str,
+                Value::Str("selected".into()),
+                H::None,
+                "选中行填充槽位名（主题解析）。",
+            ),
+        ],
+        NodeKindTag::Tabs => vec![
+            PropDesc::new(
+                "tabs",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::Multiline,
+                "页签文本，'\\n' 分隔（空串 = 无页签）。",
+            ),
+            PropDesc::new(
+                "tab_w",
+                ValueType::I64,
+                Value::I64(64),
+                H::Number {
+                    min: 8.0,
+                    max: 256.0,
+                    step: 1.0,
+                },
+                "单个页签宽度（像素）。",
+            ),
+            PropDesc::new(
+                "active",
+                ValueType::I64,
+                Value::I64(-1),
+                H::None,
+                "活动页签下标（-1 = 无）；由宿主落账。",
+            ),
+            PropDesc::new(
+                "text_slot",
+                ValueType::Str,
+                Value::Str("text".into()),
+                H::None,
+                "页签文字槽位名（主题解析）。",
+            ),
+            PropDesc::new(
+                "sel_fill_slot",
+                ValueType::Str,
+                Value::Str("selected".into()),
+                H::None,
+                "活动页签填充槽位名（主题解析）。",
+            ),
+        ],
         NodeKindTag::Theme => THEME_SLOTS
             .iter()
             .map(|(name, rgba)| {

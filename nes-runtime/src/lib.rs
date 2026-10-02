@@ -815,6 +815,11 @@ impl nes_scene::InputView for SnapshotView {
             .map(|c| c as u32)
             .collect()
     }
+    fn wheel(&self) -> (f32, f32) {
+        // S12-3：滚轮透传（格；+y=向上；一次性字段，快照口径原样）。
+        let s = self.0.borrow();
+        (s.wheel.x, s.wheel.y)
+    }
 }
 
 fn consumer_ctx(consumer: &CommandConsumer) -> &GpuContext {

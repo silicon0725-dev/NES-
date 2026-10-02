@@ -10,11 +10,14 @@
 //! # 语义（刻意最小）
 //!
 //! - 窗口关闭（点 X）=> [`Window::pump`] 返回 `false`，宿主随之退出帧循环；
-//! - **输入（S7.2）**：键/字符/鼠标/尺寸消息映射成中性 `InputEvent`
+//! - **输入（S7.2）**：键/字符/鼠标/滚轮/尺寸消息映射成中性 `InputEvent`
 //!   入进程级队列（[`drain_input`]），折叠与消费在契约层/运行时 ——
 //!   平台层只投递事实，**WM_CHAR 不是引擎 API**；
 //! - 不处理 DPI / 重绘；**固定尺寸**：surface 按创建时的客户区配置，
-//!   `WM_SIZE` 只入事件队列（表面重配置属后续里程碑，见 S6 文档遗留）。
+//!   `WM_SIZE` 只入事件队列（表面重配置属后续里程碑，见 S6 文档遗留）；
+//! - **最小窗口（S12-3）**：`WM_GETMINMAXINFO` 钳制用户拖拽下限 ——
+//!   客户区 384x240 经 `AdjustWindowRect` 外扩的整窗尺寸（防拖窄裁字）。
+//!   只对开窗时不小于该下限的窗口生效（小窗/测试替身保精确开窗）。
 
 use core::ffi::c_void;
 use core::ptr;
@@ -39,6 +42,16 @@ const WM_RBUTTONDOWN: u32 = 0x0205;
 const WM_RBUTTONUP: u32 = 0x0206;
 const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
+/// 滚轮滚动（垂直；wparam 高 16 位是原始增量，一格 = `WHEEL_DELTA` 120）。
+const WM_MOUSEWHEEL: u32 = 0x020A;
+/// 尺寸极限询问（拖拽/最大化前系统询问窗口的最小/最大尺寸）。
+const WM_GETMINMAXINFO: u32 = 0x0024;
+/// Win32 滚轮一格的原始增量（映射到"格"的归一分母）。
+const WHEEL_DELTA: f32 = 120.0;
+/// 最小客户区基准（S12-3：拖拽下限 —— 用户实测把窗口拖窄会裁掉
+/// 文本面板的字，钳在 384x240 客户区上）。
+const MIN_CLIENT_W: i32 = 384;
+const MIN_CLIENT_H: i32 = 240;
 // 虚拟键（Win32）。
 const VK_BACK: u32 = 0x08;
 const VK_TAB: u32 = 0x09;
@@ -64,6 +77,15 @@ use nes_render_api::input::{InputEvent, Key, MouseButton};
 /// **WM_CHAR 不是引擎 API**：字符码在这层折成 `InputEvent::Char`，
 /// 引擎与脚本消费的是快照的 `text` 字段。
 static EVENTS: Mutex<Vec<InputEvent>> = Mutex::new(Vec::new());
+
+/// 施加最小窗口钳制的窗口表（S12-3）：只登记**开窗时客户区不小于**
+/// [`MIN_CLIENT_W`]x[`MIN_CLIENT_H`] 的窗口 —— 用户拖拽下限只对真实
+/// 产品窗口生效。小窗（测试/离屏替身）不登记：实证 Windows 在创建/
+/// 排列阶段就经 `WM_WINDOWPOSCHANGING` 查询 `WM_GETMINMAXINFO`，小窗
+/// 一旦挂钳制会被直接顶到 384x240，破坏 T-Surf-01 的"客户区精确等于
+/// 请求尺寸"契约（256x128 开窗实测变 384x240）。析构即除名（防句柄
+/// 复用串钳制）。
+static CLAMPED_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 /// 队列容量上限（事件数）。
 const EVENTS_CAP: usize = 1024;
@@ -145,6 +167,17 @@ struct Rect {
     bottom: i32,
 }
 
+/// `MINMAXINFO`（`WM_GETMINMAXINFO` 的出参；5 组 POINT，复用 [`Point`]）。
+#[repr(C)]
+struct MinMaxInfo {
+    pt_reserved: Point,
+    pt_max_size: Point,
+    pt_max_position: Point,
+    /// 用户拖拽的最小追踪尺寸（整窗口径，含边框）—— 本引擎唯一覆写的字段。
+    pt_min_track_size: Point,
+    pt_max_track_size: Point,
+}
+
 #[repr(C)]
 struct WndClassW {
     style: u32,
@@ -194,7 +227,8 @@ extern "system" {
 }
 
 /// 窗口过程：销毁 → 投递退出消息；输入消息 → 中性事件入队（S7.2，
-/// 映射见 [`vk_to_key`]）；其余走默认过程。
+/// 映射见 [`vk_to_key`]）；最小尺寸询问 → 钳制拖拽下限（S12-3）；其余
+/// 走默认过程。
 unsafe extern "system" fn wnd_proc(
     hwnd: *mut c_void,
     msg: u32,
@@ -205,10 +239,50 @@ unsafe extern "system" fn wnd_proc(
         unsafe { PostQuitMessage(0) };
         return 0;
     }
+    if msg == WM_GETMINMAXINFO {
+        // 最小窗口钳制（S12-3）：只对登记过的窗口（开窗时不小于下限的
+        // 产品窗口）直答 —— 系统发送该消息前已把 MINMAXINFO 填好默认值
+        //（最大化尺寸/位置、追踪上下限），这里只覆写最小追踪尺寸、其余
+        // 字段原样放行，按文档返回 0。（不转发 DefWindowProcW：实测它
+        // 不回填结构体，主动 SendMessage 时转发拿到的是全零。）
+        if lparam != 0 && window_is_clamped(hwnd) {
+            let mmi = unsafe { &mut *(lparam as *mut MinMaxInfo) };
+            mmi.pt_min_track_size = min_window_outer_size();
+            return 0;
+        }
+        // 未登记窗口沿默认路径（系统下限 ~132x38，小窗精确开窗不受扰）。
+    }
     if let Some(ev) = input_event_of(msg, wparam, lparam) {
         inject_input(ev);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// 该窗口是否登记了最小钳制（[`CLAMPED_WINDOWS`] 成员查询；`wnd_proc`
+/// 是静态 extern，无 per-window 状态可挂，用进程级表映射句柄）。
+fn window_is_clamped(hwnd: *mut c_void) -> bool {
+    let guard = CLAMPED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+    guard.contains(&(hwnd as isize))
+}
+
+/// 最小整窗尺寸（`pt_min_track_size` 口径）：客户区 [`MIN_CLIENT_W`]x
+/// [`MIN_CLIENT_H`] 经 `AdjustWindowRect(WS_OVERLAPPEDWINDOW)` 按当前
+/// 系统度量外扩 —— 与 [`Window::open`] 同一换算（硬编码边框补偿在不同
+/// 主题/DPI 下会偏，S6.1 实证）。纯计算、无窗口状态依赖，静态
+/// `wnd_proc` 现场调用即可，不需要 OnceLock。
+fn min_window_outer_size() -> Point {
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: MIN_CLIENT_W,
+        bottom: MIN_CLIENT_H,
+    };
+    // SAFETY: rect 是合法出参；失败（返回 0）时保持客户区原值兜底。
+    unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, 0) };
+    Point {
+        x: rect.right - rect.left,
+        y: rect.bottom - rect.top,
+    }
 }
 
 /// 平台消息 → 中性输入事件（非输入消息返回 `None`）。
@@ -236,6 +310,14 @@ fn input_event_of(msg: u32, wparam: usize, lparam: isize) -> Option<InputEvent> 
         WM_SIZE => Some(InputEvent::Resize {
             w: lo as u32,
             h: hi as u32,
+        }),
+        WM_MOUSEWHEEL => Some(InputEvent::Wheel {
+            // 垂直增量归一到格（+WHEEL_DELTA = +1 格，向上）；水平滚轮
+            // 源不存在，x 恒 0（字段保留）。鼠标位置不入事件 —— 路由用
+            // 快照既有 mouse（消息 lparam 的屏幕坐标口径不同，且同帧
+            // WM_MOUSEMOVE 已经在维护它）。
+            x: 0.0,
+            y: ((wparam >> 16) as u16 as i16) as f32 / WHEEL_DELTA,
         }),
         _ => None,
     }
@@ -316,6 +398,12 @@ impl Window {
             unsafe { UnregisterClassW(class_name.as_ptr(), hinstance) };
             return Err(crate::error::BackendError::NullHandle("CreateWindowExW"));
         }
+        // 客户区请求不小于下限的窗口登记拖拽钳制（S12-3）；小窗不登记
+        //（测试/离屏替身保"客户区精确等于请求尺寸"，见 CLAMPED_WINDOWS）。
+        if width >= MIN_CLIENT_W as u32 && height >= MIN_CLIENT_H as u32 {
+            let mut guard = CLAMPED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+            guard.push(hwnd as isize);
+        }
         unsafe { ShowWindow(hwnd, SW_SHOW) };
         // 泵一遍待处理消息（含首帧绘制），让窗口真正上屏。
         let window = Self {
@@ -387,6 +475,10 @@ impl Drop for Window {
     fn drop(&mut self) {
         // SAFETY: 句柄存活且只在此处销毁一次；先销毁窗口再注销类。
         unsafe {
+            // 除名钳制登记（先于销毁 —— 防句柄复用把钳制串给新窗口）。
+            let mut guard = CLAMPED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+            guard.retain(|h| *h != self.hwnd as isize);
+            drop(guard);
             if !self.hwnd.is_null() {
                 DestroyWindow(self.hwnd);
             }

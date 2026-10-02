@@ -5,6 +5,7 @@
 //! | T-In-C01 | 键边缘：按下/抬起按集合差算；**自动重发幂等**（重复 down 不二次 pressed）；held 含本帧新按 |
 //! | T-In-C02 | 鼠标：位置覆盖、delta 相对上一快照（首帧 0）；按钮三态（held/pressed/released） |
 //! | T-In-C03 | 文本与窗口尺寸是**一次性**数据（快照取走即清）；键名/按钮名 round-trip；is_down 未列举名 = 未按 |
+//! | T-In-C05 | 滚轮（S12-3）：同帧多事件**相加**折叠；一次性（快照取走即清）；trace `wheel` 记法解析 |
 
 use nes_render_api::input::{InputCollector, InputEvent, Key, MouseButton};
 use nes_render_api::math::Vec2;
@@ -106,6 +107,33 @@ fn t_in_c03_transient_data_and_names() {
     assert!(s3.is_down("W"));
     assert!(!s3.is_down("ArrowLeft"));
     assert!(!s3.is_down("NoSuchKey"), "未列举 = 未按（不猜）");
+}
+
+/// T-In-C05：滚轮折叠与一次性（S12-3 additive —— 既有字段口径不动）。
+#[test]
+fn t_in_c05_wheel_folds_clears_and_parses() {
+    use nes_render_api::input::parse_trace;
+    let mut c = InputCollector::new();
+    // 同帧多事件相加（量语义：+2 格再 -1 格 = +1 格；x 保留水平源字段）。
+    c.push(InputEvent::Wheel { x: 0.0, y: 2.0 });
+    c.push(InputEvent::Wheel { x: 0.0, y: -1.0 });
+    c.push(InputEvent::Wheel { x: 0.0, y: 0.5 });
+    let s1 = c.frame();
+    assert_eq!(s1.wheel, Vec2::new(0.0, 1.5), "同帧相加，+y=向上");
+
+    // 一次性：下一帧无滚轮事件 → 回零（同 text 口径）。
+    let s2 = c.frame();
+    assert_eq!(s2.wheel, Vec2::new(0.0, 0.0));
+
+    // trace 记法：headless 回放覆盖（小数如实解析，负号 = 向下）。
+    let trace = parse_trace("0 wheel 0 1.5\n1 wheel 0 -3").expect("解析");
+    assert_eq!(trace.len(), 2);
+    assert_eq!(trace[0].events, vec![InputEvent::Wheel { x: 0.0, y: 1.5 }]);
+    assert_eq!(trace[1].events, vec![InputEvent::Wheel { x: 0.0, y: -3.0 }]);
+
+    // 错误口径：缺 X / 缺 Y 指名行。
+    assert!(parse_trace("0 wheel").unwrap_err().contains("缺 X"));
+    assert!(parse_trace("0 wheel 0").unwrap_err().contains("缺 Y"));
 }
 
 /// T-In-C04：轨迹解析（S7.3）—— 全事件族 round-trip、注释/空行、

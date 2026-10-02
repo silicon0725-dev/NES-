@@ -206,8 +206,15 @@ fn kind_of(cmd: &RenderCommand) -> &'static str {
         RenderCommand::SetFlip { .. } => "set_flip",
         RenderCommand::SetCamera { .. } => "set_camera",
         RenderCommand::SetText { .. } => "set_text",
+        // S12-3 任务 4（List 摊平）新增的 SetList：本测试不构造列表节点，
+        // 只补一枚举臂恢复可编译，既有断言零变化。
+        RenderCommand::SetList { .. } => "set_list",
         RenderCommand::SetRect { .. } => "set_rect",
         RenderCommand::Submit { .. } => "submit",
+        // S12-3 任务 1/2（E-2 裁剪契约）新增的 SetClip：本测试只按种类名
+        // 计数/定位（任务 4 起 Button/TextInput/ListView/Tabs 恒下发，
+        // 本文件断言只按种类计数/定位，不受影响）。
+        RenderCommand::SetClip { .. } => "set_clip",
     }
 }
 

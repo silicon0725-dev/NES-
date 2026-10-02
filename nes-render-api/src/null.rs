@@ -3,7 +3,7 @@
 //! 它做三件事，都是后端契约的可执行参照：
 //!
 //! 1. 按 [`RenderServer`] 的不变式生成**确定性命令流**（可当"后端该怎么接"的样例）；
-//! 2. 把副作用真的落在内存里（`items` / `labels` / `rects` / `camera`），
+//! 2. 把副作用真的落在内存里（`items` / `labels` / `rects` / `clips` / `camera`），
 //!    让测试能断言"推送被正确保存"，而不只是"没 panic"；
 //! 3. 记计数器（创建/销毁/被忽略的操作/帧数/命令数），把"空句柄被忽略"
 //!    这类静默行为变成**可观测**的事实 —— 静默而不可观测的吞错最难查。
@@ -13,9 +13,9 @@ use std::collections::BTreeMap;
 use crate::command::{FrameInfo, RenderCommand};
 use crate::handle::{ItemHandle, RenderAssetKey};
 use crate::item::RenderItem;
-use crate::math::Affine2;
+use crate::math::{Affine2, Rect};
 use crate::server::RenderServer;
-use crate::state::{Camera2DState, ControlState, Flip, LabelState};
+use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 
 /// 服务端行为计数器（把静默行为显式化）。
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -41,7 +41,12 @@ pub struct NullRenderServer {
     next_handle: u64,
     items: BTreeMap<ItemHandle, RenderItem>,
     labels: BTreeMap<ItemHandle, LabelState>,
+    /// 列表/页签簿记（S12-3 任务 4）：`set_list` 存、销毁移除。
+    lists: BTreeMap<ItemHandle, ListState>,
     rects: BTreeMap<ItemHandle, ControlState>,
+    /// 裁剪簿记（E-2 / D1）：`Some(rect)` 存、`None`/销毁移除。
+    /// 有裁剪的条目在 `submit_into` 输出序里于 `SetRect` 之后追加 `SetClip`。
+    clips: BTreeMap<ItemHandle, Rect>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
     counters: ServerCounters,
@@ -78,9 +83,19 @@ impl NullRenderServer {
         self.labels.get(&handle)
     }
 
+    /// 取渲染物的列表/页签状态（非 List 类返回 `None`）。
+    pub fn list_of(&self, handle: ItemHandle) -> Option<&ListState> {
+        self.lists.get(&handle)
+    }
+
     /// 取渲染物的控件布局状态。
     pub fn rect_of(&self, handle: ItemHandle) -> Option<&ControlState> {
         self.rects.get(&handle)
+    }
+
+    /// 取渲染物的裁剪矩形（未设置返回 `None`）。
+    pub fn clip_of(&self, handle: ItemHandle) -> Option<&Rect> {
+        self.clips.get(&handle)
     }
 
     /// 当前相机。
@@ -118,7 +133,9 @@ impl RenderServer for NullRenderServer {
             return;
         }
         self.labels.remove(&handle);
+        self.lists.remove(&handle);
         self.rects.remove(&handle);
+        self.clips.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
         self.counters.destroyed += 1;
     }
@@ -166,11 +183,36 @@ impl RenderServer for NullRenderServer {
         }
     }
 
+    fn set_list(&mut self, handle: ItemHandle, rows: &ListState) {
+        if self.items.contains_key(&handle) {
+            self.lists.insert(handle, rows.clone());
+        } else {
+            self.counters.ignored_ops += 1;
+        }
+    }
+
     fn set_rect(&mut self, handle: ItemHandle, rect: &ControlState) {
         if self.items.contains_key(&handle) {
             self.rects.insert(handle, *rect);
         } else {
             self.counters.ignored_ops += 1;
+        }
+    }
+
+    fn set_clip(&mut self, handle: ItemHandle, rect: Option<Rect>) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1），计数器使其可观测。
+            self.counters.ignored_ops += 1;
+            return;
+        }
+        match rect {
+            Some(rect) => {
+                self.clips.insert(handle, rect);
+            }
+            None => {
+                // `None` = 清除裁剪（本来就没有也是合法的清除）。
+                self.clips.remove(&handle);
+            }
         }
     }
 
@@ -213,10 +255,25 @@ impl RenderServer for NullRenderServer {
                     text: text.clone(),
                 });
             }
+            // 列表/页签（S12-3 任务 4）：输出序冻结 SetText → SetList →
+            // SetRect → SetClip（与 wgpu 后端严格同序）。
+            if let Some(rows) = self.lists.get(&item.handle) {
+                out.push(RenderCommand::SetList {
+                    handle: item.handle,
+                    rows: rows.clone(),
+                });
+            }
             if let Some(rect) = self.rects.get(&item.handle) {
                 out.push(RenderCommand::SetRect {
                     handle: item.handle,
                     rect: *rect,
+                });
+            }
+            // 裁剪恒在 SetRect 之后（D1 推送序）；仅当该条目存在裁剪时追加。
+            if let Some(clip) = self.clips.get(&item.handle) {
+                out.push(RenderCommand::SetClip {
+                    handle: item.handle,
+                    rect: Some(*clip),
                 });
             }
         }

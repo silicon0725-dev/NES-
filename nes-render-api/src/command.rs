@@ -1,8 +1,8 @@
 //! 帧信息与渲染命令。
 
 use crate::handle::{ItemHandle, RenderAssetKey};
-use crate::math::{Affine2, Vec2};
-use crate::state::{Camera2DState, ControlState, Flip, LabelState};
+use crate::math::{Affine2, Rect, Vec2};
+use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 
 /// 一帧的上下文。
 ///
@@ -117,12 +117,41 @@ pub enum RenderCommand {
         /// 文本状态（`Arc` 克隆，不复制字节）。
         text: LabelState,
     },
+    /// 列表/页签（S12-3 任务 4；ListView / Tabs 摊平后的专属载荷）。
+    ///
+    /// 与 [`RenderCommand::SetText`] 同一性质：属性动作、全量快照、按序重放。
+    /// 输出序冻结在 `SetText` 之后、`SetRect` 之前（同一渲染物的属性流序：
+    /// SetText → SetList → SetRect → SetClip —— null 与 wgpu 两处 submit
+    /// 严格同序）。
+    SetList {
+        /// 句柄。
+        handle: ItemHandle,
+        /// 列表状态（`Arc` 克隆，不复制行文本字节）。
+        rows: ListState,
+    },
     /// 控件布局（仅 Control 类渲染物）。
     SetRect {
         /// 句柄。
         handle: ItemHandle,
         /// 控件状态。
         rect: ControlState,
+    },
+    /// 裁剪矩形（E-2 裁剪契约，S12-3，语义裁决 D1）。
+    ///
+    /// 裁剪是**渲染物属性**，不是流式栈：这与"属性流 = 全量快照、按序重放、
+    /// 跨帧幂等"的契约一致 —— 栈式流序状态会破坏"漏推一帧不漂移"的不变式。
+    /// 嵌套裁剪由提取层沿祖先链求交集后以单条 `SetClip` 下发（本层不做栈语义）。
+    ///
+    /// - `rect = Some(r)`：`r` 是**已解析的视口空间**矩形，后端按目标尺寸折算成
+    ///   帧缓冲像素 scissor（半开区间）；
+    /// - `rect = None`：清除该条目的裁剪；
+    /// - 条目销毁（`DestroyItem`）时裁剪随条目消亡；
+    /// - 本命令恒出现在对应条目的 `SetRect` 之后。
+    SetClip {
+        /// 句柄。
+        handle: ItemHandle,
+        /// 视口空间裁剪矩形；`None` = 清除裁剪。
+        rect: Option<Rect>,
     },
     /// 帧结束标记（**每条命令流都必须以它结尾**）。
     Submit {
@@ -142,7 +171,9 @@ impl RenderCommand {
             | Self::SetZ { handle, .. }
             | Self::SetFlip { handle, .. }
             | Self::SetText { handle, .. }
-            | Self::SetRect { handle, .. } => Some(*handle),
+            | Self::SetList { handle, .. }
+            | Self::SetRect { handle, .. }
+            | Self::SetClip { handle, .. } => Some(*handle),
             Self::SetCamera { .. } | Self::Submit { .. } => None,
         }
     }

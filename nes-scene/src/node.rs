@@ -35,11 +35,21 @@ pub enum NodeKindTag {
     /// 单行文本输入框（S12-2 组件库）：Control 之上加提交值/主题槽位；
     /// 草稿与光标是 UiVm 瞬态，不进属性表。
     TextInput,
+    /// 滚动容器（S12-3 组件库）：可见后代控件超出自身视口的部分按滚动
+    /// 偏移平移/裁剪；滚动偏移是 UiVm 瞬态（`UiStates::scrolls`），
+    /// 不进属性表。
+    ScrollView,
+    /// 列表（S12-3 组件库）：`rows` 属性按 '\n' 分隔行文本，UiVm 据
+    /// 行点击回调宿主（选中落账由宿主做，UiVm 零写权）。
+    ListView,
+    /// 页签（S12-3 组件库）：`tabs` 属性按 '\n' 分隔页签文本，
+    /// 活动页下标是宿主属性 `active`（UiVm 不写）。
+    Tabs,
 }
 
 impl NodeKindTag {
     /// 全部标签，按继承链自上而下排列（属性面板顺序直接用它）。
-    pub const ALL: [NodeKindTag; 10] = [
+    pub const ALL: [NodeKindTag; 13] = [
         NodeKindTag::Node,
         NodeKindTag::Node2D,
         NodeKindTag::Sprite2D,
@@ -50,6 +60,9 @@ impl NodeKindTag {
         NodeKindTag::Button,
         NodeKindTag::Theme,
         NodeKindTag::TextInput,
+        NodeKindTag::ScrollView,
+        NodeKindTag::ListView,
+        NodeKindTag::Tabs,
     ];
 
     /// 在 [`Self::ALL`] 里的下标。位集与表格化存储要用。
@@ -65,6 +78,9 @@ impl NodeKindTag {
             Self::Button => 7,
             Self::Theme => 8,
             Self::TextInput => 9,
+            Self::ScrollView => 10,
+            Self::ListView => 11,
+            Self::Tabs => 12,
         }
     }
 
@@ -84,6 +100,9 @@ impl NodeKindTag {
             Self::Button => NodeKind::Button,
             Self::Theme => NodeKind::Theme,
             Self::TextInput => NodeKind::TextInput,
+            Self::ScrollView => NodeKind::ScrollView,
+            Self::ListView => NodeKind::ListView,
+            Self::Tabs => NodeKind::Tabs,
         }
     }
 
@@ -100,6 +119,9 @@ impl NodeKindTag {
             Self::Button => "Button",
             Self::Theme => "Theme",
             Self::TextInput => "TextInput",
+            Self::ScrollView => "ScrollView",
+            Self::ListView => "ListView",
+            Self::Tabs => "Tabs",
         }
     }
 
@@ -116,6 +138,9 @@ impl NodeKindTag {
             "Button" => Self::Button,
             "Theme" => Self::Theme,
             "TextInput" => Self::TextInput,
+            "ScrollView" => Self::ScrollView,
+            "ListView" => Self::ListView,
+            "Tabs" => Self::Tabs,
             _ => return None,
         })
     }
@@ -127,6 +152,7 @@ impl NodeKindTag {
             Self::Node2D | Self::Control => Self::Node,
             Self::Sprite2D | Self::Camera2D => Self::Node2D,
             Self::Label | Self::Button | Self::TextInput => Self::Control,
+            Self::ScrollView | Self::ListView | Self::Tabs => Self::Control,
         })
     }
 
@@ -202,6 +228,13 @@ pub enum NodeKind {
     /// 单行文本输入框（S12-2）：提交值与槽位引用全在属性表；
     /// 草稿/光标是 UiVm 瞬态，不落属性表。
     TextInput,
+    /// 滚动容器（S12-3）：滚动步进等全在属性表；滚动偏移是 UiVm 瞬态。
+    ScrollView,
+    /// 列表（S12-3）：行文本/行高/选中下标全在属性表；行点击经 UiVm
+    /// 回调宿主（选中落账由宿主做）。
+    ListView,
+    /// 页签（S12-3）：页签文本/页签宽/活动页全在属性表。
+    Tabs,
 }
 
 impl NodeKind {
@@ -218,6 +251,9 @@ impl NodeKind {
             Self::Button => NodeKindTag::Button,
             Self::Theme => NodeKindTag::Theme,
             Self::TextInput => NodeKindTag::TextInput,
+            Self::ScrollView => NodeKindTag::ScrollView,
+            Self::ListView => NodeKindTag::ListView,
+            Self::Tabs => NodeKindTag::Tabs,
         }
     }
 

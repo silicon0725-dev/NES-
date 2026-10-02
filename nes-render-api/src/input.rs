@@ -14,10 +14,11 @@
 //! Script / UI / Game
 //! ```
 //!
-//! 四路**分开**：Keyboard（键集 + 边缘）/ Mouse（位置 + 增量 + 按钮边缘）/
-//! TextInput（WM_CHAR 提交的字符流，与键语义分离 —— IME 合成不走键）/ 
-//! Window（尺寸变化，输入性质的事件单列）。**WM_CHAR 不是引擎 API**：
-//! 平台字符码只到这里为止，宿主与脚本消费的是快照的 `text` 字段。
+//! 四路**分开**：Keyboard（键集 + 边缘）/ Mouse（位置 + 增量 + 按钮边缘 +
+//! 滚轮一次性增量）/ TextInput（WM_CHAR 提交的字符流，与键语义分离 ——
+//! IME 合成不走键）/ Window（尺寸变化，输入性质的事件单列）。
+//! **WM_CHAR 不是引擎 API**：平台字符码只到这里为止，宿主与脚本消费的
+//! 是快照的 `text` 字段。
 //!
 //! 零依赖、无平台概念：`InputEvent` 已是中性事件（虚拟键 → `Key` 的
 //! 映射在平台层完成）。宿主可不经平台直接注入事件（自动化/回放/
@@ -150,6 +151,10 @@ pub enum InputEvent {
     MouseButton { button: MouseButton, down: bool },
     /// 客户区尺寸变化（输入性质的单列事件；表面重配置另属里程碑）。
     Resize { w: u32, h: u32 },
+    /// 滚轮滚动（格；+y=向上，+x 保留给水平滚轮源 —— 当前只有垂直源，
+    /// x 恒 0）。折叠口径：同帧多事件**相加**（滚轮是量不是边）；快照
+    /// 取走即清（一次性，同 `text`/`resized`）。
+    Wheel { x: f32, y: f32 },
 }
 
 /// 一帧的输入快照：**边缘（本帧）+ 状态（按住）** 两类口径并存 ——
@@ -175,6 +180,8 @@ pub struct InputSnapshot {
     pub buttons_released: [bool; 3],
     /// 本帧提交的文本字符（UTF-16 单元序；快照取走即清）。
     pub text: Vec<u32>,
+    /// 本帧滚轮增量（格；+y=向上；同帧多事件已相加；快照取走即清）。
+    pub wheel: Vec2,
     /// 本帧客户区尺寸变化（快照取走即清）。
     pub resized: Option<(u32, u32)>,
 }
@@ -221,6 +228,8 @@ pub struct InputCollector {
     buttons_pressed_latch: [bool; 3],
     buttons_released_latch: [bool; 3],
     text: Vec<u32>,
+    /// 本帧滚轮累积（同帧多事件相加 —— 两格就是两格；frame() 取走即清）。
+    wheel: Vec2,
     resized: Option<(u32, u32)>,
 }
 
@@ -266,6 +275,12 @@ impl InputCollector {
                 }
             }
             InputEvent::Resize { w, h } => self.resized = Some((w, h)),
+            InputEvent::Wheel { x, y } => {
+                // 量语义：同帧多事件相加（不覆盖 —— 与鼠标位置的"最新
+                // 即真相"不同）。
+                self.wheel.x += x;
+                self.wheel.y += y;
+            }
         }
     }
 
@@ -288,6 +303,7 @@ impl InputCollector {
             buttons_pressed: std::mem::take(&mut self.buttons_pressed_latch),
             buttons_released: std::mem::take(&mut self.buttons_released_latch),
             text: std::mem::take(&mut self.text),
+            wheel: std::mem::take(&mut self.wheel),
             resized: self.resized.take(),
         };
         self.prev_keys = self.curr_keys.clone();
@@ -321,6 +337,7 @@ pub struct InputTrace {
 /// 2 key_up W key_down Space
 /// 3 char 104 char 105      # text（UTF-16 单元码）
 /// 4 mouse_down left resize 800 600
+/// 5 wheel 0 1.5            # 滚轮（格；+y=向上；同帧多记相加）
 /// ```
 pub fn parse_trace(text: &str) -> Result<Vec<InputTrace>, String> {
     let mut out: Vec<InputTrace> = Vec::new();
@@ -379,6 +396,17 @@ pub fn parse_trace(text: &str) -> Result<Vec<InputTrace>, String> {
                         .and_then(|t| t.parse().ok())
                         .ok_or_else(|| format!("第 {} 行：resize 缺高", li + 1))?;
                     InputEvent::Resize { w, h }
+                }
+                "wheel" => {
+                    let x: f32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：wheel 缺 X", li + 1))?;
+                    let y: f32 = toks
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .ok_or_else(|| format!("第 {} 行：wheel 缺 Y", li + 1))?;
+                    InputEvent::Wheel { x, y }
                 }
                 other => return Err(format!("第 {} 行：未知事件 {other}", li + 1)),
             };

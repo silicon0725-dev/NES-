@@ -1,10 +1,10 @@
 //! S9-3b **Editor Shell**：建立在已验证状态模型上的编辑器 UI。
 //!
 //! 架构（评审冻结）：**UI 只消费状态模型，不成为语义来源** ——
-//! Hierarchy View 是 SceneTree 的投影（Label 文本），Inspector 是
-//! 选择节点数据的投影，Viewport 高亮是 Selection 的投影。一切修改
-//! 经 Inspector/Hierarchy 适配器 → TransactionLog。ui 零自有状态
-//!（除面板滚动等会话态）。
+//! Hierarchy View 是 SceneTree 的投影（S12-3 起 ListView 行文本 +
+//! selected 行高亮），Inspector 是选择节点数据的投影，Viewport 高亮
+//! 是 Selection 的投影。一切修改经 Inspector/Hierarchy 适配器 →
+//! TransactionLog。ui 零自有状态（除面板滚动等会话态）。
 //!
 //! 布局（768x432）：
 //! - 左侧 180px：Hierarchy 面板（树投影）
@@ -37,24 +37,24 @@ fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
 /// 视口尺寸（与帧 `FrameInfo::viewport` 同源 —— 控件锚定该视口解析）。
 const VIEWPORT: (f32, f32) = (768.0, 432.0);
 
-/// 按压点（**视图空间**）是否落在重命名输入框矩形内 —— 与 UiVm 命中
-/// 同一口径（`anchor * viewport + offset` + `size`，不可见即不参与
-/// 命中）。宿主用它护住检查器面板：压在输入框上的点击不清选中、
-/// 不启动框选，把交互让给 UiVm 的点击夺焦路径（S12-2 验收：
-/// 点击改名输入框 -> 夺焦 -> 输入 -> Enter 提交）。
-fn press_in_name_input(
+/// 按压点（**视图空间**）是否落在控件矩形内 —— 与 UiVm 命中同一口径
+///（`anchor * viewport + offset` + `size`，不可见即不参与命中）。宿主
+/// 用它护住自己的面板交互：压在控件上的点击不清选中、不启动框选，
+/// 把交互让给 UiVm 的点击路径（S12-2：改名输入框夺焦；S12-3：层级树
+/// ListView 行点击选择）。
+fn press_in_control(
     tree: &nes_scene::SceneTree,
-    input: nes_scene::NodeId,
+    node: nes_scene::NodeId,
     view_pos: (f32, f32),
 ) -> bool {
     let visible = tree
-        .prop(input, "visible")
+        .prop(node, "visible")
         .and_then(Value::as_bool)
         .unwrap_or(true);
     if !visible {
         return false;
     }
-    let vec2 = |name: &str| match tree.prop(input, name) {
+    let vec2 = |name: &str| match tree.prop(node, name) {
         Some(Value::Vec2(v)) => *v,
         _ => nes_scene::Vec2::ZERO,
     };
@@ -151,10 +151,16 @@ fn main() {
         let obj3 = tree.add_node(root, "obj3", NodeKind::Sprite2D);
         tree.set_prop(obj3, PROP_TEXTURE, Value::Resource(3)).unwrap();
         tree.set_local(obj3, Transform2D::from_pos(480.0, 180.0));
-        // Hierarchy 面板背景。
-        let hud_tree = tree.add_node(root, "hud_tree", NodeKind::Label);
-        tree.set_local(hud_tree, Transform2D::from_pos(8.0, 40.0));
-        tree.set_prop(hud_tree, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        // Hierarchy 面板（S12-3 ListView 真消费者）：视口锚定控件，
+        // 行文本 `rows` 与选中下标 `selected` 由宿主每帧投影（树是
+        // 投影不是语义来源），行点击与滚轮滚动由 UiVm 驱动（宿主零
+        // 滚动接线 —— scrolls 是 UiVm 瞬态）。
+        let hud_tree = tree.add_node(root, "hud_tree", NodeKind::ListView);
+        tree.set_prop(hud_tree, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
+        tree.set_prop(hud_tree, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(8.0, 40.0))).unwrap();
+        tree.set_prop(hud_tree, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(164.0, 360.0))).unwrap();
+        tree.set_prop(hud_tree, "rows", Value::Str(String::new())).unwrap();
+        tree.set_prop(hud_tree, "row_h", Value::I64(18)).unwrap();
         // Inspector 面板背景。
         let hud_ins = tree.add_node(root, "hud_ins", NodeKind::Label);
         tree.set_local(hud_ins, Transform2D::from_pos(612.0, 40.0));
@@ -219,6 +225,23 @@ fn main() {
             }
         });
     }
+    // 层级树行点击的落点（S12-3，UiVm 零写权延续 —— 回调在帧内只报
+    // (节点, 行下标)，经共享缓冲传回宿主，帧后落 Selection）。行→节点
+    // 映射由投影段每帧整体刷新（walk 顺序即行序），回调只按行查 uid。
+    let row_clicks: Rc<RefCell<Vec<Uid>>> = Rc::new(RefCell::new(Vec::new()));
+    let row_map_shared: Rc<RefCell<Vec<Uid>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let clicks = row_clicks.clone();
+        let map = row_map_shared.clone();
+        rt.ui_vm_mut().on_row_activate(move |node, row| {
+            if node != hud_tree {
+                return; // 只认层级树列表（当前全场景仅此一个 ListView）。
+            }
+            if let Some(uid) = map.borrow().get(row as usize) {
+                clicks.borrow_mut().push(uid.clone());
+            }
+        });
+    }
 
     let total: u64 = std::env::var("NES_GAME_FRAMES")
         .or_else(|_| std::env::var("NES_EDIT_FRAMES"))
@@ -272,16 +295,16 @@ fn main() {
         if mouse_left_held && !prev_click {
             // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。
             let (mx, my) = (snap.mouse.x, snap.mouse.y);
-            // 压在重命名输入框上 = 检查器面板的 UI 交互：护住选中
-            //（不清空、不框选），点击让给 UiVm 的夺焦路径。鼠标按
-            // 视图/客户区 折算到视图空间 —— 与 UiVm 命中同口径，窗口
-            // 缩放后仍准。
-            let over_name_input = {
+            // 压在检查器输入框 / 层级树列表上 = 面板的 UI 交互：护住
+            // 选中（不清空、不框选），点击让给 UiVm 的夺焦/行点击路径。
+            // 鼠标按 视图/客户区 折算到视图空间 —— 与 UiVm 命中同口径，
+            // 窗口缩放后仍准。
+            let (over_name_input, over_hud_list) = {
                 let (sx, sy) = rt.mouse_view_scale(VIEWPORT);
-                press_in_name_input(
-                    rt.tree_mut(),
-                    name_input,
-                    (mx * sx, my * sy),
+                let view = (mx * sx, my * sy);
+                (
+                    press_in_control(rt.tree_mut(), name_input, view),
+                    press_in_control(rt.tree_mut(), hud_tree, view),
                 )
             };
             let hit_uid: Option<Uid> = {
@@ -324,10 +347,10 @@ fn main() {
                     sel.select(uid);
                 }
                 drag_start = None; // 点击命中：不是框选
-            } else if !mouse_shift && !over_name_input {
-                // 空白处按下：开始框选（拖拽矩形）。压在重命名输入框上
-                // 的除外（上方护住 —— 清了选中输入框即隐藏，UiVm 的
-                // 点击夺焦就永远够不着它了）。
+            } else if !mouse_shift && !over_name_input && !over_hud_list {
+                // 空白处按下：开始框选（拖拽矩形）。压在检查器输入框 /
+                // 层级树列表上的除外（上方护住 —— 清了选中输入框即隐藏、
+                // 列表行点击即丢账，UiVm 的点击路径就永远够不着了）。
                 drag_start = Some((mx, my));
                 sel.clear(); // 框选重置（Shift 保留已有选择）
             }
@@ -451,29 +474,53 @@ fn main() {
         let editing = rt.ui_vm_mut().focus() == Some(name_input);
         {
             let tree = rt.tree_mut();
-            // Hierarchy View：树投影（前序 + 缩进 + 选中标记 *）。
-            let mut lines = String::from("HIERARCHY\n");
+            // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
+            // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
+            // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与
+            // 行点击回调都按这份映射结算 —— 投影与交互同源。存活节点
+            // 必有 uid（add_node 即发、walk 只访问存活节点），行与映射
+            // 严格同长同序；无"悬垂行"可言（删除即整行消失）。
+            let mut lines: Vec<String> = Vec::new();
+            let mut row_map: Vec<Uid> = Vec::new();
             let sel_uids: Vec<Uid> = sel.uids().to_vec();
             fn walk(
                 tree: &nes_scene::SceneTree,
                 id: nes_scene::NodeId,
                 depth: usize,
                 sel: &[Uid],
-                out: &mut String,
+                out: &mut Vec<String>,
+                map: &mut Vec<Uid>,
             ) {
                 let name = tree.name(id).unwrap_or("?");
-                let mark = tree
-                    .uid_of(id)
-                    .map(|u| sel.contains(&u))
-                    .unwrap_or(false);
+                let uid = tree.uid_of(id);
+                let mark = uid.as_ref().map(|u| sel.contains(u)).unwrap_or(false);
                 let indent = "  ".repeat(depth);
-                out.push_str(&format!("{}{}{}\n", indent, if mark { "* " } else { "  " }, name));
+                out.push(format!("{}{}{}", indent, if mark { "* " } else { "  " }, name));
+                if let Some(u) = uid {
+                    map.push(u);
+                }
                 for &c in tree.children(id) {
-                    walk(tree, c, depth + 1, sel, out);
+                    walk(tree, c, depth + 1, sel, out, map);
                 }
             }
-            walk(tree, tree.root(), 0, &sel_uids, &mut lines);
-            let _ = tree.set_prop(hud_tree, PROP_LABEL_TEXT, Value::Str(lines));
+            walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map);
+            // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
+            // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
+            let _ = tree.set_prop(hud_tree, "rows", Value::Str(lines.join("\n")));
+            // 刷新共享映射（UiVm 行点击回调在帧内按它查 uid —— 借用
+            // 只持续到本语句结束，帧内回调不会撞上宿主借用）。
+            *row_map_shared.borrow_mut() = row_map.clone();
+
+            // 选中行下标投影：主选中 uid → 行映射查找（找不到 = -1，
+            // 即 schema 的无选中缺省）。与 sel_box/z_index 同款纪律：
+            // Selection 是唯一语义来源，每帧直写属性。
+            let sel_row = sel
+                .primary(tree)
+                .and_then(|p| tree.uid_of(p))
+                .and_then(|u| row_map.iter().position(|m| m == &u))
+                .map(|i| i as i64)
+                .unwrap_or(-1);
+            let _ = tree.set_prop(hud_tree, "selected", Value::I64(sel_row));
 
             // Inspector View：选中节点数据投影。
             let mut ins_text = String::from("INSPECTOR\n");
@@ -573,6 +620,14 @@ fn main() {
             log.commit().unwrap();
             // 输入框 text 投影跟着落账后的新名走。
             let _ = tree.set_prop(name_input, "text", Value::Str(new_name));
+        }
+
+        // 层级树行点击落账（帧后 —— UiVm 钩子回调在帧内只报行下标）：
+        // 一次点击 = 一次 Selection::select（与视口点选同款单选替换语义；
+        // 选择是会话态，不进事务不落盘）。下一帧的树投影与 selected 行
+        // 高亮随之跟上。
+        for uid in row_clicks.borrow_mut().drain(..) {
+            sel.select(uid);
         }
 
         std::thread::sleep(Duration::from_millis(16));
