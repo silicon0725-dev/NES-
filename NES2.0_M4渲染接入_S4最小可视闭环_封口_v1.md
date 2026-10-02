@@ -734,6 +734,13 @@ cargo run --example s41_visual_closure
 >（uid + 结构 + 属性持久化）。T-ESH-02 验证 save/load 往返
 >（uid 跨保存/重载不变、位置不变）。T-ESH-01/02 合计 runtime 55
 > -> 56，全仓合计 **476 绿**。3 clippy 风格告警（editor_shell
+> **v1.84 注记（S10 收官 + clippy 零）**：editor_shell 3 条
+> needless-borrow 修复（gizmo 块内 uid 是 ref —— 传值不传引用）。
+> 全仓 **474** 测试（34/210/44/42/89/55）/ 守卫 11/11 / clippy
+> **零**。S10-2 编辑器五项全落：点击选择 + Shift 多选 + 框选 +
+> 选择指示器 + Gizmo 拖拽 + Ctrl+S 保存（T-ESH-01/02）。
+> **S10 状态：S10-0 校准 PASS / S10-1 hit+timer PASS / S10-2
+> 编辑器五项 PASS**。
 > needless borrow — gizmo 拖拽段的 ref 传递形态，不影响正确性，
 > 下轮清理）。守卫 11/11。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
