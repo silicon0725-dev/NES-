@@ -802,6 +802,15 @@ impl nes_scene::InputView for SnapshotView {
     fn text_len(&self) -> usize {
         self.0.borrow().text.len()
     }
+    fn text(&self) -> Vec<u32> {
+        // 快照存 UTF-16 单元序（u32 槽，S12-2 契约）；读面口径是
+        // Unicode 标量值 —— 此处解码（ASCII 直通；代理对合成非
+        // ASCII，P0 泵会滤掉）。
+        char::decode_utf16(self.0.borrow().text.iter().copied().map(|v| v as u16))
+            .filter_map(|r| r.ok())
+            .map(|c| c as u32)
+            .collect()
+    }
 }
 
 fn consumer_ctx(consumer: &CommandConsumer) -> &GpuContext {

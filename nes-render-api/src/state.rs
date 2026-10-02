@@ -270,6 +270,11 @@ pub struct LabelState {
     /// 文字着色（RGBA8 直 alpha；E-1 颜色通道，S12.1）。缺省白色
     /// —— 后端"采样色 x 1"与 E-1 之前逐位相同。
     pub color: [u8; 4],
+    /// 文本光标（S12-2 TextInput）：`Some(n)` = 在第 `n` 个字符槽位画一根
+    /// 1px 宽、字高竖条；`None` = 不画（缺省 —— 既有路径逐位不变）。
+    /// 位置是**字符下标**（等宽 16px 冻结口径，后端 `n * 16.0` 推笔）；
+    /// 闪隐节拍由提取层裁决（可见半拍才置 `Some`），后端零动画状态。
+    pub caret: Option<u16>,
 }
 
 impl LabelState {
@@ -284,6 +289,7 @@ impl LabelState {
             align_v: VAlign::Top,
             wrap_width: None,
             color: [255, 255, 255, 255],
+            caret: None,
         }
     }
 }

@@ -939,6 +939,12 @@ struct FontEntry {
 /// 该键在注册表里指向字形表纹理）。
 const DEFAULT_FONT_KEY: RenderAssetKey = RenderAssetKey::from_parts(u32::MAX, 1);
 
+/// 文本光标的笔位步长（像素；等宽 16px 冻结设计语言 —— 与字距同口径）。
+/// 契约层 [`LabelState::caret`] 的字符下标乘它得到笔位偏移；宽恒 1px、
+/// 高取字形格高。是否本帧画由提取层的 `caret` 位裁决（`None` = 不画），
+/// 渲染侧零动画状态。
+const CARET_ADVANCE_PX: f32 = 16.0;
+
 /// 默认字体的登记参数（[`CommandConsumer::set_default_font`] 用）。
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct FontParams {
@@ -1398,6 +1404,28 @@ impl CommandConsumer {
                                 });
                                 stats.glyphs += 1;
                             }
+                        }
+                        // 文本光标（S12-2）：1px 宽、字格高的实心竖条，画在
+                        // 笔起点 + `caret * 16px`（等宽 16px 冻结口径）；颜色
+                        // 取 [`LabelState::color`]。`None` = 本帧不画（提取层
+                        // 30 帧节拍的"隐"半拍），后端零动画状态。
+                        if let Some(caret) = label.caret {
+                            let quad = world
+                                .mul(&Affine2::translation(
+                                    caret as f32 * CARET_ADVANCE_PX,
+                                    0.0,
+                                ))
+                                .mul(&Affine2::scale(
+                                    1.0 / gpu::CELL_PX as f32,
+                                    font.cell.1 / gpu::CELL_PX as f32,
+                                ));
+                            sprites.push(SpriteInstance {
+                                handle: item.handle,
+                                world: quad.to_array(),
+                                uv_rect: fill_uv,
+                                source: [0.0, 0.0],
+                                tint: text_tint,
+                            });
                         }
                     }
                 }

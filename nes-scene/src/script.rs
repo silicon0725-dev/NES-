@@ -803,6 +803,13 @@ pub trait InputView {
     fn button(&self, name: &str) -> bool;
     /// 当前帧提交文本的元素数（== snapshot.text.len()，v1.1 冻结单位）。
     fn text_len(&self) -> usize;
+    /// 当前帧提交的文本字符（Unicode 标量值序列，S12-2 文本输入用）。
+    ///
+    /// 默认实现返回空 —— 既有实现者（S7.2/S8.2b 输入快照桥）不破坏；
+    /// 需要文本输入的宿主按需覆写。
+    fn text(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// 读面共享槽：信号处理器闭包（装进树的处理器表）与 process 路径

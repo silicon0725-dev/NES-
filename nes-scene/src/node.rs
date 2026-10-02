@@ -32,11 +32,14 @@ pub enum NodeKindTag {
     Button,
     /// 主题（S12.1 组件库）：八槽位语义色板（纯数据节点，不渲染）。
     Theme,
+    /// 单行文本输入框（S12-2 组件库）：Control 之上加提交值/主题槽位；
+    /// 草稿与光标是 UiVm 瞬态，不进属性表。
+    TextInput,
 }
 
 impl NodeKindTag {
     /// 全部标签，按继承链自上而下排列（属性面板顺序直接用它）。
-    pub const ALL: [NodeKindTag; 9] = [
+    pub const ALL: [NodeKindTag; 10] = [
         NodeKindTag::Node,
         NodeKindTag::Node2D,
         NodeKindTag::Sprite2D,
@@ -46,6 +49,7 @@ impl NodeKindTag {
         NodeKindTag::Script,
         NodeKindTag::Button,
         NodeKindTag::Theme,
+        NodeKindTag::TextInput,
     ];
 
     /// 在 [`Self::ALL`] 里的下标。位集与表格化存储要用。
@@ -60,6 +64,7 @@ impl NodeKindTag {
             Self::Script => 6,
             Self::Button => 7,
             Self::Theme => 8,
+            Self::TextInput => 9,
         }
     }
 
@@ -78,6 +83,7 @@ impl NodeKindTag {
             Self::Script => NodeKind::Script,
             Self::Button => NodeKind::Button,
             Self::Theme => NodeKind::Theme,
+            Self::TextInput => NodeKind::TextInput,
         }
     }
 
@@ -93,6 +99,7 @@ impl NodeKindTag {
             Self::Script => "Script",
             Self::Button => "Button",
             Self::Theme => "Theme",
+            Self::TextInput => "TextInput",
         }
     }
 
@@ -108,6 +115,7 @@ impl NodeKindTag {
             "Script" => Self::Script,
             "Button" => Self::Button,
             "Theme" => Self::Theme,
+            "TextInput" => Self::TextInput,
             _ => return None,
         })
     }
@@ -118,7 +126,7 @@ impl NodeKindTag {
             Self::Node | Self::Script | Self::Theme => return None,
             Self::Node2D | Self::Control => Self::Node,
             Self::Sprite2D | Self::Camera2D => Self::Node2D,
-            Self::Label | Self::Button => Self::Control,
+            Self::Label | Self::Button | Self::TextInput => Self::Control,
         })
     }
 
@@ -191,6 +199,9 @@ pub enum NodeKind {
     Button,
     /// 主题（S12.1）：八槽位色板全在属性表，纯数据节点。
     Theme,
+    /// 单行文本输入框（S12-2）：提交值与槽位引用全在属性表；
+    /// 草稿/光标是 UiVm 瞬态，不落属性表。
+    TextInput,
 }
 
 impl NodeKind {
@@ -206,6 +217,7 @@ impl NodeKind {
             Self::Script => NodeKindTag::Script,
             Self::Button => NodeKindTag::Button,
             Self::Theme => NodeKindTag::Theme,
+            Self::TextInput => NodeKindTag::TextInput,
         }
     }
 

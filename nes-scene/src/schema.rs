@@ -373,6 +373,43 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 "文字槽位名。",
             ),
         ],
+        NodeKindTag::TextInput => vec![
+            PropDesc::new(
+                "text",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::None,
+                "已提交值（也是初始值）。编辑中的草稿是 UiVm 瞬态，不落此属性。",
+            ),
+            PropDesc::new(
+                "fill_slot",
+                ValueType::Str,
+                Value::Str("panel".into()),
+                H::None,
+                "填充槽位名（主题解析）。",
+            ),
+            PropDesc::new(
+                "border_slot",
+                ValueType::Str,
+                Value::Str("border".into()),
+                H::None,
+                "边框槽位名（获得焦点时换档 accent，S12-2）。",
+            ),
+            PropDesc::new(
+                "text_slot",
+                ValueType::Str,
+                Value::Str("text".into()),
+                H::None,
+                "文字槽位名。",
+            ),
+            PropDesc::new(
+                "placeholder",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::None,
+                "占位提示文本（P0 仅存储，不参与渲染）。",
+            ),
+        ],
         NodeKindTag::Theme => THEME_SLOTS
             .iter()
             .map(|(name, rgba)| {

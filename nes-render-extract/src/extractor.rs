@@ -253,6 +253,9 @@ impl RenderExtractor {
             }
         }
         let ui = self.ui.as_ref().map(|u| u.borrow());
+        // 光标闪的节拍（S12-2）：提取帧序每 30 帧一个半拍（可见/隐藏
+        // 交替）—— 纯渲染侧动画，不进 tick 语义，也不进任何模拟状态。
+        let caret_visible = stamp / 30 % 2 == 0;
 
         for &node in order_nodes.iter() {
             stats.nodes_visited += 1;
@@ -269,7 +272,9 @@ impl RenderExtractor {
             // 准入条件：Sprite2D 有非空纹理键 / Label 有非空文本 / Control 恒准入。
             // 非渲染节点（Node / Node2D 容器 / Camera2D / Script …，以及纹理
             // 未绑定的 Sprite2D、空文本的 Label）一律跳过。
-            let Some(admission) = admit(tree, node, source, &theme, ui.as_deref()) else {
+            let Some(admission) =
+                admit(tree, node, source, &theme, ui.as_deref(), caret_visible)
+            else {
                 // 本帧不可渲染：若上一帧建过条目，必须销毁，否则留下悬垂渲染物。
                 // 判据是"本帧不再可渲染"而不是"资源消失了"：节点被改成非渲染
                 // 类型、纹理被解绑、文本被清空、资源被回收，走的是同一条路径。
@@ -340,6 +345,13 @@ impl RenderExtractor {
                     server.set_rect(handle, layout);
                     server.set_text(handle, text);
                 }
+                // 输入框摊平（S12-2）：与 Button 完全同款 —— 单节点单渲染物，
+                // rect + text 同句柄双推（消费者侧先画矩形后画字形）；光标
+                // 经 [`LabelState::caret`] 位随帧到（`None` = 不画）。
+                Admission::TextInput(_, layout, text) => {
+                    server.set_rect(handle, layout);
+                    server.set_text(handle, text);
+                }
             }
             stats.pushed += 1;
         }
@@ -406,6 +418,10 @@ enum Admission {
     /// 按钮（S12.1）：同句柄摊平 rect + text —— 消费者已支持一物多
     /// 实例（Label 一字形一四边形），按钮是其"矩形 + 文字"组合形态。
     Button(RenderAssetKey, ControlState, LabelState),
+    /// 输入框（S12-2）：与 Button 完全同款的同句柄摊平（rect + text）；
+    /// 文本取 UiStates 草稿表的编辑会话（无会话 = 已提交值），光标走
+    /// [`LabelState::caret`]（`None` = 不画 —— 闪隐的"隐"半拍）。
+    TextInput(RenderAssetKey, ControlState, LabelState),
 }
 
 impl Admission {
@@ -415,7 +431,7 @@ impl Admission {
             Admission::Sprite(key) => *key,
             Admission::Label(key, _) => *key,
             Admission::Control(key, _) => *key,
-            Admission::Button(key, _, _) => *key,
+            Admission::Button(key, _, _) | Admission::TextInput(key, _, _) => *key,
         }
     }
 }
@@ -459,6 +475,7 @@ fn admit(
     source: &dyn RenderKeySource,
     theme: &ThemeColors,
     ui: Option<&UiStates>,
+    caret_visible: bool,
 ) -> Option<Admission> {
     let tag = tree.kind_tag(node)?;
     if tag.is_a(NodeKindTag::Sprite2D) {
@@ -468,6 +485,12 @@ fn admit(
         // 按钮恒准入（空文本 = 纯图形按钮）；四态着色在此一次解析。
         let (layout, text) = button_states_of(tree, node, theme, ui);
         Some(Admission::Button(node_key(node), layout, text))
+    } else if tag.is_a(NodeKindTag::TextInput) {
+        // 输入框恒准入（空文本 = 空框也要有框可点）；三主题槽 + 焦点
+        // 换档 + 草稿/光标在此一次解析。blink 由提取层帧序的 30 帧奇偶
+        // 节拍裁决（渲染侧零动画状态 —— 动画只在这一个判定点）。
+        let (layout, text) = text_input_states_of(tree, node, theme, ui, caret_visible);
+        Some(Admission::TextInput(node_key(node), layout, text))
     } else if tag.is_a(NodeKindTag::Label) {
         let state = label_state_of(tree, node)?;
         Some(Admission::Label(
@@ -475,10 +498,17 @@ fn admit(
             themed_label(tree, node, state, theme),
         ))
     } else if tag.is_a(NodeKindTag::Control) {
-        Some(Admission::Control(
-            node_key(node),
-            themed_control(tree, node, control_state_of(tree, node), theme),
-        ))
+        // 焦点换档（S12-2）：focused -> 边框 accent（与 hover 同一
+        // 槽位解析机制 —— 直接取主题 accent 槽，不另开色源）。
+        let focused = ui
+            .and_then(|u| u.widgets.get(&node))
+            .map(|st| st.focused)
+            .unwrap_or(false);
+        let mut layout = themed_control(tree, node, control_state_of(tree, node), theme);
+        if focused {
+            layout.border = theme.slots[6]; // THEME_SLOTS 序：accent
+        }
+        Some(Admission::Control(node_key(node), layout))
     } else {
         None
     }
@@ -529,7 +559,7 @@ fn button_states_of(
     theme: &ThemeColors,
     ui: Option<&UiStates>,
 ) -> (ControlState, LabelState) {
-    let st: WidgetState = ui.and_then(|u| u.get(&node).copied()).unwrap_or_default();
+    let st: WidgetState = ui.and_then(|u| u.widgets.get(&node).copied()).unwrap_or_default();
     let mut layout = control_state_of(tree, node);
     // 按钮缺省自带面板填充（槽位可覆写）；hover/pressed 换档。
     let fill_slot = slot_prop(tree, node, "fill_slot", "panel");
@@ -551,6 +581,58 @@ fn button_states_of(
     let text_slot = slot_prop(tree, node, "text_slot", "text");
     let mut label = LabelState::new(text, 16.0);
     label.color = theme.slot(&text_slot).unwrap_or(label.color);
+    (layout, label)
+}
+
+/// 输入框摊平载荷（S12-2）：与 [`button_states_of`] 完全同款的三主题槽
+///（fill / border / text）+ 持焦点时边框换 accent。文本与光标是它独有的
+/// 两件事：
+///
+/// - **文本**：UiStates 草稿表（`texts`）里有本节点的编辑会话 → 显示
+///   草稿；无会话（未聚焦/从未点入）→ 显示节点 `text` 已提交值。
+/// - **光标**：持焦点且当帧处于 30 帧节拍的"可见"半拍 → [`LabelState::caret`]
+///   置 `Some(caret)`（草稿字符下标）；否则 `None`（渲染侧不画）。
+fn text_input_states_of(
+    tree: &SceneTree,
+    node: NodeId,
+    theme: &ThemeColors,
+    ui: Option<&UiStates>,
+    caret_visible: bool,
+) -> (ControlState, LabelState) {
+    let st: WidgetState = ui
+        .and_then(|u| u.widgets.get(&node))
+        .copied()
+        .unwrap_or_default();
+    let mut layout = control_state_of(tree, node);
+    // 输入框缺省自带面板填充（槽位可覆写）；focused 换 accent 边框
+    //（与 hover/pressed 同一槽位解析机制，不另开色源）。
+    let fill_slot = slot_prop(tree, node, "fill_slot", "panel");
+    let border_slot = slot_prop(tree, node, "border_slot", "border");
+    layout.fill = theme.slot(&fill_slot).unwrap_or(layout.fill);
+    layout.border = theme.slot(&border_slot).unwrap_or(layout.border);
+    const ACCENT: usize = 6; // THEME_SLOTS 序：bg panel border text text_dim selected accent danger
+    if st.focused {
+        layout.border = theme.slots[ACCENT];
+    }
+    // 文本：有编辑会话显示草稿，否则显示已提交值。
+    let session = ui.and_then(|u| u.texts.get(&node));
+    let text = match session {
+        Some(ts) => ts.draft.clone(),
+        None => match tree.prop(node, "text") {
+            Some(Value::Str(v)) => v.clone(),
+            _ => String::new(),
+        },
+    };
+    let text_slot = slot_prop(tree, node, "text_slot", "text");
+    let mut label = LabelState::new(text, 16.0);
+    label.color = theme.slot(&text_slot).unwrap_or(label.color);
+    // 光标：仅持焦点 + 可见半拍。字符下标口径与场景层冻结一致
+    //（`chars().count()`），收进契约层的 u16（越界夹到 u16::MAX）。
+    if st.focused && caret_visible {
+        label.caret = session.map(|ts| ts.caret).map(|c| {
+            u16::try_from(c).unwrap_or(u16::MAX)
+        });
+    }
     (layout, label)
 }
 

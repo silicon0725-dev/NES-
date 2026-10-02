@@ -17,7 +17,9 @@
 //!
 //! 运行：`cargo run --example editor_shell`
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 use nes_render_api::{FrameInfo, Vec2};
@@ -101,7 +103,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box) = {
+    let (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box, name_input) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
@@ -133,8 +135,16 @@ fn main() {
         let hud_st = tree.add_node(root, "hud_st", NodeKind::Label);
         tree.set_local(hud_st, Transform2D::from_pos(8.0, 410.0));
         tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        // Inspector 的节点重命名输入框（S12-2 TextInput —— 视口锚定，
+        // 与 UiVm 命中/焦点路由同一口径）。选中节点时显示并绑定其名字。
+        let name_input = tree.add_node(root, "name_input", NodeKind::TextInput);
+        tree.set_prop(name_input, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
+        tree.set_prop(name_input, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(616.0, 76.0))).unwrap();
+        tree.set_prop(name_input, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(148.0, 20.0))).unwrap();
+        tree.set_prop(name_input, "text", Value::Str(String::new())).unwrap();
+        tree.set_prop(name_input, "visible", Value::Bool(false)).unwrap();
         tree.apply_pending();
-        (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box)
+        (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box, name_input)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -158,8 +168,26 @@ fn main() {
     let mut drag_start: Option<(f32, f32)> = None;
     // Gizmo 拖拽（选中的对象直接拖动移动）：(uid, 鼠标偏移)。
     let mut gizmo: Option<(Uid, f32, f32)> = None;
+    // 重命名输入框的绑定（会话态）：当前 text 属性投影的是哪个选中节点。
+    let mut bound_sel: Option<Uid> = None;
+    // UiVm 提交钩子的落点（UiVm 零写权 —— 值经共享缓冲传回宿主，
+    // 宿主帧后落 Inspector::modify_name 一条 Modified 事务）。
+    let rename_sink: Rc<RefCell<Vec<(Uid, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let rename_bound: Rc<RefCell<Option<Uid>>> = Rc::new(RefCell::new(None));
+    {
+        let sink = rename_sink.clone();
+        let bound = rename_bound.clone();
+        rt.ui_vm_mut().on_commit(move |_node, value| {
+            if let Value::Str(name) = value {
+                if let Some(uid) = bound.borrow().clone() {
+                    sink.borrow_mut().push((uid, name));
+                }
+            }
+        });
+    }
 
-    let total: u64 = std::env::var("NES_EDIT_FRAMES")
+    let total: u64 = std::env::var("NES_GAME_FRAMES")
+        .or_else(|_| std::env::var("NES_EDIT_FRAMES"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(u64::MAX);
@@ -431,6 +459,19 @@ fn main() {
                 }
             }
 
+            // 重命名输入框投影：有选中 → 可见且 text 绑定选中节点名
+            //（换选中才重绑 —— 编辑会话中不改草稿）。
+            let primary_uid = sel.primary(tree).and_then(|p| tree.uid_of(p));
+            let _ = tree.set_prop(name_input, "visible", Value::Bool(primary_uid.is_some()));
+            if primary_uid != bound_sel {
+                bound_sel = primary_uid.clone();
+                *rename_bound.borrow_mut() = primary_uid.clone();
+                if let Some(p) = sel.primary(tree) {
+                    let name = tree.name(p).unwrap_or("").to_string();
+                    let _ = tree.set_prop(name_input, "text", Value::Str(name));
+                }
+            }
+
             // 选中高亮：Viewport 里的 Sprite 的 z_index（*5* 标记）。
             for u in sel.uids().to_vec() {
                 if let Some(id) = tree.find_by_uid(&u) {
@@ -459,8 +500,28 @@ fn main() {
                 }
             }
         }
+        // 重命名提交（帧后落账 —— UiVm 钩子回调在帧内只传值）：
+        // 一次提交 = 一条 Modified 事务（Inspector::modify_name）。
+        for (uid, new_name) in rename_sink.borrow_mut().drain(..) {
+            let tree = rt.tree_mut();
+            let unchanged = tree
+                .find_by_uid(&uid)
+                .and_then(|id| tree.name(id))
+                .is_some_and(|n| n == new_name);
+            if unchanged {
+                continue;
+            }
+            log.begin().unwrap();
+            Inspector::new(tree, &mut log)
+                .modify_name(&uid, &new_name)
+                .unwrap();
+            log.commit().unwrap();
+            // 输入框 text 投影跟着落账后的新名走。
+            let _ = tree.set_prop(name_input, "text", Value::Str(new_name));
+        }
+
         std::thread::sleep(Duration::from_millis(16));
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (cam, hud_tree, hud_ins, hud_st, sel_box);
+    let _ = (cam, hud_tree, hud_ins, hud_st, sel_box, name_input);
 }
