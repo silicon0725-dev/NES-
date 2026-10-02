@@ -8,6 +8,7 @@
 //! | T-WID-03 | 四态着色：hover -> accent 边框；pressed -> accent 填充+边框（UiVm 状态共享面） |
 //! | T-WID-04 | 无 Theme 节点 -> DEFAULT_DARK 兜底；Control/Label 也走槽位（面板/文字着色） |
 //! | T-WID-05 | TextInput 摊平（S12-2）：同句柄 rect+text 三槽齐达；focused -> 边框 accent；草稿文本到达；光标 Some + 30 帧节拍闪 |
+//! | T-WID-06 | 点击夺焦进提取层回归：真实 UiVm（FakeInput 点击输入框矩形）驱动 states_rc 共享面 -> focused 边框 accent / 草稿 / caret，失焦回落 |
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -206,4 +207,113 @@ fn t_wid_05_text_input_flattens_with_draft_and_caret() {
         Some(2),
         "回到可见半拍光标复现"
     );
+}
+
+/// 可编程假输入（T-UI 单元测试同款缩版：鼠标位置 + 左键 + 键盘 + 文本）。
+#[derive(Clone, Default)]
+struct ClickInput(Rc<RefCell<ClickState>>);
+
+#[derive(Default)]
+struct ClickState {
+    mouse: (f32, f32),
+    left: bool,
+    keys: std::collections::BTreeMap<String, bool>,
+    text: Vec<u32>,
+}
+
+impl nes_scene::InputView for ClickInput {
+    fn key(&self, name: &str) -> bool {
+        self.0.borrow().keys.get(name).copied().unwrap_or(false)
+    }
+    fn mouse(&self) -> (f32, f32) {
+        self.0.borrow().mouse
+    }
+    fn mouse_delta(&self) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+    fn button(&self, name: &str) -> bool {
+        name == "left" && self.0.borrow().left
+    }
+    fn text_len(&self) -> usize {
+        self.0.borrow().text.len()
+    }
+    fn text(&self) -> Vec<u32> {
+        self.0.borrow().text.clone()
+    }
+}
+
+/// T-WID-06：点击夺焦进提取层（真实 UiVm 驱动，非手工插状态）——
+/// FakeInput 点击输入框矩形 -> UiVm 夺焦 + 打字，`states_rc()` 共享面
+/// attach 给提取器：focused 边框 accent、草稿文本、caret Some；失焦后
+/// 边框回落 border 槽、草稿让位于已提交值、光标不画。
+#[test]
+fn t_wid_06_click_focus_drives_extractor_accent_draft_caret() {
+    use nes_scene::UiVm;
+
+    let mut t = SceneTree::new("root");
+    let input = t.add_node(t.root(), "name", NodeKind::TextInput);
+    t.set_prop(input, "offset", Value::Vec2(SVec2::new(200.0, 120.0))).unwrap();
+    t.set_prop(input, "size", Value::Vec2(SVec2::new(140.0, 28.0))).unwrap();
+    t.set_prop(input, "text", Value::Str("committed".into())).unwrap();
+    t.apply_pending();
+
+    let dark = ThemeColors::DEFAULT_DARK;
+    let mouse = (240.0_f32, 130.0_f32); // 输入框矩形内一点
+    let vp = (512.0_f32, 288.0_f32);
+
+    let fake = ClickInput::default();
+    let mut vm = UiVm::new();
+    vm.set_input_view(Rc::new(fake.clone()));
+
+    // 前置：未点击 —— 提取层无 focused，显示已提交值、无光标、边框 border。
+    vm.update(&t, vp, (1.0, 1.0));
+    let mut ex = RenderExtractor::new();
+    ex.attach_ui(vm.states_rc());
+    let mut srv = NullRenderServer::new();
+    let mut out = Vec::new();
+    let _ = ex.extract_into(&mut t, &NoAssets, &mut srv, &frame(vp.0, vp.1), &mut out);
+    let h = ex.handle_of(input).expect("input handle");
+    assert_eq!(srv.rect_of(h).expect("rect").border, dark.slot("border").unwrap());
+    assert_eq!(&*srv.label_of(h).expect("SetText").text, "committed");
+    assert_eq!(srv.label_of(h).expect("SetText").caret, None, "no focus, no caret");
+
+    // 点击夺焦（按下 -> 抬键）。
+    fake.0.borrow_mut().mouse = mouse;
+    fake.0.borrow_mut().left = true;
+    vm.update(&t, vp, (1.0, 1.0));
+    fake.0.borrow_mut().left = false;
+    vm.update(&t, vp, (1.0, 1.0));
+    assert_eq!(vm.focus(), Some(input), "click on input rect -> focus");
+
+    // 打字 "AB" -> 草稿进共享面。
+    fake.0.borrow_mut().text = vec!['A' as u32, 'B' as u32];
+    vm.update(&t, vp, (1.0, 1.0));
+    fake.0.borrow_mut().text.clear();
+    assert_eq!(
+        vm.text_state(input),
+        Some(TextState { draft: "committedAB".into(), caret: 11 }),
+        "session draft = committed value + typed chars",
+    );
+
+    // focused 换档进提取层：边框 accent + 草稿优先 + 光标 Some(2)。
+    let _ = ex.extract_into(&mut t, &NoAssets, &mut srv, &frame(vp.0, vp.1), &mut out);
+    let rect = srv.rect_of(h).expect("rect");
+    assert_eq!(rect.fill, dark.slot("panel").unwrap(), "focused keeps panel fill");
+    assert_eq!(rect.border, dark.slot("accent").unwrap(), "focused border -> accent");
+    let text = srv.label_of(h).expect("SetText").clone();
+    assert_eq!(&*text.text, "committedAB", "draft (committed + typed) wins");
+    assert_eq!(text.caret, Some(11), "caret lands in label payload");
+
+    // 点空白失焦：边框回落 border、草稿让位于已提交值、光标不画。
+    fake.0.borrow_mut().mouse = (400.0, 40.0);
+    fake.0.borrow_mut().left = true;
+    vm.update(&t, vp, (1.0, 1.0));
+    fake.0.borrow_mut().left = false;
+    vm.update(&t, vp, (1.0, 1.0));
+    assert_eq!(vm.focus(), None, "click on blank -> blur");
+    let _ = ex.extract_into(&mut t, &NoAssets, &mut srv, &frame(vp.0, vp.1), &mut out);
+    assert_eq!(srv.rect_of(h).expect("rect").border, dark.slot("border").unwrap());
+    let text = srv.label_of(h).expect("SetText").clone();
+    assert_eq!(&*text.text, "committed", "blur -> committed value shows");
+    assert_eq!(text.caret, None, "blur -> no caret");
 }

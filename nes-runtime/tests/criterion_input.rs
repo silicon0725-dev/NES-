@@ -157,3 +157,44 @@ fn t_in_r2_key_probe_full_chain() {
     let _ = rt.frame_with(&frame(2), &mut vm).expect("帧 3");
     assert_eq!(rt.tree_mut().local(sp).unwrap().pos.x, 4.0, "松开即停");
 }
+
+/// T-In-R3：键/鼠读面分立 —— `button_down("left")` 读鼠标按钮表，
+/// `is_down("left")`（键探针）对鼠标按钮恒 false。S12-2 记注回归：
+/// editor_shell 曾误用 `is_down("left")`，恒 false 使宿主点击路径
+///（含护住改名输入框的盾）变死代码，点击夺焦被"空白点击清选中"
+/// 连带击穿。
+#[test]
+fn t_in_r3_button_down_vs_key_probe_namespaces() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("nes_runtime_input")
+        .join("r3");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let _guard = lock_input();
+    let Ok(mut rt) = NesRuntime::open_with_root(&root, 64, 64) else {
+        eprintln!("[跳过 GPU 用例] 本机未找到 wgpu-native 动态库");
+        return;
+    };
+
+    // 左键按住（真实消息同队列注入）。
+    inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true });
+    let snap = rt.collect_input();
+    assert!(
+        snap.button_down("left"),
+        "button_down 读鼠标按钮表 -> 按住为真"
+    );
+    assert!(
+        !snap.is_down("left"),
+        "键探针名字空间没有鼠标按钮名 -> 恒 false（分立口径本身）"
+    );
+    assert!(!snap.button_down("right") && !snap.button_down("middle"));
+    assert!(!snap.button_down("nonsense"), "未知名 = 未按，不猜");
+
+    // 抬起 -> 两个读面都归假。
+    inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false });
+    let snap2 = rt.collect_input();
+    assert!(!snap2.button_down("left"));
+
+    // 清空事件队列，避免跨测试残留。
+    let _ = rt.collect_input();
+}

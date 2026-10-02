@@ -264,7 +264,10 @@ fn main() {
         }
         // 鼠标点击选择：button down 沿 → hit(mouse) → uid → Selection。
         // 按钮前沿检测（held 前后差）：down 沿 -> 一次点击。
-        let mouse_left_held = snap.is_down("left");
+        // 注意读**鼠标按钮表**（button_down）而非 is_down —— 键探针的
+        // 名字空间里没有 "left"，is_down("left") 恒 false（曾让护住
+        // 输入框的盾与整段点击路径变死代码，S12-2 记注）。
+        let mouse_left_held = snap.button_down("left");
         let mouse_shift = snap.is_down("LShift");
         if mouse_left_held && !prev_click {
             // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。

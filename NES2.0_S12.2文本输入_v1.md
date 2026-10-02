@@ -17,7 +17,7 @@ fill_slot / border_slot / text_slot / placeholder，RON 往返）；**焦点
 **P0 只收 ASCII 可打印（0x20..=0x7E），非 ASCII 忽略**（S12.0 §3.4
 IME 边界：不做组合窗，中文/真字体后置）。editor_shell 检查器换真
 消费者：节点重命名走 TextInput，一次提交 = 一条 `modify_name` 事务。
-六 crate **501 测试全绿**、clippy 0、守卫 11/11；渲染契约 additive
+六 crate **505 测试全绿**、clippy 0、守卫 11/11；渲染契约 additive
 （`caret: Option<u16>` 缺省 `None` = 既有路径逐位不变），无基线重录。
 
 ---
@@ -111,14 +111,29 @@ IME 边界：不做组合窗，中文/真字体后置）。editor_shell 检查�
   绑定的节点头上（提交回调读的是绑定槽，此刻换绑会把旧草稿安到
   新选中节点上）——会话持焦期间绑定冻结，失焦落账后下一帧再重绑。
 
+再修正（S12-2 收尾补刀）：上条"护住检查器面板"落地后实测**点击
+仍不夺焦**——盾被挂在 `snap.is_down("left")` 上，而 `is_down` 是
+**键探针**（`Key::from_name` 名字空间），键名表里根本没有 `"left"`
+（那是 `MouseButton` 名），故恒 false，宿主整段点击路径（盾 + 点选
++ 框选）实为死代码，"空白点击清选中"的击穿链原样健在。根修在宿主
+接线层：`InputSnapshot` 新增 `button_down`（读 `buttons_held` 鼠标
+按钮表，与键探针分立），editor_shell 改读 `button_down("left")`，
+盾恢复生效后 UiVm 按下沿夺焦路径可达。焦点赋值边沿与清扫规则语义
+零变更（UiVm 层 T-UI-05 / T-UI-R3 本就覆盖点击夺焦且为绿）；本轮补
+四条回归：T-UI-09（单元层点击获焦 → focused/草稿/光标进 states_rc
+共享面）、T-WID-06（真实 UiVm 驱动提取层 accent/草稿/光标换档）、
+T-UI-R4（点击重命名运行时全链 + modify_name 事务落账）、T-In-R3
+（键/鼠读面分立）。
+
 ## 6. 契约回归
 
 | 套件 | 编号 | 断言 |
 |---|---|---|
-| nes-scene/tests/s12_ui.rs | T-UI-05..08 | 焦点路由（点击夺焦/Tab 场景序轮转/点空白失焦/**Button 失焦零提交**）；文本泵（ASCII 插入 + 非 ASCII 忽略 + Backspace）；草稿语义（Enter 提交整体值不直写属性表/Esc 回滚/失焦=提交）；文本瞬态不入指纹 |
-| nes-render-extract/tests/s12_button.rs | T-WID-05..06 | TextInput 摊平同句柄（三主题槽 + focused 换 accent + 草稿优先/无会话显已提交值）；光标 Some(字符下标) 与 30 帧奇偶节拍（第 31 帧隐半拍不画） |
-| nes-runtime/tests/criterion_ui_interaction.rs | T-UI-R3 | **全链真实运行时路径**：`inject_input` Char（真实 UTF-16 消息序）→ `SnapshotView::text` 读面 → 草稿 → Enter 提交经 `on_commit` 回调一次；属性表零直写；Enter 抬起不重复提交 |
-| 六 crate 全量 | — | **501 全绿**（asset 34 / scene 222 / render-api 44 / render-extract 47 / render-wgpu 89 / runtime 65）、clippy 0（`--all-targets`）、依赖方向守卫 11/11 |
+| nes-scene/tests/s12_ui.rs | T-UI-05..09 | 焦点路由（点击夺焦/Tab 场景序轮转/点空白失焦/**Button 失焦零提交**）；文本泵（ASCII 插入 + 非 ASCII 忽略 + Backspace）；草稿语义（Enter 提交整体值不直写属性表/Esc 回滚/失焦=提交）；文本瞬态不入指纹；点击获焦 → focused/草稿/光标经 `states_rc` 共享面换档（提取层数据源交接点） |
+| nes-render-extract/tests/s12_button.rs | T-WID-05..06 | TextInput 摊平同句柄（三主题槽 + focused 换 accent + 草稿优先/无会话显已提交值）；光标 Some(字符下标) 与 30 帧奇偶节拍（第 31 帧隐半拍不画）；点击夺焦进提取层（真实 UiVm 驱动 → accent/草稿/caret，失焦回落） |
+| nes-runtime/tests/criterion_ui_interaction.rs | T-UI-R3..R4 | **全链真实运行时路径**：`inject_input` Char（真实 UTF-16 消息序）→ `SnapshotView::text` 读面 → 草稿 → Enter 提交经 `on_commit` 回调一次；属性表零直写；Enter 抬起不重复提交；鼠标点击重命名全链（MouseMove+按下/抬键 → 夺焦 → 字符落草稿 → Enter 进 rename_sink → `modify_name` 一条 Modified 事务 + undo 还原） |
+| nes-runtime/tests/criterion_input.rs | T-In-R3 | 键/鼠读面分立：`button_down("left")` 按住为真、键探针 `is_down("left")` 恒 false、未知名不猜、抬起归假（S12-2 记注回归） |
+| 六 crate 全量 | — | **505 全绿**（asset 34 / scene 223 / render-api 44 / render-extract 48 / render-wgpu 89 / runtime 67，本轮 +4：T-UI-09/T-WID-06/T-UI-R4/T-In-R3）、clippy 0（`--all-targets`）、依赖方向守卫 11/11 |
 
 ## 7. 跳过与后置
 
@@ -129,12 +144,18 @@ IME 边界：不做组合窗，中文/真字体后置）。editor_shell 检查�
   后置
 - **placeholder**：P0 仅存储不渲染；**Enter 激活 Button**（焦点在
   Button 上回车）：焦点槽已占、激活留待后续里程碑
+- **Tab 双发语义**：editor_shell 宿主侧 Tab 沿仍同时驱动 Sprite 选中
+  轮转（鼠标点选之前的备用路径），与 UiVm 的 Tab 焦点轮转同帧双发——
+  重命名会话中按 Tab 会既换焦点又换选中（有"会话持焦绑定冻结"兜底，
+  提交不落错账，仅交互语义含混）；**S12-3 收口**：焦点会话期间宿主
+  侧 Tab 让路给 UiVm
 - 契约回归：无命令流/指纹/视觉基线变更——本轮全 additive，零重录
 
 ## 8. 后续（S12-3 起按 S12.0 §7 推进）
 
 - S12-3：E-2 裁剪（SetClip + scissor）+ ScrollView + ListView + Tabs
-  （层级树换 ListView 真消费者）
+  （层级树换 ListView 真消费者）；editor_shell 宿主 Tab 双发收口（§7
+  记注：焦点会话期间宿主侧让路给 UiVm）
 - S12-4：F-4 编辑器集成（文件选择器 + 脚本面板 + editor_shell 整体
   换装）
 - 文本泵补课：左右光标移动 / Home/End / Button 回车激活

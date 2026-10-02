@@ -11,6 +11,7 @@
 //! | T-UI-06 | 文本输入状态机：字符插入光标处（P0 仅 ASCII 可打印）、Backspace 删前一字符 |
 //! | T-UI-07 | 草稿语义：Enter 提交整体值（经回调、不直写属性）、Esc 回滚、失焦提交、空/非法处理 |
 //! | T-UI-08 | 文本瞬态（草稿/光标）不入语义指纹 |
+//! | T-UI-09 | 鼠标点击 TextInput 获焦回归：FakeInput 点击输入框矩形 -> focus()+focused 态 -> focused/草稿/光标经 states_rc 共享面换档进提取层（下游 T-WID-06 消费） |
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -422,4 +423,62 @@ fn t_ui_08_text_transients_not_in_fingerprint() {
     assert_eq!(vm.text_state(in1).unwrap().draft, "qqq", "前置：草稿确实变了");
     let after = scene_fingerprint(&t, None);
     assert_eq!(before, after, "文本瞬态不进语义指纹");
+}
+
+/// T-UI-09：鼠标点击 TextInput 获焦（UiVm 单元回归）—— FakeInput 点击
+/// 输入框矩形 -> focus()==该节点 + focused 态置位 + focused/草稿/光标
+/// 经 [`UiVm::states_rc`] 共享面换档进提取层（提取器 `attach_ui` 消费的
+/// 正是这个句柄：边框 accent 取 widgets[in].focused，草稿/caret 取
+/// texts[in]；G7 禁场景层依赖提取层，故本侧钉住共享面这一契约交接点，
+/// 提取器摊平断言见下游提取层 T-WID-05/06）。
+#[test]
+fn t_ui_09_click_focus_feeds_extraction_shared_states() {
+    let (t, _btn, in1, _in2) = widgets_scene();
+    let input = FakeInput::default();
+    let mut vm = UiVm::new();
+    vm.set_input_view(Rc::new(input.clone()));
+
+    // 前置：未点击 —— 无焦点，共享面无 focused。
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    assert_eq!(vm.focus(), None, "初始无焦点");
+    let shared = vm.states_rc();
+    assert!(
+        !shared.borrow().widgets.get(&in1).is_some_and(|s| s.focused),
+        "未聚焦：共享面无 focused 旗标"
+    );
+
+    // 点击 in1 矩形 (200,120,140,28) 内一点 -> 夺焦。
+    input.set((240.0, 130.0), true);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set((240.0, 130.0), false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    assert_eq!(vm.focus(), Some(in1), "点击 TextInput 夺焦");
+    assert!(vm.state(in1).focused, "focused 态置位");
+
+    // focused 换档进提取层共享面（states_rc == attach_ui 句柄）。
+    assert!(
+        shared.borrow().widgets.get(&in1).is_some_and(|s| s.focused),
+        "focused 旗标进共享面（提取器边框 accent 数据源）"
+    );
+
+    // 打字：草稿/光标同样经共享面进提取层（草稿文本 + caret 数据源）。
+    input.set_text(vec!['A' as u32, 'B' as u32]);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.clear_text();
+    assert_eq!(
+        shared.borrow().texts.get(&in1).cloned(),
+        Some(TextState { draft: "AB".into(), caret: 2 }),
+        "草稿与光标进共享面"
+    );
+
+    // 点空白失焦：共享面 focused 清位（提取器边框回落 border 槽）。
+    input.set((400.0, 40.0), true);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set((400.0, 40.0), false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    assert_eq!(vm.focus(), None, "点空白失焦");
+    assert!(
+        !shared.borrow().widgets.get(&in1).is_some_and(|s| s.focused),
+        "失焦清共享面 focused 旗标"
+    );
 }

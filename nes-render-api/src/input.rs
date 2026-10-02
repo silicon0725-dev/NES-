@@ -184,6 +184,16 @@ impl InputSnapshot {
     pub fn is_down(&self, name: &str) -> bool {
         Key::from_name(name).is_some_and(|k| self.held.contains(&k))
     }
+
+    /// 鼠标按钮是否按住（[`MouseButton::from_name`] 口径：`"left"/
+    /// "right"/"middle"`；未知名 = 未按）。与 [`Self::is_down`] 分立 ——
+    /// 键与鼠是两张状态表（`held` vs `buttons_held`），键探针永远查不到
+    /// 鼠标按钮（S12-2 记注：editor_shell 曾误用 `is_down("left")`，
+    /// 恒 false 让整段宿主点击路径变死代码）。
+    pub fn button_down(&self, name: &str) -> bool {
+        MouseButton::from_name(name)
+            .is_some_and(|b| self.buttons_held[b.index()])
+    }
 }
 
 /// 输入折叠器：事件流 → 帧快照。纯状态机，无平台/线程概念
