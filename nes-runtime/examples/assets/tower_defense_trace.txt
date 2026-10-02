@@ -1,0 +1,7 @@
+# 哨塔防线：点击建塔（两座：先中路，后左路）
+0 mouse_move 192 60
+30 mouse_down left
+31 mouse_up left
+600 mouse_move 100 80
+630 mouse_down left
+631 mouse_up left

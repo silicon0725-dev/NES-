@@ -1,0 +1,69 @@
+// S11-2 第三完整项目：哨塔防线 —— 用 F-1（S11.1 脚本级只读共享面）拆
+// 四个具名 Script 节点协作。状态住各自 locals，写纪律冻结：
+// 跨脚本变更一律 emit 信号给属主，process 入口只写自身。
+//
+// 玩法：敌人从顶部按波次下行，到底扣 1 生命；点击屏幕建塔（花 10 金，
+// tower_ctl 读 game.gold 判可建后 emit buy）；塔按 NodeData.timer 周期
+// 攻击射程内敌人（距离平方判定），敌人死亡掉 5 金（emit reward）；
+// 一波清空推进波次（spawner emit waveclear，game.wave +1）。
+//
+// 四脚本分工（F-1 属主模式）：
+//   game      —— gold/lives/wave/kills 唯一写者；单信号通道 "game" 复用
+//                （一脚本一入口的既有约束）：载荷编码 ping=0 / buy=100+cost
+//                / leak=200 / reward=300+amt / waveclear=400
+//   spawner   —— **every 驱动**；读 game.wave 决定配额/节奏；波次记账 +
+//                选空位（pend 局部）+ 每帧 emit "sim" 驱动实体脚本。
+//                摩擦实录：既有 NodeCtx 纪律 "process 入口只许写自身"，
+//                every 写不了敌人哑实体 —— 刷怪落笔只能移到 sim 信号侧，
+//                经 F-1 点读 spawner.pend/spawned 传递决策。
+//   tower_ctl —— on "sim"：落笔刷怪（读 spawner.pend）、点击建塔（扣钱
+//                只在 game）、NodeData.timer 计时、距离判定命中、敌人
+//                下行/漏怪/击杀回收。
+//   hud_ui    —— on "tick" 每帧点读 game.gold/lives/wave/kills 显示
+//                （F-1 回退读 Script 节点局部；跨节点写在信号入口是
+//                既有合法路径，first_game 同款）。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/enemy.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/bullet.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            // 敌人池：哑实体（spawner 决策属主；落笔在 sim 处理器）。
+            Node(name: "enemies", kind: "Node", children: [
+                Node(name: "e0", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 2, "visible": false, }, children: [],),
+                Node(name: "e1", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 2, "visible": false, }, children: [],),
+                Node(name: "e2", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 2, "visible": false, }, children: [],),
+                Node(name: "e3", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 2, "visible": false, }, children: [],),
+                Node(name: "e4", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 2, "visible": false, }, children: [],),
+                Node(name: "e5", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(1), "z_index": 2, "visible": false, }, children: [],),
+            ],),
+            // 塔池：哑实体（tower_ctl 属主管理）。
+            Node(name: "towers", kind: "Node", children: [
+                Node(name: "t0", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 1, "visible": false, }, children: [],),
+                Node(name: "t1", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 1, "visible": false, }, children: [],),
+                Node(name: "t2", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 1, "visible": false, }, children: [],),
+                Node(name: "t3", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 1, "visible": false, }, children: [],),
+                Node(name: "t4", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 1, "visible": false, }, children: [],),
+                Node(name: "t5", kind: "Sprite2D", local: (x: -100.0, y: -100.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "texture": Resource(2), "z_index": 1, "visible": false, }, children: [],),
+            ],),
+            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "TOWER DEFENSE", }, children: [],),
+            // game：gold/lives/wave/kills 唯一写者（信号入口，载荷编码复用单通道）。
+            Node(name: "game", kind: "Script", props: { "source": "init { gold = 20; lives = 10; wave = 1; kills = 0; log = array() }\non \"game\" { v = arg; if v > 0 { if v >= 400 { wave = wave + 1; push(log, wave) } else { if v >= 300 { gold = gold + v - 300; kills = kills + 1 } else { if v >= 200 { lives = lives - 1 } else { gold = gold - v + 100 } } } } }" }, children: [],),
+            // spawner：on "tick" 驱动；读 game.wave 决定刷怪节奏；帧 0 先 ping
+            // 唤醒 game（信号脚本的 init 在首派发才跑 —— 既有形态）；
+            // 每帧 emit "sim" 驱动 tower_ctl（实体写不进 every —— 见文件头）。
+            Node(name: "spawner", kind: "Script", props: { "source": "init { lanes = children(node(\"enemies\")); quota = 0; spawned = 0; cd = 0; mywave = 0; waiting = 1; alive = 0; booted = 0; pend = 0; pend_ok = 0 }\nevery { pend = 0; pend_ok = 0; if booted == 0 { booted = 1; emit \"game\" 0 }; if waiting == 1 { if game.wave > 0 { mywave = game.wave; quota = 2 + mywave; spawned = 0; cd = 60; waiting = 0 } }; if cd > 0 { cd = cd - 1 }; if cd <= 0 { if spawned < quota { for_each(lanes) { if pend_ok == 0 { if it.visible == false { pend = it; pend_ok = 1; spawned = spawned + 1; cd = 60 - mywave * 10; if cd < 30 { cd = 30 } } } } } }; alive = 0; for_each(lanes) { if it.visible { alive = alive + 1 } }; if quota > 0 { if spawned >= quota { if alive == 0 { waiting = 1; emit \"game\" 400 } } }; emit \"sim\" 0 }" }, children: [],),
+            // tower_ctl：sim 处理器 —— 落笔刷怪（读 spawner.pend/spawned，
+            // F-1 点读）；点击建塔（读 game.gold 判可建 -> emit buy，扣钱只
+            // 在 game）；timer 周期攻击 + 距离平方判定命中；敌人下行/漏怪。
+            Node(name: "tower_ctl", kind: "Script", props: { "source": "init { slots = children(node(\"towers\")); ni = 0; cd = 0 }\non \"sim\" { if spawner.pend_ok == 1 { h = spawner.pend; idx = spawner.spawned - 1; node(h).pos = xy(48.0 + idx * 56.0, 0.0 - 12.0); node(h).visible = true }; if cd > 0 { cd = cd - 1 }; if button(\"left\") { if cd <= 0 { if game.gold >= 10 { if ni < len(slots) { th = slots[ni]; ni = ni + 1; cd = 30; emit \"game\" 110; node(th).pos = xy(mouse_x(), mouse_y()); node(th).visible = true; node(th).timer = 45 } } } }; for_each(children(node(\"enemies\"))) { if it.visible { it.pos = xy(it.pos.x, it.pos.y + 0.4 + spawner.mywave * 0.1); if it.pos.y > 220.0 { it.visible = false; it.pos = xy(0.0 - 100.0, 0.0 - 100.0); emit \"game\" 200 } } }; for_each(slots) { th = it; if node(th).visible == true { if node(th).timer == 0 { for_each(children(node(\"enemies\"))) { if it.visible { dx = node(th).pos.x - it.pos.x; dy = node(th).pos.y - it.pos.y; if dx * dx + dy * dy < 4900.0 { it.visible = false; it.pos = xy(0.0 - 100.0, 0.0 - 100.0); emit \"game\" 305 } } }; node(th).timer = 45 } } } }" }, children: [],),
+            // hud_ui：每帧点读 game.* 显示（F-1：属性未命中 -> Script 节点局部）。
+            Node(name: "hud_ui", kind: "Script", props: { "source": "on \"tick\" { if game.lives <= 0 { hud.text = \"LOSE\" } else { hud.text = \"GOLD:\" + num_to_str(game.gold) + \" LIVES:\" + num_to_str(game.lives) + \" WAVE:\" + num_to_str(game.wave) + \" KILLS:\" + num_to_str(game.kills) } }" }, children: [],),
+        ],
+    ),
+)
