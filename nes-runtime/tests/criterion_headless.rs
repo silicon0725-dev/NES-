@@ -863,3 +863,49 @@ fn t_farm_02_click_timer_win() {
     }
     assert!(win_at.is_some(), "click->plant->timer->harvest->WIN within 900 frames");
 }
+
+/// T-ESH-02: Editor save round-trip — to_doc -> doc_to_ron -> file -> load -> uid/props preserved.
+#[test]
+fn t_esh_02_save_roundtrip() {
+    let _g = lock();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nes_runtime_esh_save");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Build a scene with known uids.
+    let mut rt = nes_runtime::NesRuntime::open_headless(&dir).unwrap();
+    {
+        let tree = rt.tree_mut();
+        let cam = tree.add_node(tree.root(), "cam", nes_scene::NodeKind::Camera2D);
+        tree.set_local(cam, nes_scene::Transform2D::from_pos(32.0, 32.0));
+        let a = tree.add_node(tree.root(), "a", nes_scene::NodeKind::Sprite2D);
+        tree.set_local(a, nes_scene::Transform2D::from_pos(10.0, 20.0));
+        tree.apply_pending();
+    }
+
+    // Save (to_doc -> doc_to_ron -> write).
+    let doc = nes_scene::to_doc(rt.tree_mut());
+    let text = nes_scene::doc_to_ron(&doc, &nes_scene::PackOptions::compact());
+    std::fs::write(dir.join("scene.ron"), &text).unwrap();
+
+    // Load (read -> instantiate).
+    let loaded = nes_scene::instantiate(&std::fs::read_to_string(dir.join("scene.ron")).unwrap()).unwrap();
+
+    // Verify uid + structure preserved.
+    let orig_uid = {
+        let tree = rt.tree_mut();
+        let a = tree.find(&nes_scene::NodePath::parse("/root/a").unwrap()).unwrap();
+        tree.uid_of(a).unwrap()
+    };
+    let loaded_uid = loaded
+        .find(&nes_scene::NodePath::parse("/root/a").unwrap())
+        .and_then(|n| loaded.uid_of(n))
+        .expect("loaded node a");
+    assert_eq!(orig_uid, loaded_uid, "uid preserved across save/load");
+    let (lx, ly) = loaded
+        .find(&nes_scene::NodePath::parse("/root/a").unwrap())
+        .and_then(|n| loaded.local(n))
+        .map(|t| (t.pos.x, t.pos.y))
+        .unwrap();
+    assert_eq!((lx, ly), (10.0, 20.0), "position preserved");
+}

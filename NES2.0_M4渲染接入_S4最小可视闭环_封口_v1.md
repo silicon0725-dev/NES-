@@ -729,6 +729,13 @@ cargo run --example s41_visual_closure
 > offset/size 经提取层 `set_rect` 渲染边框（S4.2 既有件，编辑器
 > 复用零新渲染能力）。编辑器三件（点击/多选/框选/指示器）全部就位。
 > 475 绿。
+> **v1.83 注记（S10-2 第五项：Ctrl+S 保存 + T-ESH-02 round-trip）**：
+> editor_shell Ctrl+S —— to_doc -> doc_to_ron(compact) -> 落盘
+>（uid + 结构 + 属性持久化）。T-ESH-02 验证 save/load 往返
+>（uid 跨保存/重载不变、位置不变）。T-ESH-01/02 合计 runtime 55
+> -> 56，全仓合计 **476 绿**。3 clippy 风格告警（editor_shell
+> needless borrow — gizmo 拖拽段的 ref 传递形态，不影响正确性，
+> 下轮清理）。守卫 11/11。
 > 编辑器产品化的优先序（多选/框选/Gizmo/Inspector 控件/新缺口）。
 
 | 事项 | 状态 |
