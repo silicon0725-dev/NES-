@@ -81,15 +81,27 @@ pub const SPRITE_EYE_OFFSET: (u32, u32) = (3, 3);
 
 /// 控件边框色（绿）—— `SetRect` 的 HUD 可视化：1px 边框 + 透明内部
 /// （配合片段着色器的 alpha 丢弃，无混合也能"透出"下层像素）。
+/// 图案格的中性基底（E-1：颜色一律经实例 tint 相乘进入，图案本身不带色）。
+pub const NEUTRAL_WHITE: [u8; 4] = [255, 255, 255, 255];
+
+/// E-1 之前的边框观感（绿色哨兵）—— 已上移为契约缺省
+/// `nes_render_api::state::CONTROL_BORDER_LEGACY`，此处保留仅为历史对照。
 pub const CONTROL_FRAME_COLOR: [u8; 4] = [0, 255, 0, 255];
-/// 控件边框图案所在格号（格 0 = 精灵图案，格 1 = 控件边框，格 2~15 = 品红哨兵）。
+/// 控件边框图案所在格号（格 0 = 精灵图案，格 1 = 控件边框，格 2 = 纯色
+/// 填充，格 3~15 = 品红哨兵 —— E-1 颜色通道，S12.1）。
 pub const CONTROL_CELL: u32 = 1;
 
-/// 构造整张精灵图集：第 0 格是「红底 + 一个白眼」，第 1 格是控件边框（绿框 +
-/// 透明内部），其余格是纯品红哨兵色。
+/// 纯色填充图案所在格号（中性白 —— 颜色经实例 tint 进入）。
+pub const FILL_CELL: u32 = 2;
+
+/// 构造整张精灵图集：第 0 格是「红底 + 一个白眼」，第 1 格是控件边框
+///（**中性白**框 + 透明内部），第 2 格是中性白纯色填充，其余格是纯品红
+/// 哨兵色。
 ///
-/// 只让前两格带图案、其余格是哨兵色，「采样到了哪一格」在像素层面才是可判定的
-/// （见 [`ATLAS_FILLER_COLOR`]）。
+/// E-1 起图案格一律**中性白**：颜色经实例 tint 相乘进入（绿框观感由
+/// 契约缺省 `CONTROL_BORDER_LEGACY` 以 tint 复现，逐位同前）。
+/// 只让前三格带图案、其余格是哨兵色，「采样到了哪一格」在像素层面
+/// 才是可判定的（见 [`ATLAS_FILLER_COLOR`]）。
 pub fn build_sprite_sheet() -> Vec<u8> {
     let mut sheet = vec![0u8; (ATLAS_PX * ATLAS_PX * 4) as usize];
     for pixel in sheet.chunks_exact_mut(4) {
@@ -97,6 +109,7 @@ pub fn build_sprite_sheet() -> Vec<u8> {
     }
     let cell0 = render_sprite_cell();
     let cell1 = control_frame_cell();
+    let cell2 = fill_cell();
     let row_bytes = (CELL_PX * 4) as usize;
     for row in 0..CELL_PX {
         let dst = (row * ATLAS_PX * 4) as usize;
@@ -104,6 +117,8 @@ pub fn build_sprite_sheet() -> Vec<u8> {
         sheet[dst..dst + row_bytes].copy_from_slice(&cell0[src..src + row_bytes]);
         let dst1 = dst + (CELL_PX * 4) as usize;
         sheet[dst1..dst1 + row_bytes].copy_from_slice(&cell1[src..src + row_bytes]);
+        let dst2 = dst1 + row_bytes;
+        sheet[dst2..dst2 + row_bytes].copy_from_slice(&cell2[src..src + row_bytes]);
     }
     sheet
 }
@@ -124,18 +139,28 @@ pub fn render_sprite_cell() -> Vec<u8> {
     cell
 }
 
-/// 单格控件边框图案：1px 绿框 + 透明内部（内部经片段着色器的 alpha 丢弃）。
+/// 单格控件边框图案：1px 中性白框 + 透明内部（内部经片段着色器的
+/// alpha 丢弃；颜色经实例 tint 进入）。
 pub fn control_frame_cell() -> Vec<u8> {
     let mut cell = Vec::with_capacity(CELL_BYTES);
     for y in 0..CELL_PX {
         for x in 0..CELL_PX {
             let border = x == 0 || y == 0 || x == CELL_PX - 1 || y == CELL_PX - 1;
             cell.extend_from_slice(if border {
-                &CONTROL_FRAME_COLOR
+                &NEUTRAL_WHITE
             } else {
                 &[0, 0, 0, 0]
             });
         }
+    }
+    cell
+}
+
+/// 单格纯色填充图案：整格中性白（颜色经实例 tint 进入）。
+pub fn fill_cell() -> Vec<u8> {
+    let mut cell = Vec::with_capacity(CELL_BYTES);
+    for _ in 0..(CELL_PX * CELL_PX) {
+        cell.extend_from_slice(&NEUTRAL_WHITE);
     }
     cell
 }

@@ -69,7 +69,8 @@ pub mod source;
 
 pub use bridge::{affine2_of, flip_of, render_key_of_bits, vec2_of};
 pub use extractor::{
-    camera_state_of, compose_flip, control_state_of, label_state_of, ExtractStats, RenderExtractor,
+    camera_state_of, compose_flip, control_state_of, label_state_of, themed_control,
+    themed_label, ExtractStats, RenderExtractor,
     ScratchStats, DEFAULT_CONTROL_SIZE, DEFAULT_LABEL_FONT_SIZE, PROP_CAMERA_ACTIVE,
     PROP_CAMERA_ZOOM, PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_FLIP_H,
     PROP_FLIP_V, PROP_LABEL_FONT_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE, PROP_VISIBLE, PROP_Z_INDEX,

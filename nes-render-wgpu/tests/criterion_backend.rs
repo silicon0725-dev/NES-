@@ -420,18 +420,20 @@ fn criterion_backend_control_frame_hud() {
     let mut commands = Vec::new();
     server.submit_into(&frame(0), &mut commands);
     let outcome = consumer.consume(&commands).expect("控件帧消费");
-    assert_eq!(outcome.stats.drawn, 3);
+    // E-1（S12.1）：每控件 = 四条 1px 边框条实例（填充透明不发）
+    // —— 1 精灵 + 2 控件 x 4 条 = 9 实例。
+    assert_eq!(outcome.stats.drawn, 9);
     assert_eq!(outcome.stats.controls, 2, "两个控件边框");
     assert_eq!(outcome.stats.driver_errors, 0);
 
     let image = &outcome.image;
-    // FULL_RECT 边框：64/16 = 4 倍缩放 -> 4px 粗边框（像素 0..3），内部透明。
+    // FULL_RECT 边框：像素精确 1px 平直条（E-1），内部透明。
     assert_eq!(image.pixel(0, 0), Some(CONTROL_RGBA), "全幅边框左上");
-    assert_eq!(image.pixel(3, 3), Some(CONTROL_RGBA), "边框厚度 4px 内");
+    assert_eq!(image.pixel(3, 3), Some(CLEAR_RGBA), "边框恰 1px（内一格透明）");
     assert_eq!(image.pixel(63, 63), Some(CONTROL_RGBA), "全幅边框右下");
     assert_eq!(image.pixel(5, 5), Some(CLEAR_RGBA), "全幅内部透明 -> 背景");
-    // 子矩形 (8,8,40,40)：2.5 倍缩放 -> 约 2~3px 边框。
-    assert_eq!(image.pixel(9, 9), Some(CONTROL_RGBA), "子矩形边框");
+    // 子矩形 (8,8,40,40)：1px 平直边框。
+    assert_eq!(image.pixel(9, 9), Some(CLEAR_RGBA), "子矩形边框恰 1px");
     assert_eq!(image.pixel(12, 12), Some(CLEAR_RGBA), "子矩形内部透明");
     // 下层精灵透过控件内部可见。
     assert_eq!(image.pixel(30, 30), Some(BODY_RGBA), "精灵透过控件可见");

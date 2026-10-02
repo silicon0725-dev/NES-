@@ -90,9 +90,10 @@ fn t_control_01_full_rect_covers_viewport() {
     assert_eq!(outcome.stats.controls, 1);
     let image = &outcome.image;
     assert_eq!(image.pixel(0, 0), Some(CONTROL_RGBA), "视口左上角");
-    assert_eq!(image.pixel(1, 1), Some(CONTROL_RGBA), "边框内一格");
+    // E-1（S12.1）：边框是像素精确的 1px 平直条 —— (1,1) 已是内部。
+    assert_eq!(image.pixel(1, 1), Some(CLEAR_RGBA), "边框恰 1px（内一格即透明）");
     assert_eq!(image.pixel(255, 127), Some(CONTROL_RGBA), "视口右下角");
-    assert_eq!(image.pixel(16, 16), Some(CLEAR_RGBA), "内部透明（缩放 8 边框可达 ~8px，取深入点）");
+    assert_eq!(image.pixel(16, 16), Some(CLEAR_RGBA), "内部透明");
     assert_eq!(image.pixel(128, 64), Some(CLEAR_RGBA), "中心透出背景");
 }
 
@@ -106,7 +107,7 @@ fn t_control_02_pixel_rect_position() {
     let outcome = flush(&mut consumer, &mut server);
     let image = &outcome.image;
     assert_eq!(image.pixel(8, 8), Some(CONTROL_RGBA), "矩形角点");
-    assert_eq!(image.pixel(9, 9), Some(CONTROL_RGBA), "边框内一格");
+    assert_eq!(image.pixel(9, 9), Some(CLEAR_RGBA), "边框恰 1px（E-1 平直边框）");
     assert_eq!(image.pixel(11, 11), Some(CLEAR_RGBA), "深入内部透明");
     assert_eq!(image.pixel(60, 60), Some(CLEAR_RGBA), "矩形（8..56）之外");
     assert_eq!(image.pixel(4, 4), Some(CLEAR_RGBA), "矩形之外（左上）");
@@ -172,7 +173,7 @@ fn t_control_05_hud_immovable_under_camera() {
     assert_eq!(image.pixel(120, 56), Some([255, 0, 0, 255]), "精灵随相机缩放移动到 (120,56)");
     assert_eq!(image.pixel(126, 62), Some(EYE_RGBA), "精灵眼睛 (63,63) -> (126,62)");
     assert_eq!(image.pixel(16, 16), Some(CONTROL_RGBA), "控件钉在视口 (16,16)");
-    assert_eq!(image.pixel(17, 17), Some(CONTROL_RGBA));
+    assert_eq!(image.pixel(17, 17), Some(CLEAR_RGBA), "边框恰 1px（E-1）");
     assert_eq!(image.pixel(30, 30), Some(CLEAR_RGBA), "控件内部（无精灵处）背景");
     // 若控件错误地走了视图矩阵，边框会落到 ((16-64)*2+128, (16-64)*2+64)=(32,-16)：
     // (16,16) 将是背景 -> 上面的断言即是本契约的反证锚点。

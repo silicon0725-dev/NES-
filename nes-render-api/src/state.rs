@@ -267,6 +267,9 @@ pub struct LabelState {
     pub align_v: VAlign,
     /// 自动换行宽度（逻辑像素）；`None` = 不换行。
     pub wrap_width: Option<f32>,
+    /// 文字着色（RGBA8 直 alpha；E-1 颜色通道，S12.1）。缺省白色
+    /// —— 后端"采样色 x 1"与 E-1 之前逐位相同。
+    pub color: [u8; 4],
 }
 
 impl LabelState {
@@ -280,11 +283,16 @@ impl LabelState {
             align_h: HAlign::Left,
             align_v: VAlign::Top,
             wrap_width: None,
+            color: [255, 255, 255, 255],
         }
     }
 }
 
 // ---------------------------------------------------------------- control
+
+/// 控件边框的缺省色（历史哨兵绿 —— E-1 之前内建图集边框格的观感，
+/// 保留为契约缺省使旧观感可经数据显式覆盖而非悄悄变化）。
+pub const CONTROL_BORDER_LEGACY: [u8; 4] = [0, 255, 0, 255];
 
 /// Control 的锚点布局状态（缺口契约之一）。
 ///
@@ -314,6 +322,15 @@ pub struct ControlState {
     /// `Some(min)` 时 `resolve` 只**扩张右下边**去满足它，不移动左上角；
     /// 无论取何值，`resolve` 都**不**把负宽高钳制到 0。
     pub min_size: Option<Vec2>,
+    /// 填充色（RGBA8 直 alpha；`a == 0` = 无填充四边形）。缺省透明
+    /// —— E-1 之前控件只画边框，缺省保持同像素。
+    pub fill: [u8; 4],
+    /// 边框色（RGBA8；`a == 0` = 无边框四边形）。缺省绿色哨兵
+    /// [`CONTROL_BORDER_LEGACY`] —— 与内建图集边框格的历史观感逐位
+    /// 一致（着色实现后图集格转中性白，绿色改经本字段进入）。
+    pub border: [u8; 4],
+    /// 边框线宽（像素；缺省 1 —— S12.0 设计语言：平直 1px 边框）。
+    pub border_w: f32,
 }
 
 impl ControlState {
@@ -328,6 +345,9 @@ impl ControlState {
         offset_right: 0.0,
         offset_bottom: 0.0,
         min_size: None,
+        fill: [0, 0, 0, 0],
+        border: CONTROL_BORDER_LEGACY,
+        border_w: 1.0,
     };
 
     /// 左上角固定尺寸（四锚点 0，偏移里写尺寸）。
@@ -342,6 +362,9 @@ impl ControlState {
             offset_right: offsets[2],
             offset_bottom: offsets[3],
             min_size: None,
+            fill: [0, 0, 0, 0],
+            border: CONTROL_BORDER_LEGACY,
+            border_w: 1.0,
         }
     }
 

@@ -27,11 +27,16 @@ pub enum NodeKindTag {
     Label,
     /// 脚本宿主（M5 兼容层预留：`registry_key` 是唯一挂载点）。
     Script,
+    /// 按钮（S12.1 组件库）：Control 之上加文本与主题槽位引用；
+    /// 提取层摊平为同句柄 rect + text。
+    Button,
+    /// 主题（S12.1 组件库）：八槽位语义色板（纯数据节点，不渲染）。
+    Theme,
 }
 
 impl NodeKindTag {
     /// 全部标签，按继承链自上而下排列（属性面板顺序直接用它）。
-    pub const ALL: [NodeKindTag; 7] = [
+    pub const ALL: [NodeKindTag; 9] = [
         NodeKindTag::Node,
         NodeKindTag::Node2D,
         NodeKindTag::Sprite2D,
@@ -39,6 +44,8 @@ impl NodeKindTag {
         NodeKindTag::Control,
         NodeKindTag::Label,
         NodeKindTag::Script,
+        NodeKindTag::Button,
+        NodeKindTag::Theme,
     ];
 
     /// 在 [`Self::ALL`] 里的下标。位集与表格化存储要用。
@@ -51,6 +58,8 @@ impl NodeKindTag {
             Self::Control => 4,
             Self::Label => 5,
             Self::Script => 6,
+            Self::Button => 7,
+            Self::Theme => 8,
         }
     }
 
@@ -67,6 +76,8 @@ impl NodeKindTag {
             Self::Control => NodeKind::Control,
             Self::Label => NodeKind::Label,
             Self::Script => NodeKind::Script,
+            Self::Button => NodeKind::Button,
+            Self::Theme => NodeKind::Theme,
         }
     }
 
@@ -80,6 +91,8 @@ impl NodeKindTag {
             Self::Control => "Control",
             Self::Label => "Label",
             Self::Script => "Script",
+            Self::Button => "Button",
+            Self::Theme => "Theme",
         }
     }
 
@@ -93,6 +106,8 @@ impl NodeKindTag {
             "Control" => Self::Control,
             "Label" => Self::Label,
             "Script" => Self::Script,
+            "Button" => Self::Button,
+            "Theme" => Self::Theme,
             _ => return None,
         })
     }
@@ -100,10 +115,10 @@ impl NodeKindTag {
     /// 直接基类。`None` 表示继承链顶端。
     pub fn base(self) -> Option<Self> {
         Some(match self {
-            Self::Node | Self::Script => return None,
+            Self::Node | Self::Script | Self::Theme => return None,
             Self::Node2D | Self::Control => Self::Node,
             Self::Sprite2D | Self::Camera2D => Self::Node2D,
-            Self::Label => Self::Control,
+            Self::Label | Self::Button => Self::Control,
         })
     }
 
@@ -172,6 +187,10 @@ pub enum NodeKind {
     /// M5 的 JS 扩展、可视化脚本、Scratch 广播监听器都从这里进入，
     /// 不允许在别处另开挂载点，否则兼容层会碎成多处特判。
     Script,
+    /// 按钮（S12.1）：专有字段全在属性表（text / 槽位引用），无专有数据。
+    Button,
+    /// 主题（S12.1）：八槽位色板全在属性表，纯数据节点。
+    Theme,
 }
 
 impl NodeKind {
@@ -185,6 +204,8 @@ impl NodeKind {
             Self::Control => NodeKindTag::Control,
             Self::Label => NodeKindTag::Label,
             Self::Script => NodeKindTag::Script,
+            Self::Button => NodeKindTag::Button,
+            Self::Theme => NodeKindTag::Theme,
         }
     }
 

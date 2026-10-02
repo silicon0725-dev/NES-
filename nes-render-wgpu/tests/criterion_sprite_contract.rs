@@ -25,7 +25,6 @@ const CLEAR_RGBA: [u8; 4] = [13, 13, 25, 255];
 const BODY_RGBA: [u8; 4] = [255, 0, 0, 255];
 const EYE_RGBA: [u8; 4] = [250, 250, 250, 255];
 const FILLER_RGBA: [u8; 4] = [255, 0, 255, 255];
-const CONTROL_RGBA: [u8; 4] = [0, 255, 0, 255];
 
 fn gpu_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -105,14 +104,15 @@ fn t_sprite_02_slot_to_cell_mapping() {
     let mut server = WgpuRenderServer::new();
     sprite_at(&mut server, 16, 0.0, 0.0); // 16 % 16 = 0 -> 图案格
     sprite_at(&mut server, 17, 20.0, 0.0); // 17 % 16 = 1 -> 控件边框格
-    sprite_at(&mut server, 2, 40.0, 0.0); // 2 -> 品红哨兵格
+    sprite_at(&mut server, 3, 40.0, 0.0); // 3 -> 品红哨兵格（格 2 = E-1 填充格）
     let outcome = flush(&mut consumer, &mut server);
     assert_eq!(outcome.stats.drawn, 3);
     let image = &outcome.image;
     assert_eq!(image.pixel(5, 5), Some(BODY_RGBA), "slot 16 -> 格 0（红）");
-    assert_eq!(image.pixel(20, 0), Some(CONTROL_RGBA), "slot 17 -> 格 1（边框角）");
+    // E-1（S12.1）：边框格转中性白（颜色经 tint 进入，本路径 tint=1）。
+    assert_eq!(image.pixel(20, 0), Some([255, 255, 255, 255]), "slot 17 -> 格 1（白边框角）");
     assert_eq!(image.pixel(28, 8), Some(CLEAR_RGBA), "格 1 内部透明");
-    assert_eq!(image.pixel(45, 8), Some(FILLER_RGBA), "slot 2 -> 品红哨兵可见");
+    assert_eq!(image.pixel(45, 8), Some(FILLER_RGBA), "slot 3 -> 品红哨兵可见");
 }
 
 /// T-Sprite-03：NIL 键 = 未绑定，不渲染（契约："未绑定不渲染"不是错误）。

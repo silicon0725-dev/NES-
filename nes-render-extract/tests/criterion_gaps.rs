@@ -22,12 +22,10 @@ use std::collections::BTreeMap;
 use nes_render_api::{
     Affine2, Flip, FrameInfo, ItemHandle, NullRenderServer, RenderAssetKey, RenderCommand, Vec2,
 };
-use nes_render_extract::{
-    affine2_of, camera_state_of, compose_flip, control_state_of, label_state_of,
+use nes_render_extract::{affine2_of, camera_state_of, compose_flip, control_state_of, label_state_of,
     ExtractStats, RenderExtractor, RenderKeySource, DEFAULT_LABEL_FONT_SIZE, PROP_CAMERA_ACTIVE,
     PROP_CAMERA_ZOOM, PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_FLIP_H,
-    PROP_FLIP_V, PROP_LABEL_FONT_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE, PROP_VISIBLE, PROP_Z_INDEX,
-};
+    PROP_FLIP_V, PROP_LABEL_FONT_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE, PROP_VISIBLE, PROP_Z_INDEX, themed_control, themed_label};
 use nes_scene::{NodeId, NodeKind, ResId, SceneTree, Transform2D, Value, Vec2 as SceneVec2};
 
 // ---------------------------------------------------------------- 公共替身与工具
@@ -418,7 +416,14 @@ fn criterion_gaps_label_state_pushed_with_full_layout_payload() {
     let sprite_handle = ex.handle_of(sprite).expect("精灵必须有渲染物");
 
     let state = srv.label_of(handle).expect("后端必须收到文本状态").clone();
-    assert_eq!(label_state_of(&tree, label).as_ref(), Some(&state), "推送内容 = 独立重算结果");
+    // S12.1：推送 = 独立重算**含主题应用**（无 Theme 节点 = 缺省深色）。
+    let expect = themed_label(
+        &tree,
+        label,
+        label_state_of(&tree, label).expect("非空文本"),
+        &nes_scene::ui::ThemeColors::DEFAULT_DARK,
+    );
+    assert_eq!(expect, state, "推送内容 = 独立重算结果");
     assert_eq!(&*state.text, "hello", "文本内容必须逐字抵达");
     assert_eq!(state.font_size, 24.0, "字号必须抵达（I64 属性按 f32 出口）");
     assert!(state.font.is_nil(), "未绑字体资源时必须是空键（用后端默认字体）");
@@ -536,7 +541,16 @@ fn criterion_gaps_control_layout_pushed_and_resolves_anchors() {
     assert!(!item.visible, "visible=false 必须照实推送（只跳过绘制，不销毁）");
 
     let layout = *srv.rect_of(handle).expect("后端必须收到控件布局");
-    assert_eq!(layout, control_state_of(&tree, control), "推送内容 = 独立重算结果");
+    assert_eq!(
+        layout,
+        themed_control(
+            &tree,
+            control,
+            control_state_of(&tree, control),
+            &nes_scene::ui::ThemeColors::DEFAULT_DARK
+        ),
+        "推送内容 = 独立重算结果"
+    );
     assert_eq!(layout.anchor_left, 0.5);
     assert_eq!(layout.anchor_bottom, 0.5, "四锚点按 Vec2 广播");
     assert_eq!(layout.offset_left, 10.0);

@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use crate::node::NodeKindTag;
 use crate::props::{PropError, PropStore};
 use crate::transform::Vec2;
+use crate::ui::THEME_SLOTS;
 use crate::value::{Value, ValueType};
 
 /// 编辑器提示。只影响属性面板怎么画控件，不影响语义与序列化。
@@ -327,7 +328,67 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 H::None,
                 "控件尺寸（像素）。",
             ),
+            PropDesc::new(
+                "fill_slot",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::None,
+                "填充槽位名（S12.1 主题；空 = 透明）。",
+            ),
+            PropDesc::new(
+                "border_slot",
+                ValueType::Str,
+                Value::Str("border".into()),
+                H::None,
+                "边框槽位名（S12.1 主题）。",
+            ),
         ],
+        NodeKindTag::Button => vec![
+            PropDesc::new(
+                "text",
+                ValueType::Str,
+                Value::Str(String::new()),
+                H::None,
+                "按钮文本。",
+            ),
+            PropDesc::new(
+                "fill_slot",
+                ValueType::Str,
+                Value::Str("panel".into()),
+                H::None,
+                "填充槽位名（主题解析；悬停/按下自动换档，S12.0 §3.2）。",
+            ),
+            PropDesc::new(
+                "border_slot",
+                ValueType::Str,
+                Value::Str("border".into()),
+                H::None,
+                "边框槽位名。",
+            ),
+            PropDesc::new(
+                "text_slot",
+                ValueType::Str,
+                Value::Str("text".into()),
+                H::None,
+                "文字槽位名。",
+            ),
+        ],
+        NodeKindTag::Theme => THEME_SLOTS
+            .iter()
+            .map(|(name, rgba)| {
+                let packed = ((rgba[0] as i64) << 24)
+                    | ((rgba[1] as i64) << 16)
+                    | ((rgba[2] as i64) << 8)
+                    | rgba[3] as i64;
+                PropDesc::new(
+                    name,
+                    ValueType::I64,
+                    Value::I64(packed),
+                    H::None,
+                    "语义槽位色（I64 0xRRGGBBAA 打包）。",
+                )
+            })
+            .collect(),
         NodeKindTag::Label => vec![
             PropDesc::new(
                 "text",
@@ -346,6 +407,13 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                     step: 1.0,
                 },
                 "字号（像素）。",
+            ),
+            PropDesc::new(
+                "color_slot",
+                ValueType::Str,
+                Value::Str("text".into()),
+                H::None,
+                "文字槽位名（S12.1 主题）。",
             ),
         ],
         NodeKindTag::Script => vec![

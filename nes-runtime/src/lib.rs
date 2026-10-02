@@ -57,8 +57,7 @@ use nes_render_wgpu::window::{drain_input, Window};
 use nes_scene::scene_io::{instantiate_doc_with_resources, parse_ron, write_ron_with_resources};
 use nes_scene::{
     AdoptReport, BindReport, NoObserver, PackOptions, ResId, ResourceTable, SceneDoc, SceneObserver,
-    SceneTree, ScriptVm, TableError, Value,
-};
+    SceneTree, ScriptVm, TableError, Value, UiVm};
 
 pub use headless::{run, HeadlessReport};
 
@@ -93,6 +92,9 @@ pub struct NesRuntime {
     input_collector: InputCollector,
     /// 输入快照共享槽（键探针读它 —— `mount_key_probe` 接线）。
     input_state: Rc<RefCell<InputSnapshot>>,
+    /// UI 交互状态机（S12.1）：每帧在 simulate 与 extract 之间更新，
+    /// 状态表经 `RenderExtractor::attach_ui` 共享给提取层做四态着色。
+    ui_vm: UiVm,
     /// 固定模拟步长（S8.1；`None` = 宿主纪律模式：帧 delta 原样一步）。
     fixed_step: Option<f32>,
     /// 蓄步器余量（fixed_step 模式下跨帧携带）。
@@ -181,7 +183,7 @@ impl NesRuntime {
         } else {
             None
         };
-        Ok(Self {
+        let mut rt = Self {
             tree: SceneTree::new("root"),
             table: ResourceTable::new(),
             registry: AssetRegistry::new(FsLoader::new(root)),
@@ -197,10 +199,13 @@ impl NesRuntime {
             scene_source: None,
             input_collector: InputCollector::new(),
             input_state: Rc::new(RefCell::new(InputSnapshot::default())),
+            ui_vm: UiVm::new(),
             fixed_step: None,
             step_remainder: 0.0,
             steps_dropped: 0,
-        })
+        };
+        rt.extractor.attach_ui(rt.ui_vm.states_rc());
+        Ok(rt)
     }
 
     /// 窗口模式推进一帧（无行为代码）：泵消息 -> tick -> 提取 -> 渲染到表面 -> 呈现。
@@ -234,6 +239,10 @@ impl NesRuntime {
             return Err(BackendError::ConfigMismatch("窗口模式缺少表面".to_string()));
         }
         let _steps = self.simulate(frame.delta, obs);
+        // S12.1：UI 状态机在 simulate 后、提取前更新（看到当帧终值；
+        // 提取层随即读状态表做四态着色）。
+        self.ui_vm
+            .update(&self.tree, (frame.viewport.x, frame.viewport.y));
         self.extractor.extract_into(
             &mut self.tree,
             &self.table,
@@ -597,9 +606,16 @@ impl NesRuntime {
     ///
     /// 装一次即可（共享槽：之后每帧 `collect_input` 自动刷新读数）。
     /// VM 不碰平台 —— 与文件读取器同一注入纪律（S6.33/S7.2）。
-    pub fn mount_input_view(&self, vm: &mut ScriptVm) {
+    pub fn mount_input_view(&mut self, vm: &mut ScriptVm) {
         let state = self.input_state.clone();
-        vm.set_input_view(Rc::new(SnapshotView(state)));
+        vm.set_input_view(Rc::new(SnapshotView(state.clone())));
+        // S12.1：同一快照源一并挂给 UI 状态机（悬停/按下命中）。
+        self.ui_vm.set_input_view(Rc::new(SnapshotView(state)));
+    }
+
+    /// UI 交互状态机（注册激活钩子等宿主接线用）。
+    pub fn ui_vm_mut(&mut self) -> &mut UiVm {
+        &mut self.ui_vm
     }
 
     /// 轮询文件变化（内容戳判定）。变化后调用 [`Self::upload_pending_textures`] 重传。
@@ -679,6 +695,10 @@ impl NesRuntime {
         obs: &mut dyn SceneObserver,
     ) -> Result<FrameOutcome, BackendError> {
         let _steps = self.simulate(frame.delta, obs);
+        // S12.1：UI 状态机在 simulate 后、提取前更新（看到当帧终值；
+        // 提取层随即读状态表做四态着色）。
+        self.ui_vm
+            .update(&self.tree, (frame.viewport.x, frame.viewport.y));
         self.extractor.extract_into(
             &mut self.tree,
             &self.table,

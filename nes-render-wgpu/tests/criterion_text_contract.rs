@@ -425,7 +425,8 @@ fn t_text_11_text_control_sprite_same_pipeline() {
 
     let outcome = render_one(&mut consumer, &mut server);
     // ① 计数：一次提交里 精灵 1 + 控件 1 + 字形 2。
-    assert_eq!(outcome.stats.drawn, 4);
+    // E-1（S12.1）：控件 = 4 条 1px 边框条 —— 1 精灵 + 4 + 2 字形 = 7。
+    assert_eq!(outcome.stats.drawn, 7);
     assert_eq!(outcome.stats.controls, 1);
     assert_eq!(outcome.stats.glyphs, 2);
     // ② 像素各自正确（控件边框贴矩形边缘、内部透明透出精灵；边框的**像素厚度**
@@ -434,7 +435,7 @@ fn t_text_11_text_control_sprite_same_pipeline() {
     assert_eq!(image.pixel(16, 16), Some(BODY_RGBA), "精灵（控件内部透出）");
     assert_eq!(image.pixel(19, 19), Some(EYE_RGBA), "精灵眼睛");
     assert_eq!(image.pixel(8, 8), Some(CONTROL_RGBA), "控件边框角点");
-    assert_eq!(image.pixel(9, 9), Some(CONTROL_RGBA), "边框内一格");
+    assert_eq!(image.pixel(9, 9), Some(CLEAR_RGBA), "边框恰 1px（E-1）");
     assert_eq!(image.pixel(11, 11), Some(CLEAR_RGBA), "深入内部透明");
     assert_eq!(image.pixel(72, 8), Some(char_color(b'O' as u32)), "文本 O");
     assert_eq!(image.pixel(88, 8), Some(char_color(b'K' as u32)), "文本 K");

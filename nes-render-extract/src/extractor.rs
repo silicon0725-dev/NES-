@@ -61,11 +61,14 @@
 //! 稳定的树上跑第 N 帧与第 1 帧的容量完全相同（有测试钉住 `ScratchStats`）。
 //! 本层额外的内存动作只有映射表的增删，且只在节点/资源发生变化的帧发生。
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use nes_render_api::{
     Affine2, Camera2DState, ControlState, Flip, FrameInfo, ItemHandle, LabelState, RenderAssetKey,
     RenderCommand, RenderServer, Vec2,
 };
-use nes_scene::{Affine, NodeId, NodeKindTag, ResId, SceneTree};
+use nes_scene::ui::{ThemeColors, UiStates, WidgetState};
+use nes_scene::{Affine, NodeId, NodeKindTag, ResId, SceneTree, Value};
 
 use crate::bridge::{affine2_of, flip_of, vec2_of};
 use crate::map::NodeItemMap;
@@ -165,6 +168,8 @@ pub struct RenderExtractor {
     stack: Vec<NodeId>,
     /// 提取帧序号（从 0 起，每帧 `+1`，只用于"本帧是否见过"的标记与诊断）。
     frame_seq: u64,
+    /// UI 瞬态状态共享面（S12.1 四态着色的只读来源；None = 无 UI）。
+    ui: Option<Rc<RefCell<UiStates>>>,
 }
 
 impl RenderExtractor {
@@ -194,6 +199,11 @@ impl RenderExtractor {
     /// 某节点当前挂的句柄。
     pub fn handle_of(&self, node: NodeId) -> Option<ItemHandle> {
         self.map.handle_of(node)
+    }
+
+    /// 挂接 UI 瞬态状态表（宿主装配时一次；每帧提取读取当前值做四态着色）。
+    pub fn attach_ui(&mut self, states: Rc<RefCell<UiStates>>) {
+        self.ui = Some(states);
     }
 
     /// **提取一帧**：遍历 → 属性级推送 → 清扫 → `submit_into`。
@@ -233,6 +243,17 @@ impl RenderExtractor {
         self.collect_order(tree);
         let order_nodes = std::mem::take(&mut self.order);
 
+        // 主题解析（S12.1）：前序序里**最后**一个 Theme 节点生效
+        //（与相机单槽 last-write-wins 同款仲裁，Q4 裁决）；无主题
+        // 节点用缺省深色兜底。槽位引用都对着这一份解析。
+        let mut theme = ThemeColors::DEFAULT_DARK;
+        for &node in order_nodes.iter() {
+            if tree.kind_tag(node) == Some(NodeKindTag::Theme) {
+                theme = ThemeColors::from_tree(tree, node);
+            }
+        }
+        let ui = self.ui.as_ref().map(|u| u.borrow());
+
         for &node in order_nodes.iter() {
             stats.nodes_visited += 1;
 
@@ -248,7 +269,7 @@ impl RenderExtractor {
             // 准入条件：Sprite2D 有非空纹理键 / Label 有非空文本 / Control 恒准入。
             // 非渲染节点（Node / Node2D 容器 / Camera2D / Script …，以及纹理
             // 未绑定的 Sprite2D、空文本的 Label）一律跳过。
-            let Some(admission) = admit(tree, node, source) else {
+            let Some(admission) = admit(tree, node, source, &theme, ui.as_deref()) else {
                 // 本帧不可渲染：若上一帧建过条目，必须销毁，否则留下悬垂渲染物。
                 // 判据是"本帧不再可渲染"而不是"资源消失了"：节点被改成非渲染
                 // 类型、纹理被解绑、文本被清空、资源被回收，走的是同一条路径。
@@ -313,6 +334,12 @@ impl RenderExtractor {
                 Admission::Sprite(_) => {}
                 Admission::Label(_, text) => server.set_text(handle, text),
                 Admission::Control(_, layout) => server.set_rect(handle, layout),
+                // 按钮摊平（S12.0 §2.1）：单节点单渲染物，rect + text
+                // 同句柄双推 —— 消费者侧先画矩形后画字形。
+                Admission::Button(_, layout, text) => {
+                    server.set_rect(handle, layout);
+                    server.set_text(handle, text);
+                }
             }
             stats.pushed += 1;
         }
@@ -376,6 +403,9 @@ enum Admission {
     Label(RenderAssetKey, LabelState),
     /// 控件：键由节点身份派生；载荷是解析好的布局状态。
     Control(RenderAssetKey, ControlState),
+    /// 按钮（S12.1）：同句柄摊平 rect + text —— 消费者已支持一物多
+    /// 实例（Label 一字形一四边形），按钮是其"矩形 + 文字"组合形态。
+    Button(RenderAssetKey, ControlState, LabelState),
 }
 
 impl Admission {
@@ -385,6 +415,7 @@ impl Admission {
             Admission::Sprite(key) => *key,
             Admission::Label(key, _) => *key,
             Admission::Control(key, _) => *key,
+            Admission::Button(key, _, _) => *key,
         }
     }
 }
@@ -422,19 +453,105 @@ fn node_key(node: NodeId) -> RenderAssetKey {
 /// - `Sprite2D`：纹理槽位解析出**非空**资源键（未绑定 / 资源被回收都不算）；
 /// - `Label`：文本**非空**（空文本没有可显示内容，不该占一个渲染物）；
 /// - `Control`：恒准入（控件是布局容器，本身就有尺寸，不依赖任何资源）。
-fn admit(tree: &SceneTree, node: NodeId, source: &dyn RenderKeySource) -> Option<Admission> {
+fn admit(
+    tree: &SceneTree,
+    node: NodeId,
+    source: &dyn RenderKeySource,
+    theme: &ThemeColors,
+    ui: Option<&UiStates>,
+) -> Option<Admission> {
     let tag = tree.kind_tag(node)?;
     if tag.is_a(NodeKindTag::Sprite2D) {
         let key = texture_res(tree, node).and_then(|id| source.renderable_key(id))?;
         Some(Admission::Sprite(key))
+    } else if tag.is_a(NodeKindTag::Button) {
+        // 按钮恒准入（空文本 = 纯图形按钮）；四态着色在此一次解析。
+        let (layout, text) = button_states_of(tree, node, theme, ui);
+        Some(Admission::Button(node_key(node), layout, text))
     } else if tag.is_a(NodeKindTag::Label) {
         let state = label_state_of(tree, node)?;
-        Some(Admission::Label(node_key(node), state))
+        Some(Admission::Label(
+            node_key(node),
+            themed_label(tree, node, state, theme),
+        ))
     } else if tag.is_a(NodeKindTag::Control) {
-        Some(Admission::Control(node_key(node), control_state_of(tree, node)))
+        Some(Admission::Control(
+            node_key(node),
+            themed_control(tree, node, control_state_of(tree, node), theme),
+        ))
     } else {
         None
     }
+}
+
+/// 槽位名属性读取（缺失/类型错 → `default`）。
+fn slot_prop(tree: &SceneTree, node: NodeId, name: &str, default: &str) -> String {
+    match tree.prop(node, name) {
+        Some(Value::Str(v)) => v.clone(),
+        _ => default.to_string(),
+    }
+}
+
+/// 控件着色（S12.1 E-1）：`fill_slot` / `border_slot` 属性按主题解析
+///（fill 缺省空名 = 透明 —— 与 E-1 之前同观感）。
+pub fn themed_control(
+    tree: &SceneTree,
+    node: NodeId,
+    mut layout: ControlState,
+    theme: &ThemeColors,
+) -> ControlState {
+    let fill_slot = slot_prop(tree, node, "fill_slot", "");
+    let border_slot = slot_prop(tree, node, "border_slot", "border");
+    if !fill_slot.is_empty() {
+        layout.fill = theme.slot(&fill_slot).unwrap_or(layout.fill);
+    }
+    layout.border = theme.slot(&border_slot).unwrap_or(layout.border);
+    layout
+}
+
+/// 文本着色：`color_slot` 属性按主题解析（缺省 text 槽）。
+pub fn themed_label(
+    tree: &SceneTree,
+    node: NodeId,
+    mut state: LabelState,
+    theme: &ThemeColors,
+) -> LabelState {
+    let color_slot = slot_prop(tree, node, "color_slot", "text");
+    state.color = theme.slot(&color_slot).unwrap_or(state.color);
+    state
+}
+
+/// 按钮摊平载荷：布局 + 文本一次备齐（含四态换档 —— 悬停边框 accent、
+/// 按下填充+边框 accent；S12.0 §3.2）。
+fn button_states_of(
+    tree: &SceneTree,
+    node: NodeId,
+    theme: &ThemeColors,
+    ui: Option<&UiStates>,
+) -> (ControlState, LabelState) {
+    let st: WidgetState = ui.and_then(|u| u.get(&node).copied()).unwrap_or_default();
+    let mut layout = control_state_of(tree, node);
+    // 按钮缺省自带面板填充（槽位可覆写）；hover/pressed 换档。
+    let fill_slot = slot_prop(tree, node, "fill_slot", "panel");
+    let border_slot = slot_prop(tree, node, "border_slot", "border");
+    layout.fill = theme.slot(&fill_slot).unwrap_or(layout.fill);
+    layout.border = theme.slot(&border_slot).unwrap_or(layout.border);
+    const ACCENT: usize = 6; // THEME_SLOTS 序：bg panel border text text_dim selected accent danger
+    if st.hover {
+        layout.border = theme.slots[ACCENT];
+    }
+    if st.pressed {
+        layout.fill = theme.slots[ACCENT];
+        layout.border = theme.slots[ACCENT];
+    }
+    let text = match tree.prop(node, "text") {
+        Some(Value::Str(v)) => v.clone(),
+        _ => String::new(),
+    };
+    let text_slot = slot_prop(tree, node, "text_slot", "text");
+    let mut label = LabelState::new(text, 16.0);
+    label.color = theme.slot(&text_slot).unwrap_or(label.color);
+    (layout, label)
 }
 
 /// 从 `Camera2D` 节点解析契约层的相机状态（[`RenderServer::set_camera`] 的实参）。

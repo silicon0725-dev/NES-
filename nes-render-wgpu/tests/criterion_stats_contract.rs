@@ -105,7 +105,7 @@ fn t_stats_02_ignored_accounting() {
 /// 账面：
 /// - 命令 = 7 创建（含即建即毁）+ 1 销毁 + 1 相机 + 属性 4x6=24 + SetRect + SetText + Submit = 36；
 /// - updates = 24 + 1 + 1 = 26；
-/// - drawn = 精灵 2 + 控件 1 + 字形 2 = 5；
+/// - drawn = 精灵 2 + 控件 4（E-1 四条 1px 边框条）+ 字形 2 = 8；
 /// - skipped = 不可见 1 + NIL 键无状态 1 = 2。
 #[test]
 fn t_stats_03_mixed_frame_full_reconciliation() {
@@ -165,7 +165,7 @@ fn t_stats_03_mixed_frame_full_reconciliation() {
     assert_eq!(s.destroys, 1);
     assert_eq!(s.updates, 26, "属性 24 + SetRect 1 + SetText 1");
     assert_eq!(s.ignored, 0);
-    assert_eq!(s.drawn, 5, "精灵 2 + 控件 1 + 字形 2");
+    assert_eq!(s.drawn, 8, "精灵 2 + 控件边框 4（E-1）+ 字形 2");
     assert_eq!(s.controls, 1);
     assert_eq!(s.glyphs, 2);
     assert_eq!(s.from_registry, 1);

@@ -87,11 +87,12 @@ pub const CLEAR_COLOR: ffi::ClearColor = ffi::ClearColor {
 /// 绑定得比声明小，驱动会在创建绑定组时判定布局不兼容。
 const VIEW_UNIFORM_BYTES: u64 = 8 * core::mem::size_of::<f32>() as u64;
 
-/// 单个精灵实例的字节跨度（12 个 `f32`：2x3 世界矩阵 + UV 矩形 + 采样来源）。
+/// 单个精灵实例的字节跨度（16 个 `f32`：2x3 世界矩阵 + UV 矩形 + 采样
+/// 来源 + 着色 RGBA —— E-1 颜色通道，S12.1）。
 ///
 /// 与 `gpu::Sizes` 系（图集侧声明的视图缓冲尺寸）同一纪律：布局声明与
 /// CPU 打包必须同步，扩字段时两处一起改。
-const INSTANCE_STRIDE: u64 = 12 * core::mem::size_of::<f32>() as u64;
+const INSTANCE_STRIDE: u64 = 16 * core::mem::size_of::<f32>() as u64;
 
 /// 初始实例容量（64 个精灵 = 2 KiB；不足时按需倍增重建缓冲）。
 const INITIAL_INSTANCE_CAPACITY: u32 = 64;
@@ -114,24 +115,28 @@ struct ViewParams {
     col2: vec2<f32>,
     viewport: vec2<f32>,
 };
-// 每精灵实例数据（实例步进顶点缓冲，12 个 f32 = 48 字节）：
+// 每精灵实例数据（实例步进顶点缓冲，16 个 f32 = 64 字节）：
 //   loc0..2 = 世界矩阵三列（已含 flip 的子局部后乘）；
 //   loc3    = UV 矩形 (u0, v0, us, vs)；
 //   loc4    = 采样来源 (瓦片号, 类型)：类型 0 = 内建图集、1 = 注册表瓦片
 //             （注册表是单张平铺大纹理，位置全在 UV 矩形里；瓦片号仅作
-//             实例侧留档，着色器当前不读它）。
+//             实例侧留档，着色器当前不读它）；
+//   loc5    = 着色 RGBA（直 alpha，归一化 0..1；E-1 —— 采样色 x tint，
+//             中性 [1,1,1,1] 与 E-1 之前逐位相同）。
 struct SpriteData {
     @location(0) col0: vec2<f32>,
     @location(1) col1: vec2<f32>,
     @location(2) col2: vec2<f32>,
     @location(3) uv_rect: vec4<f32>,
     @location(4) source: vec2<f32>,
+    @location(5) tint: vec4<f32>,
 };
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) corner: vec2<f32>,
     @location(1) uv_rect: vec4<f32>,
     @location(2) source: vec2<f32>,
+    @location(3) tint: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> VIEW: ViewParams;
@@ -166,6 +171,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, data: SpriteData) -> VSOut {
     out.corner = corner;
     out.uv_rect = data.uv_rect;
     out.source = data.source;
+    out.tint = data.tint;
     return out;
 }
 
@@ -186,7 +192,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     if (color.a < 0.5) {
         discard;
     }
-    return color;
+    // E-1 着色：采样色 x tint（中性 tint = 恒等）。图集图案格是中性白，
+    // 颜色一律经 tint 进入 —— 契约层 ControlState/LabelState 的颜色
+    // 字段在 draw_into 侧折算成本属性。
+    return color * in.tint;
 }
 "#;
 
@@ -411,7 +420,7 @@ impl FrameOutcome {
 
 // ------------------------------------------------------------ SpritePipeline
 
-/// 一条精灵绘制记录（实例缓冲的单条数据，12 个 `f32`）。
+/// 一条精灵绘制记录（实例缓冲的单条数据，16 个 `f32`）。
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct SpriteInstance {
     /// 渲染物句柄（不进 GPU，仅供帧对账与诊断）。
@@ -424,6 +433,21 @@ pub struct SpriteInstance {
     /// 采样来源 `[瓦片号, 类型]`：类型 0 = 内建图集、1 = 注册表瓦片
     ///（瓦片号仅供帧对账留档，注册表位置信息已并入 UV 矩形）。
     pub source: [f32; 2],
+    /// 着色 RGBA（直 alpha 归一化 0..1；E-1 颜色通道，S12.1）。
+    /// 缺省 `[1,1,1,1]` 中性 —— 与 E-1 之前逐位相同。
+    pub tint: [f32; 4],
+}
+
+impl SpriteInstance {
+    /// RGBA8（直 alpha）-> 实例着色（归一化）。
+    pub fn tint_of(rgba: [u8; 4]) -> [f32; 4] {
+        [
+            rgba[0] as f32 / 255.0,
+            rgba[1] as f32 / 255.0,
+            rgba[2] as f32 / 255.0,
+            rgba[3] as f32 / 255.0,
+        ]
+    }
 }
 
 /// 资源键 → 图集采样格的 UV 矩形。
@@ -564,6 +588,12 @@ impl SpritePipeline {
                 format: ffi::WGPU_VERTEX_FORMAT_FLOAT32X2,
                 offset: 40,
                 shader_location: 4,
+            },
+            ffi::VertexAttribute {
+                next_in_chain: ptr::null_mut(),
+                format: ffi::WGPU_VERTEX_FORMAT_FLOAT32X4,
+                offset: 48,
+                shader_location: 5,
             },
         ];
         let buffers = [ffi::VertexBufferLayout {
@@ -711,6 +741,7 @@ impl SpritePipeline {
                 .iter()
                 .chain(sprite.uv_rect.iter())
                 .chain(sprite.source.iter())
+                .chain(sprite.tint.iter())
             {
                 self.staging.extend_from_slice(&f.to_ne_bytes());
             }
@@ -1239,28 +1270,64 @@ impl CommandConsumer {
         // 视图退化（不可逆，理论上线性部分行列式为 zoom²，正常不会发生）时跳过控件。
         let inv_view = view.inverse();
         let cell_uv = gpu::CELL_PX as f32 / gpu::ATLAS_PX as f32;
-        let control_uv = [
-            cell_uv * (gpu::CONTROL_CELL % gpu::ATLAS_CELLS) as f32,
-            cell_uv * (gpu::CONTROL_CELL / gpu::ATLAS_CELLS) as f32,
+        let mut sprites: Vec<SpriteInstance> = Vec::with_capacity(draw_list.len());
+        // E-1 颜色通道（S12.1）：填充/边框条按 ControlState 的颜色发实例
+        //（填充格 + 四条 border_w 宽的边条 —— 像素精确的平直边框，不再
+        // 随矩形尺寸缩放图案边）。按钮（同句柄 rect+text）的文字锚定
+        // 矩形左上 + 4px 内衬；纯 Label 仍锚定自身世界变换（既有行为）。
+        let fill_uv = [
+            cell_uv * (gpu::FILL_CELL % gpu::ATLAS_CELLS) as f32,
+            cell_uv * (gpu::FILL_CELL / gpu::ATLAS_CELLS) as f32,
             cell_uv,
             cell_uv,
         ];
-        let mut sprites: Vec<SpriteInstance> = Vec::with_capacity(draw_list.len());
         for item in draw_list {
             if let (Some(rect_state), Some(inv)) = (self.rects.get(&item.handle), inv_view) {
                 let rect = rect_state.resolve(viewport);
-                let quad = Affine2::translation(rect.x, rect.y).mul(&Affine2::scale(
-                    rect.w / gpu::CELL_PX as f32,
-                    rect.h / gpu::CELL_PX as f32,
-                ));
-                sprites.push(SpriteInstance {
-                    handle: item.handle,
-                    world: inv.mul(&quad).to_array(),
-                    uv_rect: control_uv,
-                    source: [0.0, 0.0],
-                });
+                // 填充（alpha == 0 不发 —— 缺省透明，与 E-1 之前同像素）。
+                if rect_state.fill[3] > 0 {
+                    let quad = Affine2::translation(rect.x, rect.y).mul(&Affine2::scale(
+                        rect.w / gpu::CELL_PX as f32,
+                        rect.h / gpu::CELL_PX as f32,
+                    ));
+                    sprites.push(SpriteInstance {
+                        handle: item.handle,
+                        world: inv.mul(&quad).to_array(),
+                        uv_rect: fill_uv,
+                        source: [0.0, 0.0],
+                        tint: SpriteInstance::tint_of(rect_state.fill),
+                    });
+                }
+                // 边框：四条 border_w 宽的填充条（上/下/左/右）。
+                if rect_state.border[3] > 0 {
+                    let t = rect_state
+                        .border_w
+                        .clamp(0.0, (rect.h * 0.5).max(0.0))
+                        .clamp(0.0, (rect.w * 0.5).max(0.0));
+                    let border_tint = SpriteInstance::tint_of(rect_state.border);
+                    let strips = [
+                        (rect.x, rect.y, rect.w, t),
+                        (rect.x, rect.y + rect.h - t, rect.w, t),
+                        (rect.x, rect.y + t, t, rect.h - 2.0 * t),
+                        (rect.x + rect.w - t, rect.y + t, t, rect.h - 2.0 * t),
+                    ];
+                    for (sx, sy, sw, sh) in strips {
+                        let quad = Affine2::translation(sx, sy).mul(&Affine2::scale(
+                            sw / gpu::CELL_PX as f32,
+                            sh / gpu::CELL_PX as f32,
+                        ));
+                        sprites.push(SpriteInstance {
+                            handle: item.handle,
+                            world: inv.mul(&quad).to_array(),
+                            uv_rect: fill_uv,
+                            source: [0.0, 0.0],
+                            tint: border_tint,
+                        });
+                    }
+                }
                 stats.controls += 1;
-            } else if let Some(label) = self.texts.get(&item.handle) {
+            }
+            if let Some(label) = self.texts.get(&item.handle) {
                 // 文本（S4.4/S4.5）：世界变换 = 笔起点（首行首字格左上角），每字形
                 // 一个四边形，采样字形表对应字格。字距恒定（等宽口径）、
                 // 行高 = 基准 + line_spacing；空格与表外字符只推进笔位不画。
@@ -1276,7 +1343,17 @@ impl CommandConsumer {
                 };
                 if let Some((font_key, font)) = resolved_font {
                     if let Some((tile, sheet_uv)) = self.registry.sample_info(font_key) {
-                        let world = item.world_transform();
+                        // 笔基点：纯 Label = 自身世界变换（既有行为）；
+                        // 按钮（同句柄带 rect）= 矩形左上 + 4px 内衬
+                        //（S12.0 设计语言 4px 栅格）。
+                        let world = match (self.rects.get(&item.handle), inv_view) {
+                            (Some(rect_state), Some(inv)) => {
+                                let rect = rect_state.resolve(viewport);
+                                inv.mul(&Affine2::translation(rect.x + 4.0, rect.y + 4.0))
+                            }
+                            _ => item.world_transform(),
+                        };
+                        let text_tint = SpriteInstance::tint_of(label.color);
                         // 字格 UV 按**纹理实际尺寸**折算（S8.2 实证修复）：
                         // 按列数/行数除只在"紧排表"（tex == cols*cell ×
                         // rows*cell）成立 —— 真实烘焙图集 256x256 只占顶部
@@ -1317,6 +1394,7 @@ impl CommandConsumer {
                                         cell_vs,
                                     ],
                                     source: [tile as f32, 1.0],
+                                    tint: text_tint,
                                 });
                                 stats.glyphs += 1;
                             }
@@ -1330,6 +1408,7 @@ impl CommandConsumer {
                     world: item.world_transform().to_array(),
                     uv_rect,
                     source: [layer as f32, 1.0],
+                    tint: [1.0, 1.0, 1.0, 1.0],
                 });
                 stats.from_registry += 1;
             } else if !self.rects.contains_key(&item.handle) {
@@ -1338,6 +1417,7 @@ impl CommandConsumer {
                     world: item.world_transform().to_array(),
                     uv_rect: cell_uv_rect(item.key),
                     source: [0.0, 0.0],
+                    tint: [1.0, 1.0, 1.0, 1.0],
                 });
             }
         }

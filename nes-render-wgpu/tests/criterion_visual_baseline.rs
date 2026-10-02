@@ -31,7 +31,7 @@ use nes_render_wgpu::{
 };
 
 /// 本机（Intel Iris Xe / Vulkan / wgpu-native v29.0.1.1）录制的基线 FNV-1a 64。
-const BASELINE_FNV1A: u64 = 0xf6cf_1788_9417_60b7;
+const BASELINE_FNV1A: u64 = 0x68d1_4f07_989f_cbaa;
 
 fn gpu_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
