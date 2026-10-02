@@ -22,7 +22,7 @@ S12-3 全部落地：**E-2 裁剪契约反转裁决**——`SetClip { rect }` �
 
 | 层 | 变更 |
 |---|---|
-| render-api | `RenderCommand::SetClip { handle, rect: Option<Rect> }`：`Some(r)` 的 `r` 是**已解析的视口空间**矩形（后端按目标尺寸折算成帧缓冲像素 scissor，半开区间）；`None` = 清除；条目销毁（`DestroyItem`）裁剪随条目消亡；命令**恒在对应条目 `SetRect` 之后**（D1 推送序）。`RenderServer` trait 增 `set_clip`；`NullRenderServer` 同构簿记（帧本地裁剪表）。未知/空句柄按契约 I1 静默忽略 |
+| render-api | `RenderCommand::SetClip { handle, rect: Option<Rect> }`：`Some(r)` 的 `r` 是**已解析的视口空间**矩形（后端按目标尺寸折算成帧缓冲像素 scissor，半开区间）；`None` = 清除；条目销毁（`DestroyItem`）裁剪随条目消亡；命令**恒在对应条目 `SetRect` 之后**（D1 推送序）。`RenderServer` trait 增 `set_clip`；`NullRenderServer` 同构簿记（跨帧属性表，清除/销毁即除名——真正帧本地的表在 wgpu 消费器）。未知/空句柄按契约 I1 静默忽略 |
 | extract | 嵌套裁剪**由提取层沿祖先链求交集**后以单条 `SetClip` 下发（本层不做栈语义）；推送见 §4 自动裁剪 |
 | wgpu | `SpriteInstance` 增 `loc6 = [x,y,w,h]` 视口空间裁剪矩形（着色器**不读**，实例布局自洽）；缺省哨兵 `NO_CLIP = [0,0,0,0]` = 无裁剪。绘制按**连续相同 clip 值分段**，每段先显式 `SetScissorRect` 再 `draw`（哨兵段也显式设回全目标——状态不跨段继承，无"上段泄漏到下段"）。`clip_to_scissor`：视口空间按 `target_size / viewport` 比例折算、`floor` 取整、与目标边界求交；**交集为空返回 `None`，该段整段跳过**。FFI 增 `wgpuRenderPassEncoderSetScissorRect`（符号存在性已对本机 wgpu_native.dll 导出表实测） |
 

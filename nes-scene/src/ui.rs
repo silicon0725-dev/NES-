@@ -780,8 +780,16 @@ pub fn scroll_max_of(tree: &SceneTree, ui: &UiStates, node: NodeId, viewport: (f
                     || t == NodeKindTag::Tabs
                 {
                     // 嵌套滚动容器：自身矩形计入，其子树被裁剪不再下探。
-                    let r = widget_rect(tree, n, viewport);
-                    max_bottom = max_bottom.max(r.1 + r.3);
+                    // 隐藏容器不计（S12-3 评审 [low]：与下方非容器后代
+                    // 的 visible 口径一致，否则隐藏容器虚增 scroll_max）。
+                    let visible = tree
+                        .prop(n, "visible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if visible {
+                        let r = widget_rect(tree, n, viewport);
+                        max_bottom = max_bottom.max(r.1 + r.3);
+                    }
                     continue;
                 }
                 let visible = tree

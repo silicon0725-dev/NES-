@@ -448,8 +448,16 @@ impl RenderExtractor {
                 }
             }
             // 裁剪恒在对应条目的 SetRect 之后推送（D1 推送序）。
+            // Some→None 迁移补推一次清除（S12-3 评审 [medium] 修复）：
+            // 后端裁剪簿记跨帧持久，节点经 undo/redo 移出 ScrollView 后
+            // 本帧不再命中任何裁剪来源，若不显式清除，陈旧交集裁剪会
+            // 永久残留 —— "全量快照"口径的生产者侧义务。
+            let wants_clip = clip.is_some();
             if let Some(clip) = clip {
                 server.set_clip(handle, Some(clip));
+            }
+            if self.map.take_clipped(node, wants_clip) == Some(true) && !wants_clip {
+                server.set_clip(handle, None);
             }
             stats.pushed += 1;
         }

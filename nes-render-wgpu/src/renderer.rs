@@ -1671,8 +1671,11 @@ impl CommandConsumer {
                                         if top >= rect.y + rect.h {
                                             break; // 行超矩形底：其后各行更靠下。
                                         }
-                                        if top + font.cell.1 <= rect.y {
-                                            continue; // 整行已在矩形顶之上。
+                                        // 判据用 row_h 而非字形格高（S12-3 评审
+                                        // [low]：选中条带底缘 top+row_h-1 比格高
+                                        // 低 1px，临界滚动位会漏画 1px 条带）。
+                                        if top + rows.row_h <= rect.y {
+                                            continue; // 整行（含条带）已在矩形顶之上。
                                         }
                                         let selected = rows.selected == Some(i as u16);
                                         // 选中条：列表矩形内衬边框 1px

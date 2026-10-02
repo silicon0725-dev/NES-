@@ -310,3 +310,41 @@ fn t_scl_06_tabs_flatten_horizontal() {
         Rect::new(10.0, 20.0, 300.0, 24.0),
     );
 }
+
+/// T-SCL-07（S12-3 评审 [medium] 修复）：Some→None 迁移帧补推清除 ——
+/// 控件先在 ScrollView 内（得交集裁剪），随后移出（repaint 到根），
+/// 下一帧必须显式 set_clip(None)，跨帧簿记的陈旧裁剪不得残留。
+#[test]
+fn t_scl_07_clip_cleared_on_structural_exit() {
+    let mut t = SceneTree::new("root");
+    let sv = t.add_node(t.root(), "sv", NodeKind::ScrollView);
+    t.set_prop(sv, "offset", Value::Vec2(SVec2::new(0.0, 0.0))).unwrap();
+    t.set_prop(sv, "size", Value::Vec2(SVec2::new(200.0, 100.0))).unwrap();
+    // panel 故意超出容器（10+300 > 200），交集才真正收窄。
+    let panel = t.add_node(sv, "panel", NodeKind::Control);
+    t.set_prop(panel, "offset", Value::Vec2(SVec2::new(10.0, 10.0))).unwrap();
+    t.set_prop(panel, "size", Value::Vec2(SVec2::new(300.0, 200.0))).unwrap();
+    t.apply_pending();
+
+    // 帧 1：panel 在 ScrollView 内 → clip = 自身 ∩ 容器（Some，收窄）。
+    let (srv, _ex, _out) = extract(&mut t, None);
+    let h = _ex.handle_of(panel).expect("panel 渲染物");
+    let clip1 = srv.clip_of(h).copied().expect("帧 1 必有交集裁剪");
+    assert!(
+        approx(clip1.w, 190.0) && approx(clip1.h, 90.0),
+        "交集应被容器收窄到 190x90：{clip1:?}"
+    );
+
+    // 结构变迁：panel 移出 ScrollView（挂到根、位置不变）。
+    t.reparent(panel, t.root(), None);
+    t.apply_pending();
+
+    // 帧 2：裸 Control 不再命中任何裁剪来源 → 必须补推 None 清除。
+    let (srv2, _ex2, _out2) = extract(&mut t, None);
+    let h2 = _ex2.handle_of(panel).expect("panel 渲染物（复用句柄）");
+    assert_eq!(
+        srv2.clip_of(h2).copied(),
+        None,
+        "Some→None 迁移帧必须清除陈旧裁剪（评审 [medium]）"
+    );
+}

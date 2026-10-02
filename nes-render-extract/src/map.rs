@@ -33,6 +33,10 @@ pub struct ItemSlot {
     pub created_frame: u64,
     /// 最近一次被遍历到的提取帧序号（清扫依据；`0` 表示从未被遍历）。
     seen_frame: u64,
+    /// 上一提取帧是否对该条目推送过 `SetClip(Some)`（S12-3 评审修复：
+    /// Some→None 迁移帧据此补推一次 `set_clip(None)` —— 跨帧簿记的
+    /// 陈旧裁剪必须显式清除，否则 undo 移出 ScrollView 后旧裁剪残留）。
+    pub clipped: bool,
 }
 
 impl ItemSlot {
@@ -109,6 +113,7 @@ impl NodeItemMap {
                 key,
                 created_frame: frame,
                 seen_frame: frame,
+                clipped: false,
             },
         );
     }
@@ -116,6 +121,15 @@ impl NodeItemMap {
     /// 摘掉条目并返回它（节点删除 / 本帧不再可渲染）。
     pub(crate) fn remove(&mut self, node: NodeId) -> Option<ItemSlot> {
         self.slots.remove(&node)
+    }
+
+    /// 读写条目的 clip 推送标记（Some→None 迁移检测用；`None` = 无条目）。
+    pub fn take_clipped(&mut self, node: NodeId, now: bool) -> Option<bool> {
+        self.slots.get_mut(&node).map(|slot| {
+            let was = slot.clipped;
+            slot.clipped = now;
+            was
+        })
     }
 
     /// 标记"本帧见过"（清扫的反面）。
