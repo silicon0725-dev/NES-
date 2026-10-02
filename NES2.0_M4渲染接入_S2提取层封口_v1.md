@@ -165,3 +165,25 @@ AIGC:
 3. **`order` 语义保持现状**：在 Q-A 裁决前，`set_z` 的 `order` 继续取场景层子序键，不得在本层私自换序。
 4. **日志与守卫须随阶段扩展**：新增推送段后需同步扩展 G6/G7 覆盖面与 `criterion_extract_*` 用例，并重跑三项验证落盘。
 *（内容由AI生成，仅供参考）*
+
+---
+
+## 记注（2026-10-02，S11-2 实测补充）：相机缩放语义辨析
+
+哨塔防线窗口宿主 2x 显示时实测踩到：**相机投影只吃 `zoom` 属性**——
+`camera_state_of` 里 `zoom = prop("zoom")`（默认 1.0，schema 钳位
+0..16）；相机节点**世界变换的 scale 分量不参与投影**（transform 只取
+平移作 center、旋转作 undo_rotation）。
+
+投影公式（`Camera2DState::view_matrix`，criterion_contract 已冻结）：
+
+```text
+屏幕 = (世界 - center) * zoom + 视口 / 2      （再经 NDC 翻转 Y）
+```
+
+后果：想放大画面改相机**变换 scale 无效**（画面反而因视口变大被推向
+右下象限）；正确做法是设 `zoom` 属性。S12 若有缩放/取景需求（编辑器
+视口缩放即一例），一律走 zoom 属性；变换 scale 语义留给节点层级构图。
+
+（出处：commit e64d9fe 修复实录；契约测试
+criterion_contract_camera_center_always_at_viewport_center。）
