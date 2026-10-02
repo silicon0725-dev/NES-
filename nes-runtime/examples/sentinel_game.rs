@@ -12,6 +12,10 @@
 //! 便携分发形态：exe 同目录 `assets/` 优先（双击即玩），否则回落仓库
 //! 开发目录。纹理缺失自动生成（纯色 16x16）。
 //!
+//! **显示 2x**：场景世界是 384x216（引擎基准坐标系），窗口开 768x432、
+//! 相机局部 scale 覆写为 2 —— 同一世界区域放大一倍渲染；鼠标坐标经
+//! [`ScaledView`] 除以 2 映射回世界系（场景脚本零改动、语义不变）。
+//!
 //! 确定性验证走 headless CLI（与本宿主同一场景文件）：
 //!
 //! ```text
@@ -19,19 +23,52 @@
 //!     --frames 900 --trace examples/assets/tower_defense_trace.txt
 //! ```
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
+use nes_render_api::input::{InputSnapshot, MouseButton};
 use nes_render_api::{FrameInfo, Vec2};
 use nes_render_wgpu::bmp;
 use nes_render_wgpu::FontParams;
 use nes_runtime::{write_bmp_rgba, NesRuntime};
-use nes_scene::ScriptVm;
+use nes_scene::{InputView, ScriptVm, Transform2D};
 
 /// 单色 16x16 纹理。
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
 }
+
+/// 缩放输入视图（显示 2x）：鼠标坐标除以缩放比映回世界系；键/按钮/
+/// 文本原样透传。快照由宿主每帧从 `collect_input()` 灌入。
+struct ScaledView(Rc<RefCell<InputSnapshot>>, f32);
+
+impl InputView for ScaledView {
+    fn key(&self, name: &str) -> bool {
+        self.0.borrow().is_down(name)
+    }
+    fn mouse(&self) -> (f32, f32) {
+        let s = self.0.borrow();
+        (s.mouse.x / self.1, s.mouse.y / self.1)
+    }
+    fn mouse_delta(&self) -> (f32, f32) {
+        let s = self.0.borrow();
+        (s.mouse_delta.x / self.1, s.mouse_delta.y / self.1)
+    }
+    fn button(&self, name: &str) -> bool {
+        let s = self.0.borrow();
+        MouseButton::from_name(name)
+            .map(|b| s.buttons_held[b.index()])
+            .unwrap_or(false)
+    }
+    fn text_len(&self) -> usize {
+        self.0.borrow().text.len()
+    }
+}
+
+/// 显示缩放（世界 384x216 -> 窗口 768x432）。
+const VIEW_SCALE: f32 = 2.0;
 
 fn main() {
     // 资产根：exe 同目录 assets/ 优先（便携包），否则仓库开发目录。
@@ -63,8 +100,8 @@ fn main() {
     let mut rt = NesRuntime::open_windowed_with_root(
         &root,
         "NES 2.0 - Sentinel Line (S11-2)",
-        384,
-        216,
+        (384.0 * VIEW_SCALE) as u32,
+        (216.0 * VIEW_SCALE) as u32,
     )
     .expect("窗口装配");
     for t in ["enemy", "bullet"] {
@@ -121,6 +158,24 @@ fn main() {
     }
 
     rt.load_scene("tower_defense.ron").expect("加载场景");
+    // 显示 2x：相机局部 scale 覆写（宿主层展示选择 —— 场景文件与
+    // headless 语义不动）。cam(192,108) 是世界中心 -> 屏幕中心，
+    // scale 2 后世界 (0,0) 仍落屏幕 (0,0)，整场 384x216 放大一倍。
+    {
+        let cam = rt
+            .tree_mut()
+            .find_by_name("cam")
+            .expect("相机节点 cam");
+        rt.tree_mut().set_local(
+            cam,
+            Transform2D {
+                pos: nes_scene::Vec2::new(192.0, 108.0),
+                rot: 0.0,
+                scale: nes_scene::Vec2::new(VIEW_SCALE, VIEW_SCALE),
+                skew: 0.0,
+            },
+        );
+    }
     let mut vm = ScriptVm::new();
     {
         let table = rt.resources_mut().clone();
@@ -129,7 +184,9 @@ fn main() {
         });
         assert!(issues.is_empty(), "脚本装载：{issues:?}");
     }
-    rt.mount_input_view(&mut vm);
+    // 缩放输入视图（替 mount_input_view）：鼠标窗口坐标 / 2 -> 世界系。
+    let shared_snap = Rc::new(RefCell::new(InputSnapshot::default()));
+    vm.set_input_view(Rc::new(ScaledView(shared_snap.clone(), VIEW_SCALE)));
 
     // NES_GAME_FRAMES=N 自动退出（打包冒烟用）；缺省无限玩到关窗。
     let total: u64 = std::env::var("NES_GAME_FRAMES")
@@ -140,13 +197,14 @@ fn main() {
     const TRANSIENT_LIMIT: u64 = 120;
     for index in 0..total {
         let snap = rt.collect_input();
+        *shared_snap.borrow_mut() = snap.clone();
         let _ = rt.emit_input_signals(&snap);
         // tick 由引擎内建发射（S8.1）—— 宿主不再手发。
         let frame = FrameInfo::new(
             index,
             1.0 / 60.0,
             index as f64 / 60.0,
-            Vec2::new(384.0, 216.0),
+            Vec2::new(384.0 * VIEW_SCALE, 216.0 * VIEW_SCALE),
         );
         match rt.frame_windowed_with(&frame, &mut vm) {
             Ok(Some(stats)) => {

@@ -124,7 +124,7 @@ fn t_tds_01_initial_state() {
     assert_eq!(game_local(&vm, &mut rt, "kills"), 0, "initial kills");
     assert_eq!(
         hud_text(&mut rt),
-        "GOLD:20 LIVES:10 WAVE:1 KILLS:0",
+        "G:20 L:10 W:1 K:0",
         "HUD mirrors game locals exactly"
     );
     assert_eq!(visible_towers(&mut rt), 0, "no towers before first click");
@@ -142,7 +142,7 @@ fn t_tds_02_first_tower_costs_exactly_ten() {
     assert_eq!(game_local(&vm, &mut rt, "wave"), 1, "wave 1 in progress");
     assert_eq!(
         hud_text(&mut rt),
-        "GOLD:10 LIVES:10 WAVE:1 KILLS:0",
+        "G:10 L:10 W:1 K:0",
         "HUD mirrors game locals"
     );
     assert_eq!(visible_towers(&mut rt), 1, "exactly one tower placed");
@@ -184,7 +184,7 @@ fn t_tds_03_full_run_semantic_invariants() {
     assert_eq!(visible_towers(&mut rt), 2, "exactly two towers placed");
     assert_eq!(
         hud_text(&mut rt),
-        format!("GOLD:{gold} LIVES:{lives} WAVE:{wave} KILLS:{kills}"),
+        format!("G:{gold} L:{lives} W:{wave} K:{kills}"),
         "HUD mirrors game locals"
     );
     // HUD 恒不显示失败态（存活条件）。

@@ -95,7 +95,7 @@ fn t_td_01_buy_deducts_gold_once() {
     assert_eq!(game_local(&vm, &mut rt, "wave"), 1, "第一波进行中");
     assert_eq!(
         hud_text(&mut rt),
-        "GOLD:10 LIVES:10 WAVE:1 KILLS:0",
+        "G:10 L:10 W:1 K:0",
         "HUD 点读 game.* 与属主局部一致"
     );
 }
