@@ -186,6 +186,19 @@ Persistent UID ──┬── Runtime Handle（arena resolve）
 都不属于 S9 完成条件。扩展纪律：**UI 是投影，Editor Core 是操作层，
 Transaction 是历史，SceneTree 是结构，uid 是身份**。
 
+## 5.7 S10 收官补记（S10-0..S10-2 评审后）
+
+S10 正式关闭：**Cross-Project Calibration**——Seed & Harvest
+（非战斗完整游戏）校准 API 摩擦五项 → hit + timer 两项 ★★★ API
+落地 → 编辑器五项（点击/多选/框选/Gizmo/保存）全部建在 S9 冻结
+语义上零引擎改动。**跨项目交叉验证成立**：Dodge（战斗）+ Seed &
+Harvest（生产/计时）+ 编辑器（对象操作）三种状态组织方式均可在
+不增加 VM 语义的情况下表达。S10 = CLOSED（474 tests / 11 guards
+/ clippy 0）。
+
+**S11-0 裁决**：先做 API 摩擦重评（零代码——统计全部项目中
+F-1/F-4 的真实出现频次），再决定后续方向。纪律不变：M1。
+
 ## 6. 复盘结论
 
 - 九里程碑无回退项；三条新原则、两条待裁、两道封口令入档；
