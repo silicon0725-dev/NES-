@@ -119,20 +119,20 @@ fn t_ui_03_uivm_hover_press_activate() {
     vm.set_input_view(Rc::new(input.clone()));
 
     // 悬停 a：无键。
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     assert!(vm.state(a).hover && !vm.state(a).pressed, "悬停 a");
     assert!(!vm.state(b).hover, "b 不悬停");
 
     // 按下 a：pressed 置位。
     input.set((40.0, 130.0), true);
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     assert!(vm.state(a).pressed, "按下 a");
 
     // 移出后抬键：不激活（标准 UI 语义 —— 按下目标 ≠ 抬键命中）。
     input.set((300.0, 130.0), true); // b 区域
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     input.set((300.0, 130.0), false);
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     assert!(!vm.state(a).pressed && !vm.state(b).pressed, "抬键清按下");
 
     // 完整点击 b：按下 → 抬键（同目标） → 激活。
@@ -140,11 +140,25 @@ fn t_ui_03_uivm_hover_press_activate() {
     let sink = fired.clone();
     vm.on_activate(move |n| sink.borrow_mut().push(n));
     input.set((240.0, 130.0), true);
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     assert!(vm.state(b).pressed, "按下 b");
     input.set((240.0, 130.0), false);
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     assert_eq!(*fired.borrow(), vec![b], "抬键命中 b 激活一次");
+}
+
+/// T-UI-03b：窗口缩放折算 —— 鼠标按 视图/客户区 比例映射回视图空间
+/// 后命中（客户区 1024x576 = 视图 512x288 的 2 倍拉伸）。
+#[test]
+fn t_ui_03b_scaled_window_mouse_hit() {
+    let (t, a, _b) = two_buttons();
+    let input = FakeInput::default();
+    // 客户区 (80, 240) -> 视图 (40, 120)（按钮 a 顶边内侧）。
+    input.set((80.0, 240.0), false);
+    let mut vm = UiVm::new();
+    vm.set_input_view(Rc::new(input));
+    vm.update(&t, (512.0, 288.0), (0.5, 0.5));
+    assert!(vm.state(a).hover, "折算后命中 a（未折算则 (80,240) 在 a 外）");
 }
 
 /// T-UI-04：瞬态不入指纹（§3.3 裁决 —— UI 摇动不影响游戏确定性）。
@@ -156,7 +170,7 @@ fn t_ui_04_transient_states_not_in_fingerprint() {
     input.set((40.0, 130.0), true);
     vm.set_input_view(Rc::new(input));
     let before = scene_fingerprint(&t, None);
-    vm.update(&t, (512.0, 288.0));
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
     assert!(vm.state(a).hover, "前置：状态确实变了");
     let after = scene_fingerprint(&t, None);
     assert_eq!(before, after, "UI 瞬态不进语义指纹");

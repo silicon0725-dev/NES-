@@ -246,9 +246,11 @@ impl NesRuntime {
         }
         let _steps = self.simulate(frame.delta, obs);
         // S12.1：UI 状态机在 simulate 后、提取前更新（看到当帧终值；
-        // 提取层随即读状态表做四态着色）。
+        // 提取层随即读状态表做四态着色）。鼠标按 视图/客户区 折算
+        //（渲染把视图空间拉伸铺满表面 —— 窗口缩放后错位的根修）。
+        let scale = self.mouse_view_scale((frame.viewport.x, frame.viewport.y));
         self.ui_vm
-            .update(&self.tree, (frame.viewport.x, frame.viewport.y));
+            .update(&self.tree, (frame.viewport.x, frame.viewport.y), scale);
         self.extractor.extract_into(
             &mut self.tree,
             &self.table,
@@ -624,6 +626,18 @@ impl NesRuntime {
         &mut self.ui_vm
     }
 
+    /// 鼠标 客户区像素 -> 视图空间 的折算比（无窗口/零尺寸 = 1:1）。
+    fn mouse_view_scale(&self, viewport: (f32, f32)) -> (f32, f32) {
+        let Some(w) = &self.window else {
+            return (1.0, 1.0);
+        };
+        let (cw, ch) = w.client_size();
+        if cw == 0 || ch == 0 {
+            return (1.0, 1.0);
+        }
+        (viewport.0 / cw as f32, viewport.1 / ch as f32)
+    }
+
     /// 轮询文件变化（内容戳判定）。变化后调用 [`Self::upload_pending_textures`] 重传。
     pub fn poll_reloads(&mut self) -> ReloadReport {
         self.registry.poll_reloads()
@@ -701,10 +715,10 @@ impl NesRuntime {
         obs: &mut dyn SceneObserver,
     ) -> Result<FrameOutcome, BackendError> {
         let _steps = self.simulate(frame.delta, obs);
-        // S12.1：UI 状态机在 simulate 后、提取前更新（看到当帧终值；
-        // 提取层随即读状态表做四态着色）。
+        // S12.1：同窗口路径 —— simulate 后、提取前更新 UI 状态
+        //（离屏目标与视口同尺寸，鼠标 1:1）。
         self.ui_vm
-            .update(&self.tree, (frame.viewport.x, frame.viewport.y));
+            .update(&self.tree, (frame.viewport.x, frame.viewport.y), (1.0, 1.0));
         self.extractor.extract_into(
             &mut self.tree,
             &self.table,

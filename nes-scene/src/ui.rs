@@ -172,9 +172,14 @@ impl UiVm {
 
     /// 每帧更新：命中测算 + 悬停/按下状态机 + 激活回调。
     ///
+    /// `mouse_scale` = 视图空间 / 客户区像素（窗口帧路径由运行时按
+    /// `frame.viewport / 客户区尺寸` 折算；渲染把视图空间经 NDC 拉伸
+    /// 铺满表面，鼠标必须同比例映射回视图空间命中才准 —— 窗口缩放
+    /// 后错位的根修）。离屏/1:1 路径传 `(1.0, 1.0)`。
+    ///
     /// 在 tick 之后、提取之前调用（看到的是当帧终值 —— 与 F-1 信号
     /// 泵同款时序裁决）。无输入视图时为空转（状态全清）。
-    pub fn update(&mut self, tree: &SceneTree, viewport: (f32, f32)) {
+    pub fn update(&mut self, tree: &SceneTree, viewport: (f32, f32), mouse_scale: (f32, f32)) {
         // 清死节点状态（悬垂不留 —— 与 ScriptVm 状态清扫同款纪律）。
         self.states
             .borrow_mut()
@@ -183,7 +188,10 @@ impl UiVm {
         let Some(input) = self.input.borrow().clone() else {
             return;
         };
-        let (mx, my) = input.mouse();
+        let (mx, my) = {
+            let (x, y) = input.mouse();
+            (x * mouse_scale.0, y * mouse_scale.1)
+        };
         let left = input.button("left");
 
         // 前序遍历收集 Button 视口矩形（前序 = 提取层同款确定性序，
