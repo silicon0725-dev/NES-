@@ -261,7 +261,7 @@ fn main() {
             if mouse_left_held {
                 // preview：直写树位置（会话态，微批次之外）。
                 let tree = rt.tree_mut();
-                if let Some(id) = tree.find_by_uid(&uid) {
+                if let Some(id) = tree.find_by_uid(uid) {
                     let cur = tree.local(id).unwrap_or_default();
                     tree.set_local(id, Transform2D::from_pos(snap.mouse.x - ox, snap.mouse.y - oy));
                     let _ = cur;
@@ -270,14 +270,14 @@ fn main() {
                 // 松开：一次事务提交最终位置。
                 let final_pos = {
                     let tree = rt.tree_mut();
-                    tree.find_by_uid(&uid)
+                    tree.find_by_uid(uid)
                         .and_then(|id| tree.local(id))
                         .map(|t| (t.pos.x, t.pos.y))
                 };
                 if let Some((fx, fy)) = final_pos {
                     log.begin().unwrap();
                     Inspector::new(rt.tree_mut(), &mut log)
-                        .modify_local(&uid.clone(), Transform2D::from_pos(fx, fy))
+                        .modify_local(uid, Transform2D::from_pos(fx, fy))
                         .unwrap();
                     log.commit().unwrap();
                 }
