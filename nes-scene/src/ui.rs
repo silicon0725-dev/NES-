@@ -266,6 +266,20 @@ impl UiVm {
         }
 
         let Some(input) = self.input.borrow().clone() else {
+            // 无输入视图：状态全清（文档口径兑现 —— 悬停/按下/焦点是
+            // 输入的投影，输入面缺席时不残留旧帧状态去驱动提取层着色）。
+            {
+                let mut states = self.states.borrow_mut();
+                states.widgets.clear();
+                states.texts.clear();
+            }
+            self.focus = None;
+            self.press_target = None;
+            self.prev_left = false;
+            self.prev_tab = false;
+            self.prev_backspace = false;
+            self.prev_enter = false;
+            self.prev_escape = false;
             return;
         };
         let (mx, my) = {
@@ -403,8 +417,15 @@ impl UiVm {
 
     /// 失焦 = 提交：把草稿整体经 [`UiVm::on_commit`] 钩子交给宿主
     /// （UiVm 零写权 —— 不直写属性表），并关闭编辑会话。
+    ///
+    /// **仅 TextInput 失焦才提交**：Button 等纯占焦控件没有编辑会话，
+    /// 失焦不发 `on_commit`（宿主的提交落账面只对输入框有意义 ——
+    /// 无会话控件回读 `text` 属性伪造载荷是错的）。
     fn blur_commit(&mut self, tree: &SceneTree) {
         if let Some(f) = self.focus.take() {
+            if tree.kind_tag(f) != Some(NodeKindTag::TextInput) {
+                return;
+            }
             // TextInput：提交草稿（无会话则提交节点现值 —— 会话从未开始）。
             let value = match self.states.borrow_mut().texts.remove(&f) {
                 Some(ts) => Value::Str(ts.draft),

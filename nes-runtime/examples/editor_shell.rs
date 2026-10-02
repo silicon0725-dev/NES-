@@ -34,6 +34,40 @@ fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
 }
 
+/// 视口尺寸（与帧 `FrameInfo::viewport` 同源 —— 控件锚定该视口解析）。
+const VIEWPORT: (f32, f32) = (768.0, 432.0);
+
+/// 按压点（**视图空间**）是否落在重命名输入框矩形内 —— 与 UiVm 命中
+/// 同一口径（`anchor * viewport + offset` + `size`，不可见即不参与
+/// 命中）。宿主用它护住检查器面板：压在输入框上的点击不清选中、
+/// 不启动框选，把交互让给 UiVm 的点击夺焦路径（S12-2 验收：
+/// 点击改名输入框 -> 夺焦 -> 输入 -> Enter 提交）。
+fn press_in_name_input(
+    tree: &nes_scene::SceneTree,
+    input: nes_scene::NodeId,
+    view_pos: (f32, f32),
+) -> bool {
+    let visible = tree
+        .prop(input, "visible")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !visible {
+        return false;
+    }
+    let vec2 = |name: &str| match tree.prop(input, name) {
+        Some(Value::Vec2(v)) => *v,
+        _ => nes_scene::Vec2::ZERO,
+    };
+    let anchor = vec2(PROP_CONTROL_ANCHOR);
+    let offset = vec2(PROP_CONTROL_OFFSET);
+    let size = vec2(PROP_CONTROL_SIZE);
+    let (x, y) = (
+        anchor.x * VIEWPORT.0 + offset.x,
+        anchor.y * VIEWPORT.1 + offset.y,
+    );
+    view_pos.0 >= x && view_pos.0 < x + size.x && view_pos.1 >= y && view_pos.1 < y + size.y
+}
+
 fn main() {
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
     let tex = assets.join("Textures");
@@ -235,6 +269,18 @@ fn main() {
         if mouse_left_held && !prev_click {
             // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。
             let (mx, my) = (snap.mouse.x, snap.mouse.y);
+            // 压在重命名输入框上 = 检查器面板的 UI 交互：护住选中
+            //（不清空、不框选），点击让给 UiVm 的夺焦路径。鼠标按
+            // 视图/客户区 折算到视图空间 —— 与 UiVm 命中同口径，窗口
+            // 缩放后仍准。
+            let over_name_input = {
+                let (sx, sy) = rt.mouse_view_scale(VIEWPORT);
+                press_in_name_input(
+                    rt.tree_mut(),
+                    name_input,
+                    (mx * sx, my * sy),
+                )
+            };
             let hit_uid: Option<Uid> = {
                 let tree = rt.tree_mut();
                 let mut cands: Vec<(i64, nes_scene::NodeId)> = tree
@@ -275,12 +321,12 @@ fn main() {
                     sel.select(uid);
                 }
                 drag_start = None; // 点击命中：不是框选
-            } else if !mouse_shift {
-                // 空白处按下：开始框选（拖拽矩形）。
+            } else if !mouse_shift && !over_name_input {
+                // 空白处按下：开始框选（拖拽矩形）。压在重命名输入框上
+                // 的除外（上方护住 —— 清了选中输入框即隐藏，UiVm 的
+                // 点击夺焦就永远够不着它了）。
                 drag_start = Some((mx, my));
-                if !mouse_shift {
-                    sel.clear(); // 框选重置（Shift 保留已有选择）
-                }
+                sel.clear(); // 框选重置（Shift 保留已有选择）
             }
         }
         // Gizmo 拖拽：鼠标移动 → 选中对象跟随（preview 直写，不入账）；
@@ -395,6 +441,11 @@ fn main() {
         prev_tab = tab_now;
 
         // ---- UI 投影（每帧从状态模型重算，零自有状态）----
+        // 输入框是否在编辑会话中（持焦点）：会话期间不换绑定 ——
+        // 换选中触发的失焦提交要落到**开会话时**绑定的节点头上
+        //（提交回调读 rename_bound，此刻换绑会把旧草稿安到新选中
+        // 节点头上），失焦落账后下一帧再重绑新选中。
+        let editing = rt.ui_vm_mut().focus() == Some(name_input);
         {
             let tree = rt.tree_mut();
             // Hierarchy View：树投影（前序 + 缩进 + 选中标记 *）。
@@ -460,10 +511,11 @@ fn main() {
             }
 
             // 重命名输入框投影：有选中 → 可见且 text 绑定选中节点名
-            //（换选中才重绑 —— 编辑会话中不改草稿）。
+            //（换选中才重绑 —— 编辑会话中（editing）不换绑：会话的
+            // 失焦提交归旧绑定，失焦后下一帧再绑新选中）。
             let primary_uid = sel.primary(tree).and_then(|p| tree.uid_of(p));
             let _ = tree.set_prop(name_input, "visible", Value::Bool(primary_uid.is_some()));
-            if primary_uid != bound_sel {
+            if primary_uid != bound_sel && !editing {
                 bound_sel = primary_uid.clone();
                 *rename_bound.borrow_mut() = primary_uid.clone();
                 if let Some(p) = sel.primary(tree) {
@@ -483,7 +535,7 @@ fn main() {
         }
 
         let _ = rt.emit_input_signals(&snap);
-        let frame = FrameInfo::new(index, 1.0 / 60.0, index as f64 / 60.0, Vec2::new(768.0, 432.0));
+        let frame = FrameInfo::new(index, 1.0 / 60.0, index as f64 / 60.0, Vec2::new(VIEWPORT.0, VIEWPORT.1));
         match rt.frame_windowed_with(&frame, &mut vm) {
             Ok(Some(stats)) => {
                 if stats.driver_errors > 0 {

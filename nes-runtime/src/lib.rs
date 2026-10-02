@@ -627,7 +627,11 @@ impl NesRuntime {
     }
 
     /// 鼠标 客户区像素 -> 视图空间 的折算比（无窗口/零尺寸 = 1:1）。
-    fn mouse_view_scale(&self, viewport: (f32, f32)) -> (f32, f32) {
+    ///
+    /// 帧内 UiVm `update` 用同一口径折算命中；宿主自查控件命中（如
+    /// editor_shell 护住检查器输入框的按压点）也用这份折算 —— 窗口
+    /// 缩放后不错位（S12-2）。
+    pub fn mouse_view_scale(&self, viewport: (f32, f32)) -> (f32, f32) {
         let Some(w) = &self.window else {
             return (1.0, 1.0);
         };

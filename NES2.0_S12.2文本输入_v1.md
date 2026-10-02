@@ -17,7 +17,7 @@ fill_slot / border_slot / text_slot / placeholder，RON 往返）；**焦点
 **P0 只收 ASCII 可打印（0x20..=0x7E），非 ASCII 忽略**（S12.0 §3.4
 IME 边界：不做组合窗，中文/真字体后置）。editor_shell 检查器换真
 消费者：节点重命名走 TextInput，一次提交 = 一条 `modify_name` 事务。
-六 crate **517 测试全绿**、clippy 0、守卫 11/11；渲染契约 additive
+六 crate **501 测试全绿**、clippy 0、守卫 11/11；渲染契约 additive
 （`caret: Option<u16>` 缺省 `None` = 既有路径逐位不变），无基线重录。
 
 ---
@@ -64,7 +64,9 @@ IME 边界：不做组合窗，中文/真字体后置）。editor_shell 检查�
   Backspace → 删光标前一字符
   Enter  → 提交草稿整体值（经 on_commit 钩子），焦点保留、会话继续
   Escape → 回滚：草稿 := 节点 text 已提交值
-  失焦   → 提交草稿（无会话 = 提交节点现值——会话从未开始）
+  失焦   → 提交草稿（仅 TextInput；无会话 = 提交节点现值——会话从未
+           开始）。Button 等纯占焦控件失焦**不发** on_commit：无编辑
+           会话，不回读 `text` 属性伪造载荷（T-UI-05 对照组钉死）
 ```
 
 - **零写权延续**：提交不直写属性表，只回调 `on_commit(NodeId,
@@ -97,14 +99,26 @@ IME 边界：不做组合窗，中文/真字体后置）。editor_shell 检查�
 `Inspector::modify_name` **一条 Modified 事务**（值未变则跳过），
 输入框 text 投影跟着落账后的新名走。`NES_GAME_FRAMES` 冒烟通过。
 
+评审修正（两处宿主/状态机口径收紧）：
+
+- **护住检查器面板**：编辑器自身的点击选择路径原本把"没压到
+  Sprite2D 的按压"一律当空白（框选 + 清空选中）——压在改名输入框
+  上会连带清掉选中，输入框同帧被投影隐藏，UiVm 命中永远够不着它
+  （点击夺焦路径失效，改名只剩 Tab 轮转可达）。修法：宿主按压沿
+  先把鼠标按 `mouse_view_scale`（新升公开的运行时折算面）折到视图
+  空间，落输入框矩形内即跳过清选/框选，把交互让给 UiVm 夺焦。
+- **编辑会话中不换绑**：换选中触发的失焦提交要落到**开会话时**
+  绑定的节点头上（提交回调读的是绑定槽，此刻换绑会把旧草稿安到
+  新选中节点上）——会话持焦期间绑定冻结，失焦落账后下一帧再重绑。
+
 ## 6. 契约回归
 
 | 套件 | 编号 | 断言 |
 |---|---|---|
-| nes-scene/tests/s12_ui.rs | T-UI-05..08 | 焦点路由（点击夺焦/Tab 场景序轮转/点空白失焦）；文本泵（ASCII 插入 + 非 ASCII 忽略 + Backspace）；草稿语义（Enter 提交整体值不直写属性表/Esc 回滚/失焦=提交）；文本瞬态不入指纹 |
+| nes-scene/tests/s12_ui.rs | T-UI-05..08 | 焦点路由（点击夺焦/Tab 场景序轮转/点空白失焦/**Button 失焦零提交**）；文本泵（ASCII 插入 + 非 ASCII 忽略 + Backspace）；草稿语义（Enter 提交整体值不直写属性表/Esc 回滚/失焦=提交）；文本瞬态不入指纹 |
 | nes-render-extract/tests/s12_button.rs | T-WID-05..06 | TextInput 摊平同句柄（三主题槽 + focused 换 accent + 草稿优先/无会话显已提交值）；光标 Some(字符下标) 与 30 帧奇偶节拍（第 31 帧隐半拍不画） |
 | nes-runtime/tests/criterion_ui_interaction.rs | T-UI-R3 | **全链真实运行时路径**：`inject_input` Char（真实 UTF-16 消息序）→ `SnapshotView::text` 读面 → 草稿 → Enter 提交经 `on_commit` 回调一次；属性表零直写；Enter 抬起不重复提交 |
-| 六 crate 全量 | — | **517 全绿**、clippy 0（`--all-targets`）、依赖方向守卫 11/11 |
+| 六 crate 全量 | — | **501 全绿**（asset 34 / scene 222 / render-api 44 / render-extract 47 / render-wgpu 89 / runtime 65）、clippy 0（`--all-targets`）、依赖方向守卫 11/11 |
 
 ## 7. 跳过与后置
 

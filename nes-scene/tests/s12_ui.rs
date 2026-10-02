@@ -7,7 +7,7 @@
 //! | T-UI-02 | ThemeColors：节点属性解析（I64 打包）、槽位名查找、缺省深色八槽齐全 |
 //! | T-UI-03 | UiVm 状态机：视口锚定命中（前序最后者胜）、悬停/按下、抬键命中激活、移出释放不激活 |
 //! | T-UI-04 | 瞬态不入指纹：update 前后 scene_fingerprint 逐位相同（§3.3 裁决） |
-//! | T-UI-05 | 焦点路由（S12-2）：点击 TextInput 夺焦、Tab 按场景序轮转、点空白失焦 |
+//! | T-UI-05 | 焦点路由（S12-2）：点击 TextInput 夺焦、Tab 按场景序轮转、点空白失焦；Button 失焦零提交（无编辑会话不伪造载荷） |
 //! | T-UI-06 | 文本输入状态机：字符插入光标处（P0 仅 ASCII 可打印）、Backspace 删前一字符 |
 //! | T-UI-07 | 草稿语义：Enter 提交整体值（经回调、不直写属性）、Esc 回滚、失焦提交、空/非法处理 |
 //! | T-UI-08 | 文本瞬态（草稿/光标）不入语义指纹 |
@@ -272,6 +272,32 @@ fn t_ui_05_focus_routing() {
     frame(&mut vm, &input, (240.0, 130.0), true); // 按 in1
     frame(&mut vm, &input, (240.0, 130.0), false);
     assert!(fired.borrow().is_empty(), "TextInput 点击不触发激活钩子");
+
+    // Button 失焦不发 on_commit：Tab 把焦点轮到 btn（纯占焦控件）后
+    // 点空白失焦 —— 提交钩子零载荷（提交语义只属于 TextInput；无
+    // 编辑会话的控件不得回读 text 属性伪造提交）。
+    let commits = Rc::new(RefCell::new(Vec::new()));
+    let csink = commits.clone();
+    vm.on_commit(move |n, v| csink.borrow_mut().push((n, v)));
+    input.set_key("tab", true); // in1 -> in2
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set_key("tab", false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set_key("tab", true); // in2 -> btn
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set_key("tab", false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    assert_eq!(vm.focus(), Some(_btn), "前置：Tab 轮到 Button");
+    assert_eq!(
+        *commits.borrow(),
+        vec![(in1, Value::Str(String::new())), (in2, Value::Str(String::new()))],
+        "途中 TextInput 失焦照常提交（对照组）"
+    );
+    commits.borrow_mut().clear();
+    frame(&mut vm, &input, (400.0, 40.0), true); // 点空白
+    frame(&mut vm, &input, (400.0, 40.0), false);
+    assert_eq!(vm.focus(), None, "Button 失焦同样清焦点槽");
+    assert!(commits.borrow().is_empty(), "Button 失焦不发 on_commit");
 }
 
 /// T-UI-06：文本输入状态机 —— 字符插入光标处（P0 仅 ASCII 可打印，
