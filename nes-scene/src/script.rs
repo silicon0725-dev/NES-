@@ -254,6 +254,7 @@ fn run<'a, 'b>(
     ctx: &mut VmCtx<'a, 'b>,
     arg: Value,
     input: &InputSlot,
+    shared: &SharedStates,
 ) {
     let mut stack: Vec<StackVal> = Vec::new();
     let mut pc = 0usize;
@@ -316,11 +317,33 @@ fn run<'a, 'b>(
             },
             Op::GetProp(name) => {
                 let node = pop_node!();
-                let v = ctx
-                    .tree()
-                    .prop(node, name)
-                    .cloned()
-                    .unwrap_or(Value::I64(0));
+                // Schema 优先；Script 节点回退到其**局部变量**（S11-0/F-1
+                // 跨脚本只读共享面 —— `game.gold` 读名为 "game" 的脚本节点
+                // 的 gold 局部）。查自己（node == host）时局部已被取出
+                //（不在 shared 表里），直接看手中 locals —— 自引用与
+                // 跨脚本读同一语义。写侧 SetProp 仍落属性表：局部只有
+                // 属主自己的 SetLocal 能写（无第二状态总线，S8.2b v1.1）。
+                let v = match ctx.tree().prop(node, name) {
+                    Some(v) => v.clone(),
+                    None => {
+                        if ctx.tree().kind_tag(node)
+                            == Some(crate::node::NodeKindTag::Script)
+                        {
+                            if node == host {
+                                locals.get(name.as_str()).cloned()
+                            } else {
+                                shared
+                                    .borrow()
+                                    .get(&node)
+                                    .and_then(|l| l.get(name.as_str()))
+                                    .cloned()
+                            }
+                            .unwrap_or(Value::I64(0))
+                        } else {
+                            Value::I64(0)
+                        }
+                    }
+                };
                 stack.push(StackVal::V(v));
             }
             Op::SetProp(name) => {
@@ -786,6 +809,12 @@ pub trait InputView {
 /// （留在 VM 里）共享同一份 —— attach 后 `set_input_view` 也立即生效。
 type InputSlot = Rc<RefCell<Option<Rc<dyn InputView>>>>;
 
+/// 跨脚本只读共享面（S11-0/F-1）：全部脚本的状态表引用。脚本执行
+/// 期间自己的局部被取出（不存在 map 里），其他脚本的可读（GetProp
+/// 的回退路径）。**只读**—— 写只在自己局部内（SetLocal），没有
+/// 跨脚本写指令（防第二状态总线，S8.2b v1.1 口径）。
+type SharedStates = Rc<RefCell<HashMap<NodeId, BTreeMap<String, Value>>>>;
+
 /// 脚本 VM：注册表 + 每脚本局部状态（跨调用持久 —— 计数器/累积器语义）。
 pub struct ScriptVm {    /// 键 -> 脚本（宿主登记 + 内嵌派生键）。
     scripts: BTreeMap<String, Script>,
@@ -962,7 +991,7 @@ impl ScriptVm {
                         let mut locals = states.borrow_mut().remove(&node).unwrap_or_default();
                         if let Some(init) = &script.init {
                             if !locals.contains_key(INIT_LOCAL) {
-                                run(init, node, &mut locals, &mut VmCtx::Signal(ctx), Value::I64(0), &input);
+                                run(init, node, &mut locals, &mut VmCtx::Signal(ctx), Value::I64(0), &input, &states);
                                 locals.insert(INIT_LOCAL.to_string(), Value::Bool(true));
                             }
                         }
@@ -973,6 +1002,7 @@ impl ScriptVm {
                             &mut VmCtx::Signal(ctx),
                             sig.payload.clone(),
                             &input,
+                            &states,
                         );
                         states.borrow_mut().insert(node, locals);
                     }),
@@ -1223,10 +1253,11 @@ impl SceneObserver for ScriptVm {
         else {
             return;
         };
+        let shared_states = self.states.clone();
         let mut locals = self.states.borrow_mut().remove(&node).unwrap_or_default();
         if let Some(init) = &script.init {
             if !locals.contains_key(INIT_LOCAL) {
-                run(init, node, &mut locals, &mut VmCtx::Node(ctx), Value::I64(0), &self.input);
+                run(init, node, &mut locals, &mut VmCtx::Node(ctx), Value::I64(0), &self.input, &shared_states);
                 locals.insert(INIT_LOCAL.to_string(), Value::Bool(true));
             }
         }
@@ -1237,6 +1268,7 @@ impl SceneObserver for ScriptVm {
             &mut VmCtx::Node(ctx),
             Value::F32(delta),
             &self.input,
+            &shared_states,
         );
         self.states.borrow_mut().insert(node, locals);
     }
