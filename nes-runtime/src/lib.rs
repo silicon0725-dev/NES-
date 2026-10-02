@@ -205,6 +205,12 @@ impl NesRuntime {
             steps_dropped: 0,
         };
         rt.extractor.attach_ui(rt.ui_vm.states_rc());
+        // S12.1：UI 状态机的输入读面在装配处直接挂上 —— 输入视图只共享
+        // `input_state` Rc，不依赖宿主调用 `mount_input_view`。这样任何
+        // 宿主（包括不用 ScriptVm/NoObserver 的示例）都能驱动 UiVm 的
+        // 悬停/按下命中；之后每帧 `collect_input` 自动刷新读数。
+        rt.ui_vm
+            .set_input_view(Rc::new(SnapshotView(rt.input_state.clone())));
         Ok(rt)
     }
 
