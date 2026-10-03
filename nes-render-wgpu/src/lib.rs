@@ -75,6 +75,7 @@ pub mod ffi;
 pub mod gpu;
 pub mod png;
 pub mod renderer;
+pub mod ttf;
 pub mod window;
 
 pub use crate::error::BackendError;
