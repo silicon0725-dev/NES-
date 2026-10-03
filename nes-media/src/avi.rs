@@ -111,6 +111,12 @@ pub enum VideoCodec {
     Dib,
     /// Motion JPEG（`'MJPG'`）—— 每帧是一张独立 JPEG。
     Mjpg,
+    /// AMV 变体 Motion JPEG（S14.3）：帧体是无头 MJPEG
+    /// （`FFD8`+熵数据+`FFD9`），需按 FFmpeg sp5x 方案合成标准 JPEG
+    /// 才可解。只由 [`crate::amv::AmvVideo`] 产生 —— AVI 容器的
+    /// `biCompression` 分类不会给出该值（语义选择：不复用 Mjpg，因为
+    /// "帧字节可直接交 JPEG 解码器"对 AMV 不成立，调用方需知道这点）。
+    Amv,
     /// 未收录的四字码（LE u32 原值保留，指名报错用）。
     Unsupported(u32),
 }
@@ -291,6 +297,11 @@ impl AviVideo {
                 decode_dib_24(body, self.info.width, self.info.height, self.top_down, self.stride)
             }
             VideoCodec::Mjpg => crate::image::decode_image(body),
+            // Amv 只会由 amv::AmvVideo 产生（AVI 解析面到不了这个值）——
+            // 防御性指名报错，不假装会解。
+            VideoCodec::Amv => Err(MediaError::Decode(
+                "AVI 帧解码失败：AMV 帧编码不属于 AVI 容器解码面（见 amv 模块）".into(),
+            )),
             VideoCodec::Unsupported(raw) => {
                 let bytes = raw.to_le_bytes();
                 Err(MediaError::Decode(format!(

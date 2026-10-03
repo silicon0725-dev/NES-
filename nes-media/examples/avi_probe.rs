@@ -16,16 +16,18 @@
 //! # 产出
 //!
 //! 1. 元信息打印（尺寸/帧率/帧数/编解码器/音轨参数）；
-//! 2. 全帧解出写 24-bit BMP 落盘（`frame_000.bmp` …）—— BMP 写盘是
-//!    nes-render-wgpu `bmp.rs` 装载器的镜像手法，**写在示例内**避免
-//!    污染库公共面（库的面只有 demux DTO）；
-//! 3. 音轨写 WAV（`nes_audio::wav::write_wav`，混音器同款 16-bit 面）。
+//! 2. 全帧解出写 24-bit BMP 落盘（AVI：`frame_NNN.bmp`；AMV：
+//!    `amv_frame_NNN.bmp`）—— BMP 写盘是 nes-render-wgpu `bmp.rs`
+//!    装载器的镜像手法，**写在示例内**避免污染库公共面（库的面只有
+//!    demux DTO）；
+//! 3. AVI 音轨写 WAV（`nes_audio::wav::write_wav`，混音器同款 16-bit
+//!    面）；AMV 音轨（IMA ADPCM）第 1 期跳过、声明值指名打印。
 //!
 //! 打印全 ASCII（Windows 控制台代码页安全，注释中文）。
 
 #![forbid(unsafe_code)]
 
-use nes_media::{AviVideo, VideoCodec};
+use nes_media::{AmvVideo, AviVideo, VideoCodec};
 
 /// 探测目标写**常量表**（词法干净：无环境变量污染流向文件系统——
 /// 本地安全扫描 S12-10 实测会拦 env->fs 1 跳污染）。真数据试跑的三
@@ -52,7 +54,15 @@ fn main() {
             println!("[avi_probe]   skip (unreadable/absent)");
             continue;
         };
-        // AMV 等未收录格式：指名报告后继续跑表内其余样本（panic 会让
+        // AMV 容器变体（RIFF 'AMV '）走 amv 模块（S14.3：无头 MJPEG 帧
+        // 合成解码）；普通 AVI 走 avi 模块。两条路线产物同族 DTO。
+        if bytes.len() >= 12 && &bytes[8..12] == b"AMV " {
+            if let Err(e) = probe_amv_and_dump(&bytes, OUT_DIR, path) {
+                println!("[avi_probe]   amv probe failed: {e}");
+            }
+            continue;
+        }
+        // AVI 等未收录格式：指名报告后继续跑表内其余样本（panic 会让
         // 后续样本跑不到——真数据试跑要的是全景）。
         if let Err(e) = AviVideo::parse(&bytes) {
             println!("[avi_probe]   unsupported/unparseable: {e}");
@@ -60,6 +70,67 @@ fn main() {
         }
         probe_and_dump(&bytes, OUT_DIR, path);
     }
+}
+
+/// AMV 版探测：解析 -> 元信息打印 -> 全帧写 BMP（前缀 amv_）。
+/// 音轨（IMA ADPCM）第 1 期跳过，声明值指名打印（avi.rs 同款产物面）。
+fn probe_amv_and_dump(bytes: &[u8], out_dir: &str, source: &str) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let amv = AmvVideo::parse(bytes).map_err(|e| e.to_string())?;
+    let parse_ms = started.elapsed().as_millis();
+
+    let info = amv.video_info();
+    println!("[avi_probe] size  : {}x{}", info.width, info.height);
+    println!("[avi_probe] fps   : {}", info.fps);
+    println!("[avi_probe] frames: {}", info.frame_count);
+    println!("[avi_probe] codec : AMV (headerless MJPEG, sp5x-synthesized headers)");
+    println!("[avi_probe] parse : {parse_ms} ms (file {} KB)", bytes.len() / 1024);
+    match amv.audio_declared_format() {
+        Some((tag, channels, rate, bits)) => println!(
+            "[avi_probe] audio : DECLARED tag={tag} ch={channels} rate={rate} bits={bits} -- \
+             skipped (real payload is ADPCM_IMA_AMV, not decoded in this stage, see amv.rs docs)"
+        ),
+        None => println!("[avi_probe] audio : no stream header"),
+    }
+
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let max_out: u32 = 16;
+    let stride = if max_out == 0 {
+        1
+    } else {
+        info.frame_count.div_ceil(max_out).max(1)
+    };
+    let frames_start = std::time::Instant::now();
+    let mut written = 0u32;
+    let mut decode_fail: Option<(u32, String)> = None;
+    for i in 0..info.frame_count {
+        if i % stride != 0 && i + 1 != info.frame_count {
+            continue;
+        }
+        let img = match amv.frame(i) {
+            Ok(img) => img,
+            Err(e) => {
+                if decode_fail.is_none() {
+                    decode_fail = Some((i, e.to_string()));
+                }
+                continue;
+            }
+        };
+        let path = std::path::Path::new(out_dir).join(format!("amv_frame_{i:03}.bmp"));
+        write_bmp(&path, img.width, img.height, &img.rgba)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        written += 1;
+    }
+    println!(
+        "[avi_probe] frames decoded+saved: {written}/{} (stride {stride}, cap {max_out}) -> {out_dir}/amv_frame_NNN.bmp ({} ms)",
+        info.frame_count,
+        frames_start.elapsed().as_millis(),
+    );
+    if let Some((i, e)) = decode_fail {
+        println!("[avi_probe] frame decode failures: first at {i}: {e}");
+    }
+    println!("[avi_probe] done (amv): {source}");
+    Ok(())
 }
 
 /// 解析 -> 元信息打印 -> 全帧写 BMP -> 音轨写 WAV。
@@ -72,6 +143,8 @@ fn probe_and_dump(bytes: &[u8], out_dir: &str, source: &str) {
     let codec = match info.codec {
         VideoCodec::Dib => "DIB (uncompressed BGR)".to_string(),
         VideoCodec::Mjpg => "MJPG (Motion JPEG)".to_string(),
+        // AVI 解析面不会给出 Amv（只由 amv 模块产生）——防御性打印。
+        VideoCodec::Amv => "AMV (unexpected in AVI container)".to_string(),
         VideoCodec::Unsupported(raw) => {
             let b = raw.to_le_bytes();
             format!("Unsupported({})", String::from_utf8_lossy(&b))
