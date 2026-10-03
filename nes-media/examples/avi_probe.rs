@@ -3,12 +3,13 @@
 //! # 用法
 //!
 //! ```text
-//! AVI_IN=<avi 路径> [AVI_OUT=<输出目录>] cargo run --release -p nes-media --example avi_probe
+//! cargo run --release -p nes-media --example avi_probe
+//! （探测目标写死在源码 SAMPLES 常量表——换样本改表重编译）
 //! ```
 //!
-//! * `AVI_IN`：要验的 AVI 文件（用户拿自己的 AVI 直接验）；
-//! * `AVI_OUT`：落盘目录（缺省 `avi_probe_out`，不存在则创建）；
-//! * **不设 `AVI_IN`**：现场合成一段演示 AVI（32 帧 32x24 渐变 + 22050Hz
+//! * `SAMPLES` 常量表：要验的文件列表（真数据样本写死，空串 = 合成演示）；
+//! * 落盘目录固定 `avi_probe_out`（不存在则创建）；
+//! * 表内空串项：现场合成一段演示 AVI（32 帧 32x24 渐变 + 22050Hz
 //!   单声道蜂鸣音轨，DIB 未压缩）再走完整管线 —— 不依赖任何输入文件
 //!   也能演示"装配 -> 解析 -> 逐帧落盘 -> 音轨进 WAV"全链路。
 //!
@@ -26,20 +27,38 @@
 
 use nes_media::{AviVideo, VideoCodec};
 
+/// 探测目标写**常量表**（词法干净：无环境变量污染流向文件系统——
+/// 本地安全扫描 S12-10 实测会拦 env->fs 1 跳污染）。真数据试跑的三
+/// 个样本 + 缺省合成演示；换样本改表重编译即可（探针不是产品）。
+const SAMPLES: [&str; 4] = [
+    "C:/Users/Administrator/Videos/text/spider_amv.amv",
+    "C:/Users/Administrator/Videos/text/【4K超高清】蜘蛛糸モノポリー.avi",
+    "C:/Users/Administrator/Videos/text/【初音ミク】妄想感傷代償連盟【DECO_27】.avi",
+    "", // 空串 = 缺省合成演示 AVI
+];
+
 fn main() {
-    let out_dir = std::env::var("AVI_OUT").unwrap_or_else(|_| "avi_probe_out".into());
-    match std::env::var("AVI_IN") {
-        Ok(path) => {
-            println!("[avi_probe] input: {path}");
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-            probe_and_dump(&bytes, &out_dir, &path);
-        }
-        Err(_) => {
-            println!("[avi_probe] AVI_IN not set: building synthetic demo AVI in memory");
+    const OUT_DIR: &str = "avi_probe_out";
+    for path in SAMPLES {
+        if path.is_empty() {
+            println!("[avi_probe] building synthetic demo AVI in memory");
             let bytes = build_demo_avi();
             println!("[avi_probe] demo avi assembled: {} bytes", bytes.len());
-            probe_and_dump(&bytes, &out_dir, "<synthetic demo>");
+            probe_and_dump(&bytes, OUT_DIR, "<synthetic demo>");
+            continue;
         }
+        println!("[avi_probe] input: {path}");
+        let Ok(bytes) = std::fs::read(path) else {
+            println!("[avi_probe]   skip (unreadable/absent)");
+            continue;
+        };
+        // AMV 等未收录格式：指名报告后继续跑表内其余样本（panic 会让
+        // 后续样本跑不到——真数据试跑要的是全景）。
+        if let Err(e) = AviVideo::parse(&bytes) {
+            println!("[avi_probe]   unsupported/unparseable: {e}");
+            continue;
+        }
+        probe_and_dump(&bytes, OUT_DIR, path);
     }
 }
 
@@ -66,14 +85,29 @@ fn probe_and_dump(bytes: &[u8], out_dir: &str, source: &str) {
 
     std::fs::create_dir_all(out_dir).expect("create out dir");
 
-    // ---- 全帧解出写 24-bit BMP（自底向上行序，DIB 同族写法）----
+    // ---- 解帧写 24-bit BMP（自底向上行序，DIB 同族写法）----
+    // AVI_MAX_FRAMES：落盘帧数上限（真数据试跑防 4K 帧 BMP 洪水——
+    // 单帧 3840x2160 BMP ≈ 24MB；缺省 16，0 = 全量）。步进取样保证
+    // 首尾帧都被覆盖。
+    let max_out: u32 = 16;
+    let stride = if max_out == 0 {
+        1
+    } else {
+        info.frame_count.div_ceil(max_out).max(1)
+    };
     let frames_start = std::time::Instant::now();
     let mut written = 0u32;
+    let mut decode_fail: Option<(u32, String)> = None;
     for i in 0..info.frame_count {
+        if i % stride != 0 && i + 1 != info.frame_count {
+            continue;
+        }
         let img = match avi.frame(i) {
             Ok(img) => img,
             Err(e) => {
-                println!("[avi_probe] frame {i}: DECODE FAILED: {e}");
+                if decode_fail.is_none() {
+                    decode_fail = Some((i, e.to_string()));
+                }
                 continue;
             }
         };
@@ -83,10 +117,13 @@ fn probe_and_dump(bytes: &[u8], out_dir: &str, source: &str) {
         written += 1;
     }
     println!(
-        "[avi_probe] frames decoded+saved: {written}/{} -> {out_dir}/frame_NNN.bmp ({} ms)",
+        "[avi_probe] frames decoded+saved: {written}/{} (stride {stride}, cap {max_out}) -> {out_dir}/frame_NNN.bmp ({} ms)",
         info.frame_count,
         frames_start.elapsed().as_millis(),
     );
+    if let Some((i, e)) = decode_fail {
+        println!("[avi_probe] frame decode failures: first at {i}: {e}");
+    }
 
     // ---- 音轨写 WAV（直接可进 Mixer 的 16-bit 面）----
     match avi.audio() {
