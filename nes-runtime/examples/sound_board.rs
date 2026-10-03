@@ -42,9 +42,7 @@ fn main() {
                 if wav.samples.iter().all(|&s| s == 0) && i % 97 == 0 {
                     // 全零样本偶发（静音垫片）不算失败，仅采样提示。
                 }
-                let bits = if bytes.len() > 0 { "" } else { "" };
-                let _ = bits;
-                // 24-bit 判定：解析成功后无法回读位深——按文件比例粗记。
+                // 24-bit 判定：解析成功后无法回读位深——按文件头粗记。
                 if is_probably24(p) {
                     ok24 += 1;
                 } else {
@@ -114,22 +112,19 @@ fn main() {
                     println!("[play] {key}");
                 }
             };
-            match ev {
-                nes_render_api::input::InputEvent::Key { key, down: true } => {
-                    let name = key.name();
-                    if name == "Escape" {
-                        break 'main;
-                    }
-                    if name == "Space" {
-                        play(next_random());
-                    }
-                    if let Some(n) = name.chars().next().and_then(|c| c.to_digit(9)) {
-                        if (1..=9).contains(&n) {
-                            play(n as u32 - 1);
-                        }
+            if let nes_render_api::input::InputEvent::Key { key, down: true } = ev {
+                let name = key.name();
+                if name == "Escape" {
+                    break 'main;
+                }
+                if name == "Space" {
+                    play(next_random());
+                }
+                if let Some(n) = name.chars().next().and_then(|c| c.to_digit(9)) {
+                    if (1..=9).contains(&n) {
+                        play(n - 1);
                     }
                 }
-                _ => {}
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
