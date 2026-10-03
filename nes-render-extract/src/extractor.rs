@@ -865,15 +865,22 @@ pub fn label_state_of(tree: &SceneTree, node: NodeId) -> Option<LabelState> {
 /// `min_size` 恒为**无下界**（`None`）：场景层这一版没有最小尺寸属性，本层不凭空
 /// 发明默认值，更不得造出零下界 —— 零下界会把负宽高压成 0，既与"负尺寸不钳制"
 /// 相悖，也会把场景文件的"未设置"与"显式要求最小尺寸"混为一谈。
+///
+/// `border_w`（S12-1 契约字段）自场景属性表直读：schema 暂未声明该键，宿主经
+/// `set_prop_raw` 写入（编辑器选中框 2px 线宽走这条路）。未写 = 缺省 1px，
+/// 既有场景与控件的观感逐位不变；负值不在此夹紧 —— 线宽取舍的权威在渲染侧
+/// （与 [`ControlState::border_w`] 的契约一致，单处解释）。
 pub fn control_state_of(tree: &SceneTree, node: NodeId) -> ControlState {
     let anchor = vec2_prop(tree, node, PROP_CONTROL_ANCHOR, Vec2::ZERO);
     let offset = vec2_prop(tree, node, PROP_CONTROL_OFFSET, Vec2::ZERO);
     let (w, h) = tuple2_prop(tree, node, PROP_CONTROL_SIZE, DEFAULT_CONTROL_SIZE);
 
-    ControlState::new(
+    let mut state = ControlState::new(
         [anchor.x, anchor.y, anchor.x, anchor.y],
         [offset.x, offset.y, offset.x + w, offset.y + h],
-    )
+    );
+    state.border_w = f32_prop(tree, node, "border_w", 1.0);
+    state
 }
 
 /// 翻转合成：把 `flip` 作为**子局部**后乘到世界矩阵上（`world ∘ scale(±1,±1)`）。

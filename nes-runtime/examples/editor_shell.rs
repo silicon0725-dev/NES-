@@ -16,6 +16,12 @@
 //! 操作：Tab 循环选择；方向键移动选中；Delete 删除子树；
 //! Ctrl+Z undo；Ctrl+Y redo。
 //!
+//! S12-5（Godot 观感起步）：① 拖拽同帧冲洗 —— 投影块读 world() 前先
+//! `refresh_transforms`（S12-4 选中框错位的根修：框/命中不再吃上一帧
+//! 缓存）；② 视口网格（"grid" 容器下的 1px 条带池，z=-100 垫底，
+//! 层级树跳过）；③ 选中框 accent 槽 + 2px 线宽 + z=100 垫顶；
+//! ④ 面板 Godot 命名（Scene / Inspector）；⑤ Ctrl 拖拽 8px 吸附。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -48,6 +54,15 @@ const STATUS_BAND: f32 = 24.0;
 
 /// 装配时开窗尺寸（客户区 (0,0) 的最小化帧沿用的"上次有效值"初值）。
 const OPEN_CLIENT: (u32, u32) = (768, 432);
+
+/// 视口网格间距（Godot 2D 编辑器的默认网格观感）。
+const GRID_SPACING: f32 = 32.0;
+/// 网格吸附步长（Godot 按住 Ctrl 拖动的取整直感）。
+const GRID_SNAP: f32 = 8.0;
+/// 网格条带池上限（竖条 + 横条共用一个池）：超大窗口下网格密度自适应
+/// 上限 —— 线条数超出池容量就少画几根，不动态扩池，控件数与提取/渲染
+/// 成本恒定有界（90 根 ≈ 1080p 中等窗口两方向都够用）。
+const GRID_POOL: usize = 90;
 
 /// 按压点（**视图空间**）是否落在控件矩形内 —— 与 UiVm 命中同一口径
 ///（`anchor * viewport + offset` + `size`，不可见即不参与命中）。宿主
@@ -150,9 +165,29 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input) = {
+    let (grid, grid_bars, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene) = {
         let tree = rt.tree_mut();
         let root = tree.root();
+        // 视口网格（S12-5 Godot 观感）：条带池 —— 竖条 1px 宽 × 视口高、
+        // 横条 1px 高 × 视口宽，fill_slot="border" 吃边框槽色，visible=false
+        // 备用（每帧投影按视口布线，见循环内网格段）。全部挂在 "grid" 容器
+        // 之下：层级树投影跳过该容器（网格是观感，不是可编辑对象，不进
+        // 行列表）。z_index 经 set_prop_raw 置 -100 —— Control 继承链
+        //（Control→Node）没有 z_index schema 键，而提取层 z_of 直读属性表；
+        // -100 压在精灵（z=0）与选中高亮（z=5）之下，网格永远垫底。
+        // 建在树前部（先于相机/精灵），双保险：同 z 时前序序也更早。
+        let grid = tree.add_node(root, "grid", NodeKind::Node);
+        let mut grid_bars = Vec::with_capacity(GRID_POOL);
+        for _ in 0..GRID_POOL {
+            let bar = tree.add_node(grid, "grid_bar", NodeKind::Control);
+            let _ = tree.set_prop(bar, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(bar, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 1.0)));
+            let _ = tree.set_prop(bar, "fill_slot", Value::Str("border".into()));
+            let _ = tree.set_prop(bar, "visible", Value::Bool(false));
+            tree.set_prop_raw(bar, "z_index", Value::I64(-100));
+            grid_bars.push(bar);
+        }
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
         tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
         let obj1 = tree.add_node(root, "obj1", NodeKind::Sprite2D);
@@ -192,10 +227,24 @@ fn main() {
         tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
         // 状态栏。
         // Selection indicator (Control border following primary selection).
+        // S12-5 Godot 化：边框换 accent 槽（Godot 2D 选中的浅蓝高亮）；
+        // 线宽 2px 经 set_prop_raw 写 border_w（S12-1 契约字段，schema 暂
+        // 未暴露该键 —— 提取层 control_state_of 已直读属性表，未写 = 缺省
+        // 1px）；z_index=100（同 set_prop_raw 通道）压过选中精灵的高亮
+        // z=5，选中框永远在最上层。
         let sel_box = tree.add_node(root, "sel_box", NodeKind::Control);
         tree.set_prop(sel_box, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
         tree.set_prop(sel_box, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-100.0, -100.0))).unwrap();
         tree.set_prop(sel_box, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(20.0, 20.0))).unwrap();
+        tree.set_prop(sel_box, "border_slot", Value::Str("accent".into())).unwrap();
+        tree.set_prop_raw(sel_box, "border_w", Value::F32(2.0));
+        tree.set_prop_raw(sel_box, "z_index", Value::I64(100));
+
+        // 左面板标题（S12-5 Godot 命名）：与右侧 Inspector 标题同款 Label。
+        // 左面板 x 恒定（MARGIN），位置装配期一次写定即可，无需每帧投影。
+        let hud_scene = tree.add_node(root, "hud_scene", NodeKind::Label);
+        tree.set_local(hud_scene, Transform2D::from_pos(MARGIN + 2.0, 12.0));
+        tree.set_prop(hud_scene, PROP_LABEL_TEXT, Value::Str("Scene".into())).unwrap();
 
         let hud_st = tree.add_node(root, "hud_st", NodeKind::Label);
         tree.set_local(hud_st, Transform2D::from_pos(8.0, 410.0));
@@ -210,7 +259,7 @@ fn main() {
         tree.set_prop(name_input, "text", Value::Str(String::new())).unwrap();
         tree.set_prop(name_input, "visible", Value::Bool(false)).unwrap();
         tree.apply_pending();
-        (cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input)
+        (grid, grid_bars, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -412,15 +461,24 @@ fn main() {
             }
         }
         // Gizmo 拖拽：鼠标移动 → 选中对象跟随（preview 直写，不入账）；
-        // 松开 → Inspector.modify_local 一次事务。
+        // 松开 → Inspector.modify_local 一次事务。按住 Ctrl 吸附 8px 栅格
+        //（S12-5：Godot 2D 的 Ctrl 拖动直感，状态栏 Ctrl=snap）—— 目标
+        // 位置取整到 GRID_SNAP 的整数倍，松开提交的也是已取整的终值。
         if let Some((ref uid, ox, oy)) = gizmo {
             if mouse_left_held {
                 // preview：直写树位置（会话态，微批次之外）。
+                let (tx, ty) = (mx - ox, my - oy);
+                let (tx, ty) = if snap.is_down("LCtrl") {
+                    (
+                        (tx / GRID_SNAP).round() * GRID_SNAP,
+                        (ty / GRID_SNAP).round() * GRID_SNAP,
+                    )
+                } else {
+                    (tx, ty)
+                };
                 let tree = rt.tree_mut();
                 if let Some(id) = tree.find_by_uid(uid) {
-                    let cur = tree.local(id).unwrap_or_default();
-                    tree.set_local(id, Transform2D::from_pos(mx - ox, my - oy));
-                    let _ = cur;
+                    tree.set_local(id, Transform2D::from_pos(tx, ty));
                 }
             } else {
                 // 松开：一次事务提交最终位置。
@@ -549,6 +607,15 @@ fn main() {
         let mut rebind_name: Option<String> = None;
         {
             let tree = rt.tree_mut();
+            // S12-5 错位根修（本帧同源）：Gizmo 拖拽的 set_local 只标脏
+            //（DIRTY_XFORM / DIRTY_SUBTREE），世界矩阵要等 simulate/tick
+            // 里的 refresh_transforms 才重算 —— 投影块此刻读 tree.world()
+            // 拿到的是**上一帧**缓存，选中框/命中恒落后一帧，快速拖动把
+            // 一帧之差积累成几十像素的可见错位。在一切 world() 读数之前
+            // 做一次引擎权威冲洗（增量式，只算脏子树，代价可忽略）：
+            // 框 / 命中 / 任何 world() 读数从此与拖拽写入同帧。这只是
+            // 宿主读数前的自取，不改 runtime/提取层的刷新时序（契约）。
+            tree.refresh_transforms();
             // 相机置中 = (cw/2, ch/2)：最大化/拖拽后世界视口吃中间
             // 剩余区域（面板不随窗口拉伸）。
             tree.set_local(cam, Transform2D::from_pos(viewport.0 / 2.0, viewport.1 / 2.0));
@@ -562,12 +629,60 @@ fn main() {
                 Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, viewport.1 - MARGIN - STATUS_BAND)));
             // 状态栏贴底：y = ch-20。
             tree.set_local(hud_st, Transform2D::from_pos(MARGIN, viewport.1 - 20.0));
+
+            // 视口网格布线（S12-5）：世界可视区 = 两侧面板之间的中间区域。
+            // 32px 间距、从视口原点（世界原点，相机恒等映射）对齐 —— 缩放
+            // 窗口时线条钉在世界坐标上不漂移。池条带竖条在前、横条在后
+            // 依次吃满；线条数超出池容量就少画几根（GRID_POOL 上限注释）；
+            // 落不进可视区的条带 visible=false 不画。控件是单级视口锚定，
+            // 直接写 offset/size（锚 (0,0) + 客户区坐标）。
+            let gx0 = MARGIN + LEFT_PANEL_W;
+            let gx1 = viewport.0 - INSPECTOR_W - 2.0 * MARGIN;
+            let gy0 = TOP_BAND;
+            let gy1 = viewport.1 - STATUS_BAND;
+            // 32 的整数倍里落在 [g0, g1) 的下标范围（可视区退化 = 0 根）。
+            let (mut nv, mut nh) = (0usize, 0usize);
+            let (mut v0, mut h0) = (0i64, 0i64);
+            if gx1 > gx0 && gy1 > gy0 {
+                v0 = (gx0 / GRID_SPACING).ceil() as i64;
+                let v1 = ((gx1 - 1.0) / GRID_SPACING).floor() as i64;
+                h0 = (gy0 / GRID_SPACING).ceil() as i64;
+                let h1 = ((gy1 - 1.0) / GRID_SPACING).floor() as i64;
+                nv = ((v1 - v0 + 1).max(0) as usize).min(GRID_POOL);
+                nh = ((h1 - h0 + 1).max(0) as usize).min(GRID_POOL - nv);
+            }
+            for (i, &bar) in grid_bars.iter().enumerate() {
+                if i < nv {
+                    // 竖条：x 钉在 32 的整数倍，纵贯可视区全高。
+                    let x = (v0 + i as i64) as f32 * GRID_SPACING;
+                    let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(x, gy0)));
+                    let _ = tree.set_prop(bar, PROP_CONTROL_SIZE,
+                        Value::Vec2(nes_scene::Vec2::new(1.0, gy1 - gy0)));
+                    let _ = tree.set_prop(bar, "visible", Value::Bool(true));
+                } else if i < nv + nh {
+                    // 横条：y 钉在 32 的整数倍，横贯可视区全宽。
+                    let y = (h0 + (i - nv) as i64) as f32 * GRID_SPACING;
+                    let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(gx0, y)));
+                    let _ = tree.set_prop(bar, PROP_CONTROL_SIZE,
+                        Value::Vec2(nes_scene::Vec2::new(gx1 - gx0, 1.0)));
+                    let _ = tree.set_prop(bar, "visible", Value::Bool(true));
+                } else {
+                    // 池内备用条带：熄灭（投影无状态，每帧重写一遍口径）。
+                    let _ = tree.set_prop(bar, "visible", Value::Bool(false));
+                }
+            }
+
             // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
             // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
             // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与
             // 行点击回调都按这份映射结算 —— 投影与交互同源。存活节点
             // 必有 uid（add_node 即发、walk 只访问存活节点），行与映射
             // 严格同长同序；无"悬垂行"可言（删除即整行消失）。
+            // S12-5：walk 跳过 "grid" 容器整棵子树 —— 网格条带不是可
+            // 编辑对象，不进行列表；过滤在 walk 单点做，行文本与行→uid
+            // 映射天然同源（同一次遍历产出，映射不会被网格节点污染）。
             let mut lines: Vec<String> = Vec::new();
             let mut row_map: Vec<Uid> = Vec::new();
             let sel_uids: Vec<Uid> = sel.uids().to_vec();
@@ -578,7 +693,11 @@ fn main() {
                 sel: &[Uid],
                 out: &mut Vec<String>,
                 map: &mut Vec<Uid>,
+                skip: nes_scene::NodeId,
             ) {
+                if id == skip {
+                    return; // 网格容器：观感节点整子树不进层级树。
+                }
                 let name = tree.name(id).unwrap_or("?");
                 let uid = tree.uid_of(id);
                 let mark = uid.as_ref().map(|u| sel.contains(u)).unwrap_or(false);
@@ -588,10 +707,10 @@ fn main() {
                     map.push(u);
                 }
                 for &c in tree.children(id) {
-                    walk(tree, c, depth + 1, sel, out, map);
+                    walk(tree, c, depth + 1, sel, out, map, skip);
                 }
             }
-            walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map);
+            walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, grid);
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
             let _ = tree.set_prop(hud_tree, "rows", Value::Str(lines.join("\n")));
@@ -613,7 +732,8 @@ fn main() {
             // Inspector View：选中节点数据投影（S12-4 ⑤：短文本 ——
             // 标题一行 + 选中信息另起，"(none)" = 无选中；不再整段
             // 倾倒 props —— 长行溢出表面右缘正是标题被裁的旧观感）。
-            let mut ins_text = String::from("INSPECTOR\n");
+            // S12-5 Godot 命名：标题统一为首字母大写的 "Inspector"。
+            let mut ins_text = String::from("Inspector\n");
             match sel.primary(tree) {
                 Some(p) => {
                     let name: String = tree.name(p).unwrap_or("?").chars().take(12).collect();
@@ -627,9 +747,9 @@ fn main() {
             // 随面板走 —— 修"标题被表面边缘裁剪"）。
             tree.set_local(hud_ins, Transform2D::from_pos(viewport.0 - INSPECTOR_W, 12.0));
 
-            // 状态栏。
+            // 状态栏（S12-5：文案补 Ctrl=snap —— Gizmo 拖拽的吸附提示）。
             let st = format!(
-                "st> undo:{} redo:{} sel:{} | Click=sel Shift+Click=multi Drag=box Arrows=move Del=del Ctrl+Z/Y=undo/redo",
+                "st> undo:{} redo:{} sel:{} | Click=sel Shift+Click=multi Drag=box Arrows=move Del=del Ctrl+Z/Y=undo/redo Ctrl=snap",
                 if log.can_undo() { "Y" } else { "-" },
                 if log.can_redo() { "Y" } else { "-" },
                 sel.len(),
@@ -741,5 +861,5 @@ fn main() {
         // 帧差以 Instant 实测进 FrameInfo（见循环头的 delta/elapsed）。
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene);
 }
