@@ -541,9 +541,16 @@ impl UiVm {
 
     /// 文本输入泵：字符插入 / Backspace 删除 / Enter 提交 / Esc 回滚。
     ///
-    /// - 字符：[`InputView::text`] 的 Unicode 标量值逐个插入光标处；
-    ///   P0 只收 ASCII 可打印（`0x20..=0x7E`），非 ASCII 忽略。
-    /// - Backspace（按下沿）：删光标前一字符。
+    /// - 字符：[`InputView::text`] 的 UTF-16 码元流逐单元解码，**全部
+    ///   非控制 Unicode 标量**插入光标处（IME 第 1 期 —— 中文/全角/
+    ///   假名可入草稿）：控制码 `0x00..=0x1F` 与 `0x7F` 丢弃；代理对
+    ///   （高 `0xD800..=0xDBFF` + 紧随低 `0xDC00..=0xDFFF`）合成一个
+    ///   标量、光标只 +1；孤立低代理与流尾悬挂高代理丢弃（`text` 是
+    ///   一次性当帧批 —— `InputCollector::frame()` 用 `mem::take` 取走
+    ///   即清、本 VM 无跨帧文本缓存，低代理落在下一帧时高代理已不可
+    ///   寻；真实窗口里 WM_CHAR 代理对背靠背投递，同帧到达是常态）。
+    /// - Backspace（按下沿）：删光标前一**字符**（非字节 —— 草稿是
+    ///   String 按字节索引，经 [`char_bound`] 换算字符边界）。
     /// - Enter（按下沿）：提交草稿整体值（经 [`UiVm::on_commit`]），
     ///   焦点保留、会话继续。
     /// - Escape（按下沿）：回滚 —— 草稿 := 节点 `text` 已提交值。
@@ -567,14 +574,46 @@ impl UiVm {
         {
             let mut states = self.states.borrow_mut();
             if let Some(ts) = states.texts.get_mut(&node) {
-                // 字符插入（P0：ASCII 可打印，非 ASCII 忽略）。
-                for cp in input.text() {
-                    if (0x20..=0x7E).contains(&cp) {
-                        let ch = char::from_u32(cp).unwrap_or('?');
-                        let byte_idx = char_bound(&ts.draft, ts.caret);
-                        ts.draft.insert(byte_idx, ch);
-                        ts.caret += 1;
+                // 字符插入（IME 第 1 期：UTF-16 码元流 -> 全部非控制标量；
+                // 契约细节见本方法 doc）。
+                let stream = input.text();
+                let mut i = 0usize;
+                while i < stream.len() {
+                    let cp = stream[i];
+                    let scalar = if (0xD800..=0xDBFF).contains(&cp) {
+                        match stream
+                            .get(i + 1)
+                            .copied()
+                            .filter(|lo| (0xDC00..=0xDFFF).contains(lo))
+                        {
+                            Some(lo) => {
+                                i += 2;
+                                // 合成公式恒落 0x10000..=0x10FFFF ——
+                                // from_u32 必 Some（unwrap 口径见下）。
+                                char::from_u32(
+                                    0x1_0000 + ((cp - 0xD800) << 10) + (lo - 0xDC00),
+                                )
+                            }
+                            None => {
+                                i += 1; // 流尾悬挂高代理：丢弃（见 doc）。
+                                None
+                            }
+                        }
+                    } else if (0xDC00..=0xDFFF).contains(&cp) {
+                        i += 1; // 孤立低代理：非法序，丢弃。
+                        None
+                    } else {
+                        i += 1;
+                        char::from_u32(cp)
+                    };
+                    let Some(ch) = scalar else { continue };
+                    // 控制码丢弃（C0 与 DEL；代理合成 ≥0x10000 恒不中）。
+                    if (ch as u32) <= 0x1F || ch as u32 == 0x7F {
+                        continue;
                     }
+                    let byte_idx = char_bound(&ts.draft, ts.caret);
+                    ts.draft.insert(byte_idx, ch);
+                    ts.caret += 1;
                 }
                 // Backspace：删除光标前一字符（按下沿）。
                 let bs = key_down(input, "Backspace", "backspace");

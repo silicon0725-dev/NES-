@@ -227,6 +227,13 @@ const INS_LINE_CHARS: usize = 11;
 /// 输入框/面板内容的水平内衬。
 const INSPECTOR_INSET: f32 = 6.0;
 
+/// IME 组合窗锚点的框内内衬（像素，x/y 同值 —— 单行输入框的 P0 近似）。
+const IME_CARET_INSET: f32 = 4.0;
+/// IME 光标近似步进（px/字符）：中英混排平均取 10 —— 等宽点阵英文
+/// 16px / 全宽中文的真实步进需要渲染器字形度量，归渲染集成期；P0
+/// 只求候选窗"落在输入框附近"（见帧循环接线注）。
+const IME_AVG_ADVANCE: f32 = 10.0;
+
 /// 装配时开窗尺寸（客户区 (0,0) 的最小化帧沿用的"上次有效值"初值）。
 const OPEN_CLIENT: (u32, u32) = (768, 432);
 
@@ -1114,9 +1121,11 @@ fn main() {
     const TRANSIENT_LIMIT: u64 = 120;
     // 运行态取证（S12-9 冒烟钩子，帧 176 采样 —— 见循环内注）：
     // spin 节点位移（> 0 = 脚本在运行态真实驱动过）与工具栏 PLAY 文本
-    //（运行中应为 "PLAY*"）。
+    //（运行中应为 "PLAY*"）。IME 第 1 期：帧 214 采样改名框草稿
+    //（Char(0x4E2D) 注入后应为 "obj1中" —— Unicode 泵端到端取证）。
     let mut demo_spin_x = 0.0f32;
     let mut demo_play_text = String::new();
+    let mut demo_ime_draft = String::new();
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -1195,6 +1204,17 @@ fn main() {
                 182 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 190 => inject_input(InputEvent::Key { key: Key::U, down: true }),
                 192 => inject_input(InputEvent::Key { key: Key::U, down: false }),
+                // IME 第 1 期冒烟（真人在改名框打中文留人工 —— 自动化只
+                // 钉"Unicode 字符入草稿"链路）：点击改名输入框（768x432
+                // 客户区、obj1 选中、Transform 组展开：offset = (568,112)
+                // 尺寸 (178,20)，取 (600,120)）夺焦 → 注入 Char(0x4E2D)
+                //（'中'，走 inject_input 同队列通道 = WM_CHAR 直投口径，
+                // 不经系统 IME 合成 —— 与环境键盘布局无关，t_in_01 同款
+                // 确定性）→ 帧 214 取证草稿。
+                200 => inject_input(InputEvent::MouseMove { x: 600.0, y: 120.0 }),
+                202 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                204 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                210 => inject_input(InputEvent::Char(0x4E2D)),
                 _ => {}
             }
         }
@@ -1241,6 +1261,13 @@ fn main() {
             if let Some(spin) = tree.find_by_name("spin") {
                 demo_spin_x = tree.local(spin).unwrap_or_default().pos.x;
             }
+        }
+        if demo && index == 214 {
+            demo_ime_draft = rt
+                .ui_vm_mut()
+                .text_state(name_input)
+                .map(|t| t.draft)
+                .unwrap_or_default();
         }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
         // 运行态（S12-9）：编辑交互整体让路 —— Tab 循环也一样。
@@ -2222,6 +2249,37 @@ fn main() {
             rt.ui_vm_mut().reset_text(name_input, &name);
         }
 
+        // IME 组合窗定位（第 1 期）：改名输入框**持焦且可见**的帧，把
+        // 候选窗钉到近似光标位（客户区坐标）。近似公式（P0）：输入框
+        // 视口位 + 4px 内衬 + 光标字符数 × 10px 平均步进 —— 本壳默认
+        // 开窗 768x432 客户区==视口 1:1，公式按 1:1 直算；窗口缩放后
+        // 有偏差（准确步进与缩放折算归渲染集成期）。失焦/不可见帧
+        // **不调** —— IME 窗停在系统默认位（定位是持焦期间的宿主责任）。
+        if rt.ui_vm_mut().focus() == Some(name_input) {
+            let (visible, ox, oy) = {
+                let tree = rt.tree_mut();
+                let visible = tree
+                    .prop(name_input, "visible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let (ox, oy) = match tree.prop(name_input, PROP_CONTROL_OFFSET) {
+                    Some(Value::Vec2(v)) => (v.x, v.y),
+                    _ => (0.0, 0.0),
+                };
+                (visible, ox, oy)
+            };
+            if visible {
+                let caret = rt
+                    .ui_vm_mut()
+                    .text_state(name_input)
+                    .map(|t| t.caret)
+                    .unwrap_or(0);
+                let x = (ox + IME_CARET_INSET + caret as f32 * IME_AVG_ADVANCE) as i32;
+                let y = (oy + IME_CARET_INSET) as i32;
+                rt.imm_set_caret_point(x, y);
+            }
+        }
+
         let _ = rt.emit_input_signals(&snap);
         let frame = FrameInfo::new(index, delta, elapsed, Vec2::new(viewport.0, viewport.1));
         // S12-9 帧循环分叉：运行态把观察者从 NoObserver 换成 ScriptVm
@@ -2424,6 +2482,10 @@ fn main() {
         assert!(has("reset"), "reset log missing: {lines:?}");
         assert!(demo_spin_x > 0.0, "脚本未在运行态驱动（spin.x={demo_spin_x}）");
         assert_eq!(demo_play_text, "PLAY*", "运行中 PLAY 文本应为 PLAY*");
+        // IME 第 1 期：Char(0x4E2D) 端到端 —— inject_input（WM_CHAR 口径）
+        // → 快照 → SnapshotView → UiVm Unicode 泵 → 草稿 "obj1中"（光标
+        // 5，不属断言面但同源）。
+        assert_eq!(demo_ime_draft, "obj1中", "IME Char(0x4E2D) 未入改名框草稿：{demo_ime_draft:?}");
         {
             let tree = rt.tree_mut();
             let spin = tree.find_by_name("spin").expect("spin 节点存活（uid/NodeId 不动）");

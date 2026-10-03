@@ -23,6 +23,7 @@
 
 use core::ffi::c_void;
 use core::ptr;
+use std::cell::Cell;
 use std::sync::Mutex;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
@@ -180,6 +181,20 @@ struct MinMaxInfo {
     pt_max_track_size: Point,
 }
 
+/// `COMPOSITIONFORM`（imm32 `ImmSetCompositionWindow` 的入参；C 布局
+/// u32 + POINT + RECT，对齐 4，x64 无填充）。本引擎只用 `CFS_POINT`：
+/// `pt_current_pos` 是组合窗（预编辑/候选窗）的客户区锚点，`rc_area`
+/// 该风格下不消费（零值占位）。
+#[repr(C)]
+struct CompositionForm {
+    dw_style: u32,
+    pt_current_pos: Point,
+    rc_area: Rect,
+}
+
+/// `CFS_POINT`：组合窗按点定位（客户区坐标）。
+const CFS_POINT: u32 = 0x0002;
+
 #[repr(C)]
 struct WndClassW {
     style: u32,
@@ -226,6 +241,20 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+}
+
+// ---- IME 组合窗定位（第 1 期；imm32 隐式链接 —— 系统 DLL，与 user32/
+// kernel32 同先例，非第三方 crate 依赖）。HIMC = 输入法上下文句柄。----
+#[link(name = "imm32")]
+extern "system" {
+    /// 取窗口当前关联的输入法上下文（无关联/无 IME 环境 = null）。
+    fn ImmGetContext(hwnd: *mut c_void) -> *mut c_void;
+    /// 释放 [`ImmGetContext`] 取到的上下文（配对调用）。
+    fn ImmReleaseContext(hwnd: *mut c_void, himc: *mut c_void) -> i32;
+    /// 设置组合窗形态（[`CompositionForm`]）。
+    fn ImmSetCompositionWindow(himc: *mut c_void, form: *const CompositionForm) -> i32;
+    /// 关联/解除窗口的输入法上下文，返回**先前**的上下文句柄。
+    fn ImmAssociateContext(hwnd: *mut c_void, himc: *mut c_void) -> *mut c_void;
 }
 
 /// 窗口过程：销毁 → 投递退出消息；输入消息 → 中性事件入队（S7.2，
@@ -291,7 +320,9 @@ fn min_window_outer_size() -> Point {
 ///
 /// lparam 打包口径：鼠标 x/y 各 16 位有符号（客户区像素，多显示器可
 /// 为负）；WM_SIZE 宽高各 16 位无符号。WM_CHAR 的 wparam 是 UTF-16
-/// 单元原码（代理对重组属后续，见 S7.2 文档遗留）。
+/// 单元原码，**原样入队**：代理对重组在消费侧完成（运行时快照读面
+/// `char::decode_utf16` 与场景层 UiVm 泵配对，IME 第 1 期）—— 平台层
+/// 只投递事实（"WM_CHAR 不是引擎 API"纪律不变）。
 fn input_event_of(msg: u32, wparam: usize, lparam: isize) -> Option<InputEvent> {
     let lo = (lparam & 0xFFFF) as u16;
     let hi = ((lparam >> 16) & 0xFFFF) as u16;
@@ -336,6 +367,11 @@ pub struct Window {
     hwnd: *mut c_void,
     hinstance: *mut c_void,
     class_name: Vec<u16>,
+    /// `imm_associate(false)` 停用前的上下文句柄（`ImmAssociateContext`
+    /// 的返回值），`imm_associate(true)` 用它还原；`None` = 从未停用。
+    /// `Cell` 纪律：本类型的全部 FFI 调用都在开窗线程（帧循环）发生，
+    /// 不跨线程共享（`&self` API 需要内部可变性）。
+    ime_saved_ctx: Cell<Option<usize>>,
 }
 
 impl Window {
@@ -412,6 +448,7 @@ impl Window {
             hwnd,
             hinstance,
             class_name,
+            ime_saved_ctx: Cell::new(None),
         };
         let _ = window.pump();
         Ok(window)
@@ -440,6 +477,52 @@ impl Window {
             return (0, 0);
         }
         ((rect.right - rect.left).max(0) as u32, (rect.bottom - rect.top).max(0) as u32)
+    }
+
+    /// 把 IME 组合窗（预编辑/候选窗）锚到**客户区**指定点（IME 第 1 期）：
+    /// `ImmGetContext` → `COMPOSITIONFORM{CFS_POINT, (x, y)}` →
+    /// `ImmSetCompositionWindow` → `ImmReleaseContext`（取/放配对）。
+    ///
+    /// 无输入法上下文（裸英文键盘环境 `ImmGetContext` 返回 null）时静默
+    /// 返回 —— 定位是"有 IME 就跟手、没有就无事发生"的软契约；设置
+    /// 失败同样不报错（下一帧宿主还会再调，瞬态失败自愈）。
+    pub fn imm_set_caret_point(&self, x: i32, y: i32) {
+        // SAFETY: hwnd 存活；form 是栈上合法入参；取/放上下文配对。
+        unsafe {
+            let himc = ImmGetContext(self.hwnd);
+            if himc.is_null() {
+                return; // 无 IME 上下文：静默（见方法注）。
+            }
+            let form = CompositionForm {
+                dw_style: CFS_POINT,
+                pt_current_pos: Point { x, y },
+                rc_area: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+            };
+            ImmSetCompositionWindow(himc, &form);
+            ImmReleaseContext(self.hwnd, himc);
+        }
+    }
+
+    /// 启/停本窗口的 IME 关联（`ImmAssociateContext`）。停用时记下系统
+    /// 返回的先前上下文，启用时用它还原（`None` = 从未停用，启用是
+    /// no-op —— 系统缺省本就关联）。
+    ///
+    /// **默认保持启用不动**：装配路径从不调用本方法；P0 只提供 API，
+    /// 编辑器侧不做按焦点启停（改名框失焦是否要临时关 IME 归后续
+    /// 里程碑裁决）。
+    pub fn imm_associate(&self, enable: bool) {
+        // SAFETY: hwnd 存活；停用/还原句柄都来自系统自身（NULL 或先前
+        // 返回值），不引入悬垂。
+        unsafe {
+            if enable {
+                if let Some(saved) = self.ime_saved_ctx.take() {
+                    ImmAssociateContext(self.hwnd, saved as *mut c_void);
+                }
+            } else if self.ime_saved_ctx.get().is_none() {
+                let prev = ImmAssociateContext(self.hwnd, ptr::null_mut());
+                self.ime_saved_ctx.set(Some(prev as usize));
+            }
+        }
     }
 
     /// 泵一轮消息。返回 `false` 表示窗口已关闭（收到退出消息），宿主应停止帧循环。

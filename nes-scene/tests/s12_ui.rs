@@ -8,12 +8,13 @@
 //! | T-UI-03 | UiVm 状态机：视口锚定命中（前序最后者胜）、悬停/按下、抬键命中激活、移出释放不激活 |
 //! | T-UI-04 | 瞬态不入指纹：update 前后 scene_fingerprint 逐位相同（§3.3 裁决） |
 //! | T-UI-05 | 焦点路由（S12-2）：点击 TextInput 夺焦、Tab 按场景序轮转、点空白失焦；Button 失焦零提交（无编辑会话不伪造载荷） |
-//! | T-UI-06 | 文本输入状态机：字符插入光标处（P0 仅 ASCII 可打印）、Backspace 删前一字符 |
+//! | T-UI-06 | 文本输入状态机：字符插入光标处（Unicode：全部非控制标量，IME 第 1 期）、Backspace 删前一字符 |
 //! | T-UI-07 | 草稿语义：Enter 提交整体值（经回调、不直写属性）、Esc 回滚、失焦提交、空/非法处理 |
 //! | T-UI-08 | 文本瞬态（草稿/光标）不入语义指纹 |
 //! | T-UI-09 | 鼠标点击 TextInput 获焦回归：FakeInput 点击输入框矩形 -> focus()+focused 态 -> focused/草稿/光标经 states_rc 共享面换档进提取层（下游 T-WID-06 消费） |
 //! | T-UI-10 | 获焦初始化（S12-4）：点击与 Tab 两路径草稿一律 = text 属性值、光标 = 末尾（focus_node 单点实现；宿主换绑后的新值也跟） |
 //! | T-UI-11 | reset_text（S12-4）：置草稿=值、光标=尾、不动焦点、不触发 on_commit；持焦会话中原地替换，后续编辑落在新草稿上 |
+//! | T-UI-12 | IME Unicode 泵（第 1 期）：CJK/全角/假名直入草稿、代理对合一个标量（光标 +1）、控制码与孤立/悬挂代理丢弃、Backspace 整字删除 |
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -303,8 +304,8 @@ fn t_ui_05_focus_routing() {
     assert!(commits.borrow().is_empty(), "Button 失焦不发 on_commit");
 }
 
-/// T-UI-06：文本输入状态机 —— 字符插入光标处（P0 仅 ASCII 可打印，
-/// 非 ASCII 忽略）、Backspace 删前一字符。
+/// T-UI-06：文本输入状态机 —— 字符插入光标处（IME 第 1 期 Unicode
+/// 契约：全部非控制标量照收，含非 ASCII）、Backspace 删前一字符。
 /// 左/右光标移动：P0 可选缺口，本版未实现（见 ui.rs 泵注释）。
 #[test]
 fn t_ui_06_typing_backspace_caret() {
@@ -327,18 +328,100 @@ fn t_ui_06_typing_backspace_caret() {
     input.clear_text();
     assert_eq!(vm.text_state(in1), Some(TextState { draft: "abc".into(), caret: 3 }));
 
-    // 非 ASCII 忽略，ASCII 照收：得到 "abcx"。
-    input.set_text(vec![0xE9, 'x' as u32]); // 0xE9 = é，非法（P0）
+    // 非 ASCII 照收（旧 P0 口径"仅 0x20..=0x7E"已放开）：0xE9 = é。
+    input.set_text(vec![0xE9]);
     frame(&mut vm);
     input.clear_text();
-    assert_eq!(vm.text_state(in1), Some(TextState { draft: "abcx".into(), caret: 4 }));
+    assert_eq!(vm.text_state(in1), Some(TextState { draft: "abcé".into(), caret: 4 }));
 
-    // Backspace：删光标前一字符（按下沿一次）。
+    // Backspace：删光标前一字符（按下沿一次）—— é 整字删除。
     input.set_key("backspace", true);
     frame(&mut vm);
     input.set_key("backspace", false);
     frame(&mut vm);
     assert_eq!(vm.text_state(in1), Some(TextState { draft: "abc".into(), caret: 3 }));
+}
+
+/// T-UI-12：IME Unicode 泵（第 1 期）—— 中文/全角/假名直入草稿、
+/// 代理对合成一个标量、控制码与孤立/悬挂代理丢弃、Backspace 整字
+/// 删除（多字节字符一刀切一字符，不撕 UTF-8 序列）。
+#[test]
+fn t_ui_12_unicode_ime_pump() {
+    let (t, _btn, in1, _in2) = widgets_scene();
+    let input = FakeInput::default();
+    let mut vm = UiVm::new();
+    vm.set_input_view(Rc::new(input.clone()));
+    let frame = |vm: &mut UiVm| vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+
+    // 点击夺焦（空草稿，光标 0）。
+    input.set((240.0, 130.0), true);
+    frame(&mut vm);
+    input.set((240.0, 130.0), false);
+    frame(&mut vm);
+    assert_eq!(vm.text_state(in1), Some(TextState { draft: String::new(), caret: 0 }));
+
+    // CJK：0x4E2D（'中'）入草稿，光标 +1。
+    input.set_text(vec![0x4E2D]);
+    frame(&mut vm);
+    input.clear_text();
+    assert_eq!(vm.text_state(in1), Some(TextState { draft: "中".into(), caret: 1 }));
+
+    // 代理对 (0xD83D, 0xDE00) = 😀（U+1F600）：合成一个标量，光标 +1
+    // 而非 +2（一次提交 = 一个字符）。
+    input.set_text(vec![0xD83D, 0xDE00]);
+    frame(&mut vm);
+    input.clear_text();
+    let st = vm.text_state(in1).unwrap();
+    assert_eq!(st.draft, "中\u{1F600}", "代理对按公式合成标量");
+    assert_eq!(st.draft.chars().count(), 2, "草稿按字符计");
+    assert_eq!(st.caret, 2, "合成标量光标只 +1");
+
+    // 全角/假名（BMP 非 ASCII）同收：全角空格 U+3000、あ U+3042。
+    input.set_text(vec![0x3000, 0x3042]);
+    frame(&mut vm);
+    input.clear_text();
+    assert_eq!(vm.text_state(in1).unwrap().caret, 4, "BMP 非 ASCII 全收");
+
+    // 控制码丢弃：0x00..=0x1F（含 0x01/0x1F）与 0x7F（DEL）零消费。
+    input.set_text(vec![0x01, 0x1F, 0x7F]);
+    frame(&mut vm);
+    input.clear_text();
+    assert_eq!(vm.text_state(in1).unwrap().caret, 4, "控制码不入草稿");
+
+    // 流尾悬挂高代理：丢弃（text 是一次性当帧批，跨帧不拼 —— 见泵注）。
+    input.set_text(vec![0xD83D]);
+    frame(&mut vm);
+    input.clear_text();
+    assert_eq!(vm.text_state(in1).unwrap().caret, 4, "悬挂高代理丢弃");
+
+    // 孤立低代理：非法序，丢弃。
+    input.set_text(vec![0xDE00]);
+    frame(&mut vm);
+    input.clear_text();
+    assert_eq!(vm.text_state(in1).unwrap().caret, 4, "孤立低代理丢弃");
+
+    // Backspace 整字删除：删 あ（3 字节一字符），草稿不撕字节序列。
+    input.set_key("backspace", true);
+    frame(&mut vm);
+    input.set_key("backspace", false);
+    frame(&mut vm);
+    let st = vm.text_state(in1).unwrap();
+    assert_eq!(st.caret, 3, "光标随整字删除回退");
+    assert_eq!(st.draft, "中\u{1F600}\u{3000}", "删的是最后一字符（非一字节）");
+
+    // Enter 提交 Unicode 草稿整体值（IME 输入走完 提交 链）。
+    let commits = Rc::new(RefCell::new(Vec::new()));
+    let sink = commits.clone();
+    vm.on_commit(move |n, v| sink.borrow_mut().push((n, v)));
+    input.set_key("enter", true);
+    frame(&mut vm);
+    input.set_key("enter", false);
+    frame(&mut vm);
+    assert_eq!(
+        *commits.borrow(),
+        vec![(in1, Value::Str("中\u{1F600}\u{3000}".into()))],
+        "Unicode 草稿整体提交"
+    );
 }
 
 /// T-UI-07：草稿语义 —— Enter 提交整体值（经 on_commit 回调、不直写
