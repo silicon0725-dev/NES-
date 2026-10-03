@@ -9,3 +9,4 @@ wgpu-win/lib/*.dll.a
 # 临时文件
 *.tmp
 .mimosa/
+nes-media/avi_probe_out/
