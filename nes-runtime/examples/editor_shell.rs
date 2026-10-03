@@ -50,6 +50,19 @@
 //! F 键不产生文本、且 Key 契约未列举 F 键 —— 平台层保留原码为
 //! `Key::Other(vk)`，按码比对（见 VK_F5.. 注）。
 //!
+//! S12-8（文件系统 dock，Godot 左下 res:// 面板）：左栏从单段 Scene
+//! 扩成 Godot 式上下两段 —— 上 **Scene**（既有层级树投影）+ 4px
+//! border 分隔条 + 下 **FileSystem**（"res:/" 标题 + 资产树 ListView，
+//! 复用控件）。数据面 = 通用递归资产扫描（scan_scripts 先例的推广，
+//! 每 60 帧 + F5；目录优先字典序、白名单后缀、隐藏项跳过、两层封顶）。
+//! 交互（Godot 惯例）：行单击选中（selected 行高亮投影）；双击分派
+//! —— .ron 场景 = Output 提示（场景打开归 play-in-editor 里程碑，P0
+//! 不实现）、.nes = 直接挂载（与 Inspector Enter 同一 mount_script
+//! 事务）、目录/其余后缀提示。UiVm 行回调只有单击沿，双击由宿主
+//! 会话态合成（同行 <30 帧两次点击）。单击 .nes 顺手指为 F6 候选
+//! 起点 —— FileSystem 与 Inspector 两处入口同一挂载流。F9 切换两段
+//! 分割档（焦点段占大头；P0 不做拖拽，比例是会话态不进树）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -58,7 +71,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
-use nes_render_api::input::{InputEvent, Key};
+use nes_render_api::input::{InputEvent, Key, MouseButton};
 use nes_render_api::{FrameInfo, Vec2};
 use nes_render_extract::{PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE};
 use nes_render_wgpu::window::inject_input;
@@ -92,12 +105,38 @@ const DOCK_H: f32 = 96.0;
 /// dock 日志行行高（与 ListView `row_h` 同值；渲染器行 y = 矩形顶
 /// +4 + i*row_h，故可见行数 = (列表高-4) / 18 向下取整 = 4 行）。
 const DOCK_ROW_H: f32 = 18.0;
-/// 编辑器日志环形保留行数（新行在下，满 8 丢最旧 —— Godot Output
-/// 的最小语义；可见窗只放最新能放下的几行，最新行永远可见）。
-const EDITOR_LOG_KEEP: usize = 8;
+/// 编辑器日志环形保留行数（新行在下，满 N 丢最旧 —— Godot Output
+/// 的最小语义；可见窗只放最新能放下的几行，最新行永远可见）。S12-8
+/// 起 12 行：冒烟钩子要同时断言 Enter 与 FileSystem 双击**两条挂载
+/// 路径**的日志（一轮流程恰好 12 行，早期行不再被新行挤出断言窗；
+/// dock 可见窗仍只显最新几行，显示面不变）。
+const EDITOR_LOG_KEEP: usize = 12;
 /// dock 行显示截宽（字符数）：40 字 × 16px advance = 640px，最小窗
 /// 768 下 dock 内衬（≈748px）也放得下，行尾不裁字。
 const DOCK_LINE_CHARS: usize = 40;
+
+/// 文件系统 dock（S12-8，Godot 左下 res:// 面板）布局常量：
+/// - 分隔条厚度（4px border 槽条）与标题行高（"res:/" 16px 文本行）；
+/// - P0 布局裁决：**固定分割 + F9 两档** —— 不做拖拽，F9 在
+///   "Scene 55% / FileSystem 40%" 与 "Scene 40% / FileSystem 55%"
+///   两档间切换（焦点段占大头）；比例是编辑器会话态，不进树。
+const FS_SEP_H: f32 = 4.0;
+/// FileSystem 标题行高（"res:/" 一行 16px，与默认文本行高同口径）。
+const FS_TITLE_H: f32 = 16.0;
+/// Scene / FileSystem 分割比（上段 = Scene；F9 切到 ALT 档）。
+const FS_SPLIT_TOP: f32 = 0.55;
+const FS_SPLIT_ALT: f32 = 0.40;
+/// fs 列表行高（与 dock 行高同值；行 y = 列表顶 +4 + i*row_h）。
+const FS_ROW_H: f32 = 18.0;
+/// 资产扫描深度（P0 两层条目：根一层 + 子目录一层）。
+const FS_SCAN_DEPTH: usize = 2;
+/// 资产白名单后缀（`.` 隐藏项与无后缀垃圾一律不进树）。
+const FS_EXT_WHITELIST: [&str; 6] = ["nes", "bmp", "png", "ron", "ttf", "txt"];
+/// 双击裁决窗（帧）：同行两次行点击报告沿间隔 <30 帧 = 双击。UiVm
+/// 行回调只有单击 —— 双击是宿主会话态的边沿合成（60fps 下 <0.5s，
+/// 与鼠标双击时长同量级；行回调沿 = 抬键沿，与按下沿间隔至差一帧，
+/// 同一裁决口径）。
+const FS_DBLCLICK_FRAMES: u64 = 30;
 
 /// 2D 标尺条带厚度（Godot 2D 视口顶横/左竖刻度尺观感）。
 const RULER_W: f32 = 16.0;
@@ -123,7 +162,7 @@ const TOOLBAR_BTN_W: f32 = 48.0;
 const TOOLBAR_BTN_H: f32 = 20.0;
 const TOOLBAR_BTN_STEP: f32 = 52.0;
 
-/// F5/F6/F7 的 Win32 虚拟键码。Key 契约未列举 F 键 —— 平台层把未列举
+/// F5/F6/F7/F9 的 Win32 虚拟键码。Key 契约未列举 F 键 —— 平台层把未列举
 /// 虚拟键原样保留为 `Key::Other(原码)`（vk_to_key 兜底分支），边缘
 /// 检测直接按 `Key::Other(VK_*)` 比对 pressed 集。选 F 键有个工程
 /// 理由：F 键不产生 WM_CHAR 文本 —— 与改名输入框的键入天然无冲突
@@ -131,6 +170,8 @@ const TOOLBAR_BTN_STEP: f32 = 52.0;
 const VK_F5: u32 = 0x74;
 const VK_F6: u32 = 0x75;
 const VK_F7: u32 = 0x76;
+/// F9：左栏 Scene/FileSystem 分割档切换（S12-8，两档见 FS_SPLIT_*）。
+const VK_F9: u32 = 0x78;
 
 /// 脚本候选池自动刷新周期（帧）：std::fs::read_dir 每帧调用 = 每帧
 /// 一次目录枚举 + 若干次分配，60fps 下纯属浪费。裁决：**每 60 帧
@@ -191,24 +232,107 @@ fn press_in_control(
 /// [`EDITOR_LOG_KEEP`] 行，新行在下、满员丢最旧。引擎没有结构化
 /// 日志通道，undo/redo/选择/删除/改名/拖移这些编辑器事件在各自
 /// 落账点就地推一行（Godot Output dock 的最小等价物）。
-/// 扫描资产根下 `Scripts/*.nes`（F-4 挂载候选池）：返回**资产根相对
-/// 路径**（`Scripts/blink.nes` —— registry_key 的落账口径，与游戏
-/// 路径 `read(assets_root.join(rel))` 同一相对系）。文件名排序保证
-/// F6 轮换顺序稳定；目录不存在/不可读 = 空池（如实，不猜）。
-fn scan_scripts(root: &Path) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(root.join("Scripts")) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("nes") {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    out.push(format!("Scripts/{name}"));
-                }
-            }
+/// 文件系统 dock 的一个资产条目（S12-8）：`rel` = 资产根相对路径
+///（正斜杠分隔，`Scripts/blink.nes` —— registry_key 落账口径，与游戏
+/// 路径 `read(assets_root.join(rel))` 同一相对系；目录条目尾带 `/`）；
+/// `is_dir` 目录/文件；`depth` = 相对根的层级（根条目 0）—— 行缩进
+/// 由它推导。
+struct FsEntry {
+    rel: String,
+    is_dir: bool,
+    depth: usize,
+}
+
+/// 递归扫描资产根（FileSystem 树数据面 + F-4 脚本候选池的**同一数据
+/// 源**，scan_scripts 先例的推广）：每层目录优先、目录/文件各自字典
+/// 序；文件按白名单后缀过滤（[`FS_EXT_WHITELIST`]），`.` 开头隐藏项
+///（.mimosa 等）与无后缀垃圾一律跳过；深度 [`FS_SCAN_DEPTH`] 封顶
+///（P0 两层：根 + 子目录一层）。目录不存在/不可读 = 空列表（如实，
+/// 不猜）。返回的相对路径直接就是挂载/打开口径（无需再拼前缀）。
+fn scan_assets(root: &Path) -> Vec<FsEntry> {
+    let mut out: Vec<FsEntry> = Vec::new();
+    scan_assets_dir(root, "", 0, &mut out);
+    out
+}
+
+/// [`scan_assets`] 的单层实现：`rel_prefix` = 相对资产根的目录前缀
+///（`Scripts/`，空串 = 根）；`level` = 当前层级（根 = 0）。
+fn scan_assets_dir(root: &Path, rel_prefix: &str, level: usize, out: &mut Vec<FsEntry>) {
+    let dir = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix)
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return; // 目录不存在/不可读：该层如实为空。
+    };
+    let (mut dirs, mut files): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for e in rd.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue; // 非 UTF-8 名：面板行文本是 UTF-8 口径，跳过。
+        };
+        if name.starts_with('.') {
+            continue; // 隐藏项（.mimosa 等）不进树。
+        }
+        let p = e.path();
+        if p.is_dir() {
+            dirs.push(name);
+        } else if p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| FS_EXT_WHITELIST.contains(&x))
+        {
+            files.push(name);
         }
     }
-    out.sort();
-    out
+    dirs.sort();
+    files.sort();
+    for d in dirs {
+        let prefix = format!("{rel_prefix}{d}/");
+        out.push(FsEntry {
+            rel: prefix.clone(),
+            is_dir: true,
+            depth: level,
+        });
+        if level + 1 < FS_SCAN_DEPTH {
+            scan_assets_dir(root, &prefix, level + 1, out);
+        }
+    }
+    for f in files {
+        out.push(FsEntry {
+            rel: format!("{rel_prefix}{f}"),
+            is_dir: false,
+            depth: level,
+        });
+    }
+}
+
+/// fs 行文本：每层两空格缩进 + 基名（目录尾带 `/`）—— Godot res://
+/// 树的缩进直感，行文本经默认字体等宽渲染。
+fn fs_row_text(e: &FsEntry) -> String {
+    let name = base_name(e.rel.trim_end_matches('/'));
+    let indent = "  ".repeat(e.depth);
+    if e.is_dir {
+        format!("{indent}{name}/")
+    } else {
+        format!("{indent}{name}")
+    }
+}
+
+/// 脚本候选池 = 扫描结果中的全部 .nes（资产根相对路径）—— 与 res://
+/// 树同一数据源：FileSystem 选中的 .nes 必在池内（F6 候选起点裁决的
+/// 前提），两处入口看到同一个资产世界。
+fn script_pool(entries: &[FsEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| !e.is_dir && e.rel.ends_with(".nes"))
+        .map(|e| e.rel.clone())
+        .collect()
+}
+
+/// 相对路径后缀（不含点；无后缀 = 空串）—— 双击分派的提示行用。
+fn extension_suffix(rel: &str) -> &str {
+    rel.rsplit_once('.').map(|(_, e)| e).unwrap_or("")
 }
 
 /// 路径基名（面板行宽只放得下文件名，不含目录前缀）。
@@ -241,6 +365,61 @@ fn mount_target(
         matches!(tree.prop(m, "registry_key"), Some(Value::Str(s)) if !s.is_empty());
     let enabled = matches!(tree.prop(m, "enabled"), Some(Value::Bool(true)));
     tree.uid_of(m).map(|u| (u, mounted, enabled))
+}
+
+/// F-4 挂载事务（S12-8 起为 FileSystem 双击与 Inspector Enter **两处
+/// 入口的同一事务**，原 Enter 内联体上提）：目标解析（选中本身是
+/// Script -> 挂它；否则第一个 Script 子节点；再没有 -> 同事务新建，
+/// 名字 = 脚本基名，层级树里可见）+ registry_key 落账 —— undo 一步
+/// 整回（T-INS-03 契约）。无选中 = Output 一行说明，不落账。
+fn mount_script(
+    tree: &mut nes_scene::SceneTree,
+    log: &mut TransactionLog,
+    sel: &Selection,
+    ring: &Rc<RefCell<VecDeque<String>>>,
+    rel: &str,
+) {
+    let Some(puid) = sel.primary(tree).and_then(|p| tree.uid_of(p)) else {
+        log_line(ring, "mount: no selection".into());
+        return;
+    };
+    let target: Option<Uid> = match tree.find_by_uid(&puid) {
+        Some(p) if tree.kind_tag(p) == Some(nes_scene::NodeKindTag::Script) => {
+            Some(puid.clone())
+        }
+        Some(p) => tree
+            .children(p)
+            .iter()
+            .find(|&&c| tree.kind_tag(c) == Some(nes_scene::NodeKindTag::Script))
+            .and_then(|c| tree.uid_of(*c)),
+        None => None,
+    };
+    log.begin().unwrap();
+    let (mount_uid, created) = match target {
+        Some(u) => (u, false),
+        None => {
+            let u = Hierarchy::new(tree, log)
+                .create_child(&puid, &script_node_name(rel), NodeKind::Script)
+                .unwrap();
+            (u, true)
+        }
+    };
+    Inspector::new(tree, log)
+        .modify_prop(&mount_uid, "registry_key", Value::Str(rel.to_string()))
+        .unwrap();
+    log.commit().unwrap();
+    let host = tree
+        .find_by_uid(&puid)
+        .and_then(|id| tree.name(id).map(str::to_string));
+    log_line(
+        ring,
+        format!(
+            "mount {}{} <- {}",
+            host.unwrap_or_default(),
+            if created { " (+script)" } else { "" },
+            base_name(rel),
+        ),
+    );
 }
 
 fn log_line(ring: &Rc<RefCell<VecDeque<String>>>, line: String) {
@@ -320,7 +499,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // 视口网格（S12-5 Godot 观感）：条带池 —— 竖条 1px 宽 × 视口高、
@@ -412,6 +591,41 @@ fn main() {
         let _ = tree.set_prop(hud_dock, "rows", Value::Str(String::new()));
         let _ = tree.set_prop(hud_dock, "row_h", Value::I64(DOCK_ROW_H as i64));
         tree.set_prop_raw(hud_dock, "z_index", Value::I64(-80));
+        // 文件系统 dock（S12-8，Godot 左下 res:// 面板）：panel 槽
+        // 铺底 + "res:/" 标题行 + 资产树 ListView（复用控件，行文本 =
+        // 相对资产根的缩进树；选中/行点击与层级树同款投影-回调口径）。
+        // 分隔条（4px border 槽条）独立成控件 —— Scene 与 FileSystem
+        // 两段的界线（P0 固定分割 + F9 两档，见布局投影块）。挂
+        // "fsdock" 容器：walk 整子树跳过（资产观感不是场景对象，不进
+        // 行列表）。z=-60 垫底（网格 -100、标尺 -90、dock -80、工具栏
+        // -70 之上，仍在精灵 0 之下 —— 同款纪律；左栏与视口不重叠，
+        // 纯口径一致）。offset/size 装配期只给占位初值，每帧由布局
+        // 投影重写（窗口一变当帧跟上，S12-4 ①口径）。
+        let fsdock = tree.add_node(root, "fsdock", NodeKind::Node);
+        let fs_bg = tree.add_node(fsdock, "fs_bg", NodeKind::Control);
+        let _ = tree.set_prop(fs_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(fs_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 240.0)));
+        let _ = tree.set_prop(fs_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, 100.0)));
+        let _ = tree.set_prop(fs_bg, "fill_slot", Value::Str("panel".into()));
+        tree.set_prop_raw(fs_bg, "z_index", Value::I64(-60));
+        let fs_title = tree.add_node(fsdock, "fs_title", NodeKind::Label);
+        tree.set_local(fs_title, Transform2D::from_pos(MARGIN + 2.0, 242.0));
+        let _ = tree.set_prop(fs_title, PROP_LABEL_TEXT, Value::Str("res:/".into()));
+        tree.set_prop_raw(fs_title, "z_index", Value::I64(-60));
+        let fs_sep = tree.add_node(fsdock, "fs_sep", NodeKind::Control);
+        let _ = tree.set_prop(fs_sep, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(fs_sep, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 236.0)));
+        let _ = tree.set_prop(fs_sep, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, FS_SEP_H)));
+        let _ = tree.set_prop(fs_sep, "fill_slot", Value::Str("border".into()));
+        tree.set_prop_raw(fs_sep, "z_index", Value::I64(-60));
+        let fs_tree = tree.add_node(fsdock, "fs_tree", NodeKind::ListView);
+        let _ = tree.set_prop(fs_tree, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(fs_tree, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 258.0)));
+        let _ = tree.set_prop(fs_tree, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, 80.0)));
+        let _ = tree.set_prop(fs_tree, "rows", Value::Str(String::new()));
+        let _ = tree.set_prop(fs_tree, "row_h", Value::I64(FS_ROW_H as i64));
+        let _ = tree.set_prop(fs_tree, "selected", Value::I64(-1));
+        tree.set_prop_raw(fs_tree, "z_index", Value::I64(-60));
         // 视口工具栏（S12-7/F-4，Godot 2D 视口顶部工具条观感）：标尺
         // 之上一条 24px 工具带 —— panel 槽铺底 + 底缘 1px border 分隔
         // 线 + SEL/SNAP/GRID 三个开关按钮（UiVm on_activate 已通）。
@@ -534,7 +748,7 @@ fn main() {
         tree.set_local(ins_script, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -555,13 +769,23 @@ fn main() {
     // - 工具栏三开关（SEL 选择/拖拽总开关、SNAP 恒吸附、GRID 网格）；
     // - 分区标题行矩形（上一帧投影产出 -> 帧首命中，一帧滞后与既有
     //   UI 命中同口径）：(面板左 x, 行顶 y, 组下标)。
-    let mut scripts: Vec<String> = scan_scripts(&assets);
+    // 文件系统 dock 数据面（S12-8）：资产条目（递归扫描，每 60 帧 +
+    // F5 刷新）与脚本候选池**同源派生**（script_pool —— FileSystem
+    // 选中的 .nes 必在池内，F6 候选起点裁决的前提）。
+    let mut fs_entries: Vec<FsEntry> = scan_assets(&assets);
+    let mut scripts: Vec<String> = script_pool(&fs_entries);
     let mut script_idx: usize = 0;
     let mut group_stage: u8 = 0;
     let mut tool_sel_on = true;
     let mut tool_snap_on = false;
     let mut tool_grid_on = true;
     let mut title_rows: Vec<(f32, f32, usize)> = Vec::new();
+    // 文件系统 dock 会话态（S12-8，不进树、不落盘）：选中行（None =
+    // 无选中，投影 -1）、F9 两档分割的焦点段（false = Scene 占大头）、
+    // 双击合成的上次行点击 (帧号, 行)。
+    let mut fs_sel: Option<usize> = None;
+    let mut fs_focus = false;
+    let mut fs_last_press: Option<(u64, usize)> = None;
 
     // 状态栏的 undo/redo 键按下沿检测。
     let mut prev_z = false;
@@ -601,15 +825,20 @@ fn main() {
     // 映射由投影段每帧整体刷新（walk 顺序即行序），回调只按行查 uid。
     let row_clicks: Rc<RefCell<Vec<Uid>>> = Rc::new(RefCell::new(Vec::new()));
     let row_map_shared: Rc<RefCell<Vec<Uid>>> = Rc::new(RefCell::new(Vec::new()));
+    // 文件系统 dock 行点击落点（S12-8，UiVm 零写权延续 —— 帧内只报
+    // 行下标，帧后宿主结算选中/双击分派；与层级树同一共享缓冲模式）。
+    let fs_clicks: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
     {
         let clicks = row_clicks.clone();
         let map = row_map_shared.clone();
+        let fs_sink = fs_clicks.clone();
         rt.ui_vm_mut().on_row_activate(move |node, row| {
-            if node != hud_tree {
-                return; // 只认层级树列表（当前全场景仅此一个 ListView）。
-            }
-            if let Some(uid) = map.borrow().get(row as usize) {
-                clicks.borrow_mut().push(uid.clone());
+            if node == hud_tree {
+                if let Some(uid) = map.borrow().get(row as usize) {
+                    clicks.borrow_mut().push(uid.clone());
+                }
+            } else if node == fs_tree {
+                fs_sink.borrow_mut().push(row as usize);
             }
         });
     }
@@ -692,6 +921,18 @@ fn main() {
                 62 => inject_input(InputEvent::Key { key: Key::Other(VK_F7), down: false }),
                 70 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
                 72 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
+                // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
+                // spin.nes 行（(60, 256)：768x432 客户区、默认 Scene
+                // 55% 档下第 2 行），两次点击沿间隔 10 帧 < 30（双击
+                // 裁决窗），挂载后 U 卸载回空 registry_key（树形态
+                // 断言兼容）。
+                80 => inject_input(InputEvent::MouseMove { x: 60.0, y: 256.0 }),
+                82 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                84 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                90 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                92 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                100 => inject_input(InputEvent::Key { key: Key::U, down: true }),
+                102 => inject_input(InputEvent::Key { key: Key::U, down: false }),
                 _ => {}
             }
         }
@@ -706,12 +947,14 @@ fn main() {
         );
         let _ = (z_now, y_now);
         // F 键与挂载流的按下沿（pressed 集即本帧边缘 —— 无需 prev 表）。
-        // F5 刷候选池 / F6 轮换候选 / F7 循环组折叠；Enter 挂载、
-        // U 卸载、E 切 enabled（后三者有焦点门，见挂载段）。
-        let (f5_now, f6_now, f7_now, enter_now, u_now, e_now) = (
+        // F5 刷资产扫描 / F6 轮换候选 / F7 循环组折叠 / F9 切左栏分割
+        // 档；Enter 挂载、U 卸载、E 切 enabled（后三者有焦点门，见挂
+        // 载段）。
+        let (f5_now, f6_now, f7_now, f9_now, enter_now, u_now, e_now) = (
             snap.pressed.contains(&Key::Other(VK_F5)),
             snap.pressed.contains(&Key::Other(VK_F6)),
             snap.pressed.contains(&Key::Other(VK_F7)),
+            snap.pressed.contains(&Key::Other(VK_F9)),
             snap.pressed.contains(&Key::Enter),
             snap.pressed.contains(&Key::U),
             snap.pressed.contains(&Key::E),
@@ -772,6 +1015,7 @@ fn main() {
                 [
                     name_input, hud_tree, hud_dock, ruler_h, ruler_v, ruler_corner,
                     tool_sel, tool_snap, tool_grid,
+                    fs_bg, fs_sep, fs_tree,
                 ]
                 .iter()
                 .any(|&n| press_in_control(tree, n, viewport, (mx, my)))
@@ -982,12 +1226,20 @@ fn main() {
             }
         }
         // ---- F-4 脚本挂载与编辑器会话键（S12-7）----
-        // 候选池周期刷新（每 60 帧 = 约 1s；F5 手动即时刷 —— 代价取舍
-        // 见 SCRIPT_SCAN_EVERY 注）。轮换下标越界即回 0（池变小/清空）。
+        // 资产扫描周期刷新（每 60 帧 = 约 1s；F5 手动即时刷 —— 代价
+        // 取舍见 SCRIPT_SCAN_EVERY 注）：res:// 树与脚本池**同一数据
+        // 源**一并重扫（S12-8）。轮换下标越界即回 0（池变小/清空）；
+        // fs 选中行越界即清除（条目变少时高亮不悬空）。
         if index % SCRIPT_SCAN_EVERY == 0 {
-            scripts = scan_scripts(&assets);
+            fs_entries = scan_assets(&assets);
+            scripts = script_pool(&fs_entries);
             if script_idx >= scripts.len() {
                 script_idx = 0;
+            }
+            if let Some(i) = fs_sel {
+                if i >= fs_entries.len() {
+                    fs_sel = None;
+                }
             }
         }
         // 焦点门：改名输入框持焦时 Enter/字母属于输入框（UiVm 提交
@@ -995,13 +1247,29 @@ fn main() {
         // 结果（一帧滞后，与既有 UI 命中口径一致）。
         let renaming = rt.ui_vm_mut().focus() == Some(name_input);
         if !renaming {
-            // F5：手动刷新候选池（带日志；周期刷新不打扰 Output）。
+            // F5：手动刷新资产扫描（带日志；周期刷新不打扰 Output）。
             if f5_now {
-                scripts = scan_scripts(&assets);
+                fs_entries = scan_assets(&assets);
+                scripts = script_pool(&fs_entries);
                 if script_idx >= scripts.len() {
                     script_idx = 0;
                 }
+                if let Some(i) = fs_sel {
+                    if i >= fs_entries.len() {
+                        fs_sel = None;
+                    }
+                }
                 log_line(&editor_log, format!("scan {} script(s)", scripts.len()));
+            }
+            // F9：左栏 Scene/FileSystem 分割档切换（焦点段占大头；
+            // 会话态不进树 —— 比例只落在每帧重写的 offset/size 上，
+            // 与工具栏三开关同一纪律）。
+            if f9_now {
+                fs_focus = !fs_focus;
+                log_line(
+                    &editor_log,
+                    format!("split {}", if fs_focus { "files" } else { "scene" }),
+                );
             }
             // F7：循环切换分组折叠（4 态：全开 -> 折 Transform -> 全折
             // -> 折 Script -> 全开）。会话态，不进树。
@@ -1022,9 +1290,10 @@ fn main() {
                 }
             }
             // Enter：挂载候选 -> 选中节点。合法性（候选存在 + .nes 后
-            // 缀）不过 -> Output 一行错误，不落账。落账一笔事务：目标
-            // Script 节点不存在就先建（Created）再写 registry_key
-            //（Modified）—— undo 一步整回（T-INS-03 契约）。
+            // 缀）不过 -> Output 一行错误，不落账；过 -> 与 FileSystem
+            // 双击走**同一挂载事务**（mount_script：目标解析 + 缺
+            // Script 子节点同事务新建 + registry_key 落账，undo 一步
+            // 整回 —— T-INS-03 契约；S12-8 起内联体上提为公共函数）。
             if enter_now {
                 let cand = scripts.get(script_idx).cloned();
                 let valid = match cand {
@@ -1040,74 +1309,7 @@ fn main() {
                 };
                 if valid {
                     let rel = cand.unwrap_or_default();
-                    let parent = sel
-                        .primary(rt.tree_mut())
-                        .and_then(|p| rt.tree_mut().uid_of(p));
-                    match parent {
-                        None => log_line(&editor_log, "mount: no selection".into()),
-                        Some(puid) => {
-                            // 目标解析：选中是 Script -> 本身；否则既有
-                            // Script 子节点；再没有 -> 同事务新建一个
-                            //（名字 = 脚本基名，层级树里可见 —— 引擎口径
-                            // 脚本住 Script 节点，attach 只认 Script）。
-                            let target: Option<Uid> = {
-                                let tree = rt.tree_mut();
-                                match tree.find_by_uid(&puid) {
-                                    Some(p)
-                                        if tree.kind_tag(p)
-                                            == Some(nes_scene::NodeKindTag::Script) =>
-                                    {
-                                        Some(puid.clone())
-                                    }
-                                    Some(p) => tree
-                                        .children(p)
-                                        .iter()
-                                        .find(|&&c| {
-                                            tree.kind_tag(c)
-                                                == Some(nes_scene::NodeKindTag::Script)
-                                        })
-                                        .and_then(|c| tree.uid_of(*c)),
-                                    None => None,
-                                }
-                            };
-                            log.begin().unwrap();
-                            let (mount_uid, created) = match target {
-                                Some(u) => (u, false),
-                                None => {
-                                    let u = Hierarchy::new(rt.tree_mut(), &mut log)
-                                        .create_child(
-                                            &puid,
-                                            &script_node_name(&rel),
-                                            NodeKind::Script,
-                                        )
-                                        .unwrap();
-                                    (u, true)
-                                }
-                            };
-                            Inspector::new(rt.tree_mut(), &mut log)
-                                .modify_prop(
-                                    &mount_uid,
-                                    "registry_key",
-                                    Value::Str(rel.clone()),
-                                )
-                                .unwrap();
-                            log.commit().unwrap();
-                            let host = {
-                                let tree = rt.tree_mut();
-                                tree.find_by_uid(&puid)
-                                    .and_then(|id| tree.name(id).map(str::to_string))
-                            };
-                            log_line(
-                                &editor_log,
-                                format!(
-                                    "mount {}{} <- {}",
-                                    host.unwrap_or_default(),
-                                    if created { " (+script)" } else { "" },
-                                    base_name(&rel),
-                                ),
-                            );
-                        }
-                    }
+                    mount_script(rt.tree_mut(), &mut log, &sel, &editor_log, &rel);
                 }
             }
             // U：卸载 = registry_key 写空串（schema 缺省 = 未挂载）。
@@ -1248,9 +1450,44 @@ fn main() {
                 let _ = tree.set_prop(*b, "text",
                     Value::Str(if *on { format!("{name}*") } else { (*name).to_string() }));
             }
-            // 左层级面板：宽恒 180，高度到 dock 上缘。
+            // 左栏两段布线（S12-8，Godot 左栏 Scene + res:// 两段）：
+            // 可用高 = 顶带到 dock 上缘；上段 Scene（层级树）+ 4px
+            // border 分隔条 + 下段 FileSystem（"res:/" 标题 + 资产树）。
+            // 分割比例由 F9 档位推导（fs_focus 会话态 —— 比例本身不进
+            // 树，只落在每帧重写的 offset/size 上，焦点段占大头）。
+            // 最小窗口下段高钳 0（列表/条带照画零矩形，提取层口径）。
+            let avail_h = (viewport.1 - TOP_BAND - STATUS_BAND - DOCK_H).max(0.0);
+            let top_frac = if fs_focus { FS_SPLIT_ALT } else { FS_SPLIT_TOP };
+            let scene_h = ((avail_h - FS_SEP_H) * top_frac).max(0.0);
+            let fs_h = (avail_h - FS_SEP_H - scene_h).max(0.0);
+            let sep_y = TOP_BAND + scene_h;
+            let fs_y = sep_y + FS_SEP_H;
             let _ = tree.set_prop(hud_tree, PROP_CONTROL_SIZE,
-                Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, viewport.1 - TOP_BAND - STATUS_BAND - DOCK_H)));
+                Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, scene_h)));
+            let _ = tree.set_prop(fs_sep, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(MARGIN, sep_y)));
+            let _ = tree.set_prop(fs_sep, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, FS_SEP_H)));
+            let _ = tree.set_prop(fs_bg, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(MARGIN, fs_y)));
+            let _ = tree.set_prop(fs_bg, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, fs_h)));
+            tree.set_local(fs_title, Transform2D::from_pos(MARGIN + 2.0, fs_y + 1.0));
+            let _ = tree.set_prop(fs_tree, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(MARGIN, fs_y + FS_TITLE_H)));
+            let _ = tree.set_prop(fs_tree, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, (fs_h - FS_TITLE_H).max(0.0))));
+            // res:// 行文本投影（投影无状态口径）：缩进树形（每层两空
+            // 格，目录尾斜杠）+ 选中行下标随 fs_sel（-1 = 无选中，与
+            // 层级树 selected 行高亮同款）。空列表 = 空 rows（行数 0，
+            // UiVm 不回调行）。
+            let fs_rows: Vec<String> = fs_entries.iter().map(fs_row_text).collect();
+            let _ = tree.set_prop(fs_tree, "rows", Value::Str(fs_rows.join("\n")));
+            let fs_sel_row = fs_sel
+                .filter(|&i| i < fs_entries.len())
+                .map(|i| i as i64)
+                .unwrap_or(-1);
+            let _ = tree.set_prop(fs_tree, "selected", Value::I64(fs_sel_row));
             // 右检查器面板底：x = cw-198（宽 190 + 右缘 8），y = 8..dock 上缘。
             let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - INSPECTOR_W - 2.0 * MARGIN, MARGIN)));
@@ -1472,7 +1709,7 @@ fn main() {
                     walk(tree, c, depth + 1, sel, out, map, skips);
                 }
             }
-            let skips = [grid, ruler, dock, toolbar];
+            let skips = [grid, ruler, dock, toolbar, fsdock];
             walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, &skips);
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
@@ -1594,7 +1831,7 @@ fn main() {
             // 状态栏（S12-7：工具开关态 + F 键挂载流提示；SNAP 开关
             // ON 恒吸附、Ctrl 反转 —— tools 段 S/N/G 即三开关现态）。
             let st = format!(
-                "st> undo:{} redo:{} sel:{} tools:{}{}{} | Click=sel Drag=box Del=del F5=scan F6=cand Enter=mount U=unmount E=enable F7=groups Ctrl+Z/Y=undo",
+                "st> undo:{} redo:{} sel:{} tools:{}{}{} | Click=sel Drag=box Del=del F5=scan F6=cand Enter=mount U=unmount E=enable F7=groups F9=split Ctrl+Z/Y=undo",
                 if log.can_undo() { "Y" } else { "-" },
                 if log.can_redo() { "Y" } else { "-" },
                 sel.len(),
@@ -1730,6 +1967,57 @@ fn main() {
             );
         }
 
+        // 文件系统 dock 行点击落账（帧后 —— UiVm 钩子帧内只报行下
+        // 标）：单击 = 选中该行（会话态，下一帧 selected 行高亮跟上）；
+        // .nes 顺手指为 F6 候选起点（两处入口同一挂载流，池与 res://
+        // 树同源必命中）。同行 30 帧内两次点击沿 = 双击（FS_DBLCLICK_
+        // FRAMES 裁决；UiVm 行回调只有单击沿，双击是宿主会话态的边沿
+        // 合成）：.ron 场景 = Output 提示（场景打开归 play-in-editor
+        // 里程碑，P0 不实现）；.nes = 直接挂载（与 Enter 同一
+        // mount_script 事务，Output 报结果）；目录/其余后缀 = 提示，
+        // 不落账。
+        for row in fs_clicks.borrow_mut().drain(..) {
+            let Some(entry) = fs_entries.get(row) else {
+                continue;
+            };
+            fs_sel = Some(row);
+            let double = fs_last_press.is_some_and(|(f, r)| {
+                r == row && index.saturating_sub(f) < FS_DBLCLICK_FRAMES
+            });
+            if double {
+                if entry.is_dir {
+                    log_line(
+                        &editor_log,
+                        format!(
+                            "fs: dir {} (flat view)",
+                            base_name(entry.rel.trim_end_matches('/')),
+                        ),
+                    );
+                } else if entry.rel.ends_with(".ron") {
+                    log_line(
+                        &editor_log,
+                        format!(
+                            "open {} -> play-in-editor milestone",
+                            base_name(&entry.rel),
+                        ),
+                    );
+                } else if entry.rel.ends_with(".nes") {
+                    log_line(&editor_log, format!("fs open {}", base_name(&entry.rel)));
+                    mount_script(rt.tree_mut(), &mut log, &sel, &editor_log, &entry.rel);
+                } else {
+                    log_line(
+                        &editor_log,
+                        format!("fs: no action for .{}", extension_suffix(&entry.rel)),
+                    );
+                }
+            } else if !entry.is_dir && entry.rel.ends_with(".nes") {
+                if let Some(i) = scripts.iter().position(|s| *s == entry.rel) {
+                    script_idx = i;
+                }
+            }
+            fs_last_press = Some((index, row));
+        }
+
         // 帧节拍：无固定 sleep —— present 的 FIFO 队列自节流（vsync），
         // 帧差以 Instant 实测进 FrameInfo（见循环头的 delta/elapsed）。
     }
@@ -1746,6 +2034,12 @@ fn main() {
             "分组折叠失败：{lines:?}"
         );
         assert!(has("scan 2 script(s)"), "候选池刷新失败：{lines:?}");
+        // S12-8：FileSystem 双击 —— fs open 分派提示 + 与 Enter 同款
+        // 挂载事务（目标 Script 子节点已存在 -> 无 "(+script)" 后缀，
+        // 与首挂载日志可区分）；末尾 U 卸载回空 registry_key（上方树
+        // 形态断言不受影响）。
+        assert!(has("fs open spin.nes"), "fs double-click dispatch failed: {lines:?}");
+        assert!(has("mount obj1 <- spin.nes"), "fs double-click mount failed: {lines:?}");
         // 树形态：挂载 Script 子节点留存（名字 = 脚本基名），registry_key
         // 已回空串（卸载），enabled = false（切换后未回改）。
         let tree = rt.tree_mut();
@@ -1762,5 +2056,5 @@ fn main() {
         println!("[demo] 挂载/卸载/enabled/折叠/刷新 冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, ins_tf_title, ins_sc_title);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree);
 }
