@@ -689,6 +689,17 @@ impl NesRuntime {
             .unwrap_or((0, 0))
     }
 
+    /// IME 组合窗（预编辑/候选窗）定位到**客户区**指定点（IME 第 1 期，
+    /// [`Window::imm_set_caret_point`] 的直通包装）。
+    ///
+    /// 离屏/headless 装配无窗口 —— no-op（软契约：定位尽力而为，不报
+    /// 错；无 IME 上下文时窗口侧同样静默）。
+    pub fn imm_set_caret_point(&self, x: i32, y: i32) {
+        if let Some(w) = &self.window {
+            w.imm_set_caret_point(x, y);
+        }
+    }
+
     /// 轮询文件变化（内容戳判定）。变化后调用 [`Self::upload_pending_textures`] 重传。
     pub fn poll_reloads(&mut self) -> ReloadReport {
         self.registry.poll_reloads()
@@ -854,9 +865,11 @@ impl nes_scene::InputView for SnapshotView {
         self.0.borrow().text.len()
     }
     fn text(&self) -> Vec<u32> {
-        // 快照存 UTF-16 单元序（u32 槽，S12-2 契约）；读面口径是
-        // Unicode 标量值 —— 此处解码（ASCII 直通；代理对合成非
-        // ASCII，P0 泵会滤掉）。
+        // 快照存 UTF-16 码元序（u32 槽，S12-2 契约）；读面口径是
+        // Unicode 标量值 —— 此处解码（BMP 直通；代理对按标准公式合成；
+        // 孤立/悬挂代理被 filter_map 如实丢弃 —— 跨帧不拼，与场景层
+        // UiVm 泵同口径）。IME 第 1 期起泵全收非控制标量：中文可入
+        // 编辑器改名框（中文 IME 的 WM_CHAR 端到端链路见 s12 契约）。
         char::decode_utf16(self.0.borrow().text.iter().copied().map(|v| v as u16))
             .filter_map(|r| r.ok())
             .map(|c| c as u32)

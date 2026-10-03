@@ -5,6 +5,7 @@
 //! | T-In-01 | 真实消息路径：PostMessageW 的键/字符/鼠标/尺寸消息经泵映射成中性 `InputEvent` 入队，按到达序；drain 取走清空 |
 //! | T-In-02 | 程序化注入与真实消息同队列；容量上限满时丢新保旧；`vk_to_key` 映射表 |
 //! | T-In-03 | 滚轮（S12-3）：WM_MOUSEWHEEL 真实消息与注入同队列，增量按 WHEEL_DELTA 归一成格（+y=向上）；WM_GETMINMAXINFO 钳制最小整窗尺寸 |
+//! | T-In-04 | IME 第 1 期：直接投递 WM_CHAR 0x4E2D（'中'，UTF-16 码元原码）→ 泵映射 Char(0x4E2D) 入队 —— 非ASCII 码元原样过平台层（配对/消费在契约层之上） |
 
 use nes_render_api::input::{InputCollector, InputEvent, Key, MouseButton};
 use nes_render_api::math::Vec2;
@@ -254,4 +255,57 @@ fn t_in_03_wheel_notches_and_min_track() {
     assert_eq!(probe_small.pt_max_size.x, sentinel, "未登记窗口：其余字段也不动");
 
     let _ = drain_input(); // 收尾清队列（下一测试自会再清，双保险）
+}
+
+/// T-In-04（IME 第 1 期）：非 ASCII 码元过平台层 —— 直接投递
+/// `WM_CHAR`（wparam = 0x4E2D，'中' 的 UTF-16 码元原码）经泵映射成
+/// `Char(0x4E2D)` 入队、drain 如实取回。代理对两单元（非 BMP 字符）
+/// 也按同映射逐单元过层 —— 配对合成属消费侧（运行时读面 / UiVm 泵），
+/// 平台层"只投递事实"纪律对任意码元一视同仁。
+///
+/// **确定性注**：直接投递 WM_CHAR 本身不受 IME 影响 —— t_in_01 的
+/// IME 依赖 flake 出在"投 WM_KEYDOWN 指望 TranslateMessage 合成字符"
+///（中文 IME 激活时走 IME 消息路径不产 WM_CHAR）；本测试不经过合成
+/// 路径，任何键盘布局/IME 状态下行为一致。IME 组合窗定位（imm32）
+/// 只改候选窗的屏上位置，不改消息流 —— 与本契约无交。
+#[test]
+fn t_in_04_cjk_char_code_unit_round_trip() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = drain_input(); // 清残留（进程级队列）
+    let window = Window::open("t-in-04-cjk-char", 256, 128).expect("窗口");
+    window.pump();
+    let _ = drain_input(); // 清首泵系统噪声
+
+    const WM_CHAR: u32 = 0x0102;
+    // '中'（U+4E2D）单码元 + 代理对两单元（😀 U+1F600 = D83D DE00，
+    // 平台层原样转发 —— 真实窗口里 WM_CHAR 对非 BMP 字符就是背靠背
+    // 两连发）。首条 WM_KEYDOWN 允许 TranslateMessage 合成幻影字符
+    //（环境相关，见断言口径）。
+    let posts = [
+        (WM_CHAR, 0x4E2Dusize, 0isize),
+        (WM_CHAR, 0xD83Dusize, 0),
+        (WM_CHAR, 0xDE00usize, 0),
+    ];
+    for (msg, wp, lp) in posts {
+        assert!(unsafe { PostMessageW(window.hwnd(), msg, wp, lp) } != 0);
+    }
+    window.pump(); // 分发 -> wnd_proc -> 映射入队
+
+    let drained = drain_input();
+    let chars: Vec<u32> = drained
+        .iter()
+        .filter_map(|e| match e {
+            InputEvent::Char(c) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    // 钉保序子序列（允许系统噪声/合成字符穿插 —— t_in_01 同口径）：
+    // 三码元按投递序全部到达、原码零改动。
+    let want = [0x4E2Du32, 0xD83D, 0xDE00];
+    let mut it = chars.iter();
+    assert!(
+        want.iter().all(|w| it.any(|c| c == w)),
+        "三个 UTF-16 码元按序原码到达：{chars:?}"
+    );
+    assert!(drain_input().is_empty(), "drain 后清空");
 }

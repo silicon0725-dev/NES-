@@ -18,7 +18,11 @@
 //! 滚轮一次性增量）/ TextInput（WM_CHAR 提交的字符流，与键语义分离 ——
 //! IME 合成不走键）/ Window（尺寸变化，输入性质的事件单列）。
 //! **WM_CHAR 不是引擎 API**：平台字符码只到这里为止，宿主与脚本消费的
-//! 是快照的 `text` 字段。
+//! 是快照的 `text` 字段。`text` 存 **UTF-16 码元序**（u32 槽）：BMP 内
+//! 字符一单元一字符；非 BMP 字符（如 emoji）按代理对（高 `0xD800..=
+//! 0xDBFF` + 低 `0xDC00..=0xDFFF`）背靠背入流 —— 消费侧负责配对合成
+//! 标量（运行时快照读面与场景层 UiVm 泵，IME 第 1 期）；孤立/悬挂
+//! 代理在消费侧如实丢弃。
 //!
 //! 零依赖、无平台概念：`InputEvent` 已是中性事件（虚拟键 → `Key` 的
 //! 映射在平台层完成）。宿主可不经平台直接注入事件（自动化/回放/
@@ -143,7 +147,8 @@ pub enum InputEvent {
     /// 键按下/抬起（自动重发的 down 由集合语义自然幂等 —— 快照边缘按
     /// 集合差算，重复 down 不产生第二次 pressed）。
     Key { key: Key, down: bool },
-    /// 文本输入字符（UTF-16 单元原码；与键语义分离）。
+    /// 文本输入字符（UTF-16 码元原码；与键语义分离 —— 非 BMP 字符按
+    /// 代理对两单元入流，配对在消费侧，见模块注）。
     Char(u32),
     /// 鼠标移动（客户区像素）。
     MouseMove { x: f32, y: f32 },
@@ -178,7 +183,8 @@ pub struct InputSnapshot {
     pub buttons_pressed: [bool; 3],
     /// 按钮本帧抬起。
     pub buttons_released: [bool; 3],
-    /// 本帧提交的文本字符（UTF-16 单元序；快照取走即清）。
+    /// 本帧提交的文本字符（UTF-16 码元序；快照取走即清；代理对配对
+    /// 在消费侧，见模块注）。
     pub text: Vec<u32>,
     /// 本帧滚轮增量（格；+y=向上；同帧多事件已相加；快照取走即清）。
     pub wheel: Vec2,
@@ -335,7 +341,7 @@ pub struct InputTrace {
 /// 0 key_down W
 /// 1 mouse_move 100 100
 /// 2 key_up W key_down Space
-/// 3 char 104 char 105      # text（UTF-16 单元码）
+/// 3 char 104 char 105      # text（UTF-16 码元码）
 /// 4 mouse_down left resize 800 600
 /// 5 wheel 0 1.5            # 滚轮（格；+y=向上；同帧多记相加）
 /// ```
