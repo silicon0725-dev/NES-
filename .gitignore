@@ -8,3 +8,4 @@ wgpu-win/lib/*.dll.a
 
 # 临时文件
 *.tmp
+.mimosa/
