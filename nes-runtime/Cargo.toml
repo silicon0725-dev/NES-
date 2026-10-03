@@ -21,9 +21,14 @@ path = "examples/engine_frame.rs"
 #                          └──────────────────┴──────────────┴────────────────┘
 #                                      全部被本 crate 消费（G11：只许向下，谁也不许依赖本 crate）
 #
+#     nes-audio ──▶ 本 crate（S13 第 2 期正向接入：runtime ──▶ nes-audio，
+#                   方向唯一；守卫 G12 的反向禁令不含 runtime —— 正向白名单已放宽）
+#
 # 本 crate 是"引擎"的雏形：把五个 crate 装配成「场景树 -> 资源 -> 每帧提取 ->
 # 命令流 -> GPU -> 像素」的一条帧循环。它不实现任何渲染/场景语义 —— 语义在
-# 各 crate 里已冻结，这里只做组合。
+# 各 crate 里已冻结，这里只做组合。音频同理（S13 第 2 期）：解码/混音/设备
+# 语义全部在 nes-audio，本层只做装配（open_audio）、Sound 资源装载注册与
+# 脚本 Cmd::PlaySound 的转交 —— 音频不进语义状态。
 #
 # 零第三方依赖（全部 path 依赖）；空 [workspace] 表钉成独立工作区根，
 # 与 GPU 侧 crate 同一纪律。
@@ -33,5 +38,6 @@ nes-scene = { path = "../nes-scene" }
 nes-render-api = { path = "../nes-render-api" }
 nes-render-extract = { path = "../nes-render-extract" }
 nes-render-wgpu = { path = "../nes-render-wgpu" }
+nes-audio = { path = "../nes-audio" }
 
 [workspace]

@@ -41,12 +41,18 @@ pub struct HeadlessReport {
 impl NesRuntime {
     /// headless 推进一帧（**与 `frame*` 共用同一条 `SceneTree::tick` 路径**，
     /// 只是不做提取/渲染/呈现 —— 语义零分支）。
+    ///
+    /// 音频面（S13 第 2 期）：tick 后照常取走 `play` 落地的声音键 ——
+    /// headless 通常未开音频，取走即弃（缓冲不跨帧积压、不进指纹）；
+    /// 开了音频则同一通道转混音器（headless 也能出声，同一运行时）。
     pub fn tick_headless(
         &mut self,
         delta: f32,
         obs: &mut dyn nes_scene::SceneObserver,
     ) -> TickStats {
-        self.tree.tick(delta, obs)
+        let stats = self.tree.tick(delta, obs);
+        self.consume_played_sounds();
+        stats
     }
 
     /// 语义状态指纹：场景（结构/变换/属性/生命周期 + 脚本局部）⊕ 输入

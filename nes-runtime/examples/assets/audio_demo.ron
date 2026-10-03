@@ -1,0 +1,20 @@
+// S13 第 2 期音频演示场景：一个 Sound 资源 + 一个脚本节点。
+//
+// 玩法：宿主 open_audio 后 init 即播一声 440Hz 蜂鸣（`play` 的 Cmd 全链
+// 冒烟）；按空格再播一声。装载链：Res(id:1, kind:"Sound") -> bind 读
+// Audio/beep.wav -> 解码 -> 按路径键 "Audio/beep" 注册进混音器。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Audio/beep.wav", kind: "Sound"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "S13 AUDIO DEMO | init beeped | SPACE = beep" }, children: [],),
+            Node(name: "game", kind: "Script", props: { "source": "init { play \"Audio/beep\" }\non \"input/key_down\" { if arg == \"Space\" { play \"Audio/beep\" } }" }, children: [],),
+        ],
+    ),
+)

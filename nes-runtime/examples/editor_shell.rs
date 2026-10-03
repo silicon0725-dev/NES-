@@ -125,6 +125,13 @@
 //! 无副作用；游戏键（WASD 等）经同一输入快照直达脚本 —— 编辑器与
 //! 游戏共享同一快照源（S8.2b-3 既有口径）。
 //!
+//! S13 第 2 期（音频接入）：启动时声明一个演示声音资产（Audio/beep.wav
+//! —— 440Hz 蜂鸣，代码生成与 bmp 同口径）并随 bind 装载；PLAY 会话时
+//! 若场景有 Sound 资源则自动 `open_audio`（Output 记 "audio on"；失败
+//! 报一行不中断 —— 带病也能跑的既有口径）。STOP **不关**音频（幂等
+//! 无害：空混音器静音填充）。游戏脚本 `play "…"` 的 Cmd::PlaySound 由
+//! 运行时在 tick 后转交混音器 —— play-in-editor 运行态由此出声。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -133,6 +140,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
+use nes_asset::AssetKind;
+use nes_audio::wav::write_wav;
 use nes_render_api::input::{InputEvent, Key, MouseButton};
 use nes_render_api::{FrameInfo, Vec2};
 use nes_render_extract::{PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE};
@@ -146,6 +155,20 @@ use nes_scene::{compile_script, NodeKind, NoObserver, ScriptVm, Transform2D, Val
 
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
+}
+
+/// 440Hz 蜂鸣样本（`duration_ms` 毫秒、单声道 16-bit；演示声音资产生成
+/// 与 write_bmp_rgba 同一家法：代码生成、缺了再写、仓库只背一份小文件）。
+fn beep_samples(duration_ms: u32, amplitude: i16) -> Vec<i16> {
+    let rate = 22050u32;
+    let frames = (u64::from(rate) * u64::from(duration_ms) / 1000) as usize;
+    (0..frames)
+        .map(|i| {
+            // 整数近似的 440Hz 正弦相位（无浮点三角依赖；确定性生成）。
+            let t = (i as i64 * 440) % rate as i64;
+            ((t * amplitude as i64) / rate as i64) as i16
+        })
+        .collect()
 }
 
 /// 布局常量（S12-4 冻结、S12-6 扩底部 dock）：面板**恒定宽** —— 最大化
@@ -196,8 +219,9 @@ const FS_SPLIT_ALT: f32 = 0.40;
 const FS_ROW_H: f32 = 18.0;
 /// 资产扫描深度（P0 两层条目：根一层 + 子目录一层）。
 const FS_SCAN_DEPTH: usize = 2;
-/// 资产白名单后缀（`.` 隐藏项与无后缀垃圾一律不进树）。
-const FS_EXT_WHITELIST: [&str; 6] = ["nes", "bmp", "png", "ron", "ttf", "txt"];
+/// 资产白名单后缀（`.` 隐藏项与无后缀垃圾一律不进树）。S13 第 2 期起
+/// 含 `wav` —— 声音资产与纹理/脚本同为项目资产，res:// 树如实列出。
+const FS_EXT_WHITELIST: [&str; 7] = ["nes", "bmp", "png", "ron", "ttf", "txt", "wav"];
 /// 双击裁决窗（帧）：同行两次行点击报告沿间隔 <30 帧 = 双击。UiVm
 /// 行回调只有单击 —— 双击是宿主会话态的边沿合成（60fps 下 <0.5s，
 /// 与鼠标双击时长同量级；行回调沿 = 抬键沿，与按下沿间隔至差一帧，
@@ -681,6 +705,19 @@ impl PlaySession {
         }
         let attached = total - issues.len();
         rt.mount_input_view(&mut vm);
+        // S13 第 2 期：场景有 Sound 资源则自动开音频（幂等 —— 运行中重启
+        // 不会重复开；失败报一行不中断，"带病也能跑"的既有口径）。STOP
+        // 不关音频：混音器与设备跨会话存活（空混音器静音填充，幂等无害）。
+        let has_sound = rt
+            .resources_mut()
+            .iter()
+            .any(|e| e.kind() == Some(AssetKind::Audio));
+        if has_sound {
+            match rt.open_audio() {
+                Ok(()) => log_line(ring, "audio on".into()),
+                Err(e) => log_line(ring, format!("audio: {e}")),
+            }
+        }
         self.vm = Some(vm);
         self.playing = true;
         log_line(ring, format!("play ({attached} scripts)"));
@@ -755,6 +792,14 @@ fn main() {
             write_bmp_rgba(&tex.join(name), 16, 16, &solid_rgba(r, g, b)).expect("写纹理");
         }
     }
+    // 演示声音资产（S13 第 2 期）：440Hz / 250ms，缺了再写（bmp 同口径）。
+    let audio_dir = assets.join("Audio");
+    std::fs::create_dir_all(&audio_dir).unwrap();
+    let beep = audio_dir.join("beep.wav");
+    if !beep.exists() {
+        let wav = nes_audio::Wav { sample_rate: 22050, channels: 1, samples: beep_samples(250, 8000) };
+        write_wav(&beep, &wav).expect("写蜂鸣 WAV");
+    }
 
     let mut rt = NesRuntime::open_windowed_with_root(
         &assets,
@@ -766,8 +811,9 @@ fn main() {
     for t in ["player", "enemy", "bullet", "heart", "door"] {
         let _ = rt.declare_texture(&format!("Textures/{t}.bmp")).expect("声明纹理");
     }
+    let _ = rt.declare_sound("Audio/beep.wav").expect("声明演示声音");
     let report = rt.bind_assets();
-    assert_eq!(report.loaded.len(), 5);
+    assert_eq!(report.loaded.len(), 6, "5 纹理 + 1 声音（S13）：{report:?}");
     assert_eq!(rt.upload_pending_textures().expect("上传"), 5);
     // 位图默认字体的等宽 advance（IME 锚点在位图回退模式下的累加步进
     // —— 从 font_metrics 实读，不写死 16）。
@@ -1327,11 +1373,13 @@ fn main() {
                 70 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: true }),
                 72 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: false }),
                 // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
-                // spin.nes 行（(60, 256)：768x432 客户区、默认 Scene
-                // 55% 档下第 2 行），两次点击沿间隔 10 帧 < 30（双击
+                // spin.nes 行（768x432 客户区、默认 Scene 55% 档：S13 起
+                // 资产根多出 Audio/（演示声音）目录 —— 目录优先字典序，
+                // spin.nes 从第 2 行（y=256）下移两行到第 4 行（y=
+                // 256+2*18=292）），两次点击沿间隔 10 帧 < 30（双击
                 // 裁决窗），挂载后 U 卸载回空 registry_key（树形态
                 // 断言兼容）。
-                80 => inject_input(InputEvent::MouseMove { x: 60.0, y: 256.0 }),
+                80 => inject_input(InputEvent::MouseMove { x: 60.0, y: 292.0 }),
                 82 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 84 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 90 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
@@ -2654,6 +2702,13 @@ fn main() {
         // 不动 —— find_by_name 命中的还是同一个节点）。
         assert!(has("snapshot "), "play snapshot hint missing: {lines:?}");
         assert!(has("play (1 scripts)"), "play log missing: {lines:?}");
+        // S13 第 2 期：PLAY 会话自动开音频（场景含 Sound 资源）—— Output
+        // 必有 "audio on" 行（无设备环境记 "audio: ..." 错误行，钩子按
+        // 实际能力断言其一 —— "没有设备"与"接线断了"不许互装）。
+        assert!(
+            has("audio on") || has("audio: "),
+            "PLAY 后无音频日志（audio on / audio: 错误行均缺）：{lines:?}"
+        );
         assert!(has("stop"), "stop log missing: {lines:?}");
         assert!(has("reset"), "reset log missing: {lines:?}");
         assert!(demo_spin_x > 0.0, "脚本未在运行态驱动（spin.x={demo_spin_x}）");

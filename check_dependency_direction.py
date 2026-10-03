@@ -30,9 +30,14 @@
     G8 / G9 / G10 为 S4「后端 crate 接入」新增，与 nes-render-wgpu/Cargo.toml
     的依赖纪律注释一一对应。
 
-    G11 nes-runtime（引擎组装层）的直接依赖只能是五个项目 crate（path 依赖），
+    G11 nes-runtime（引擎组装层）的直接依赖只能是六个项目 crate（path 依赖），
         且零第三方依赖、独立工作区根；任何 crate 不得依赖 nes-runtime
         —— 组装层是全链顶端叶子，只许被可执行目标（示例/测试）消费
+
+    G12 nes-audio（S13 音频核心）零依赖（normal / dev / build 三类都不得有）、
+        无 build.rs、独立工作区根；除 nes-runtime 正向接入（S13 第 2 期，
+        runtime ──▶ nes-audio 方向唯一）外，任何 crate 不得（直接或传递）
+        依赖它 —— 音频核心是依赖树的纯叶子，正向白名单仅含组装层，反向一律禁止
 
 退出码：0 = 全部通过；1 = 有检查项失败；2 = 环境/参数错误（例如 cargo 不可用）。
 仅使用 Python 标准库，可直接接入 CI。
@@ -61,14 +66,19 @@ BACKEND_ALLOWED = (CONTRACT_CRATE,)                # 后端唯一合法直接依
 BACKEND_FORBIDDEN_UPSTREAM = ("nes-scene", "nes-asset", "nes-render-extract")
 NO_DEP_ON_BACKEND = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE)  # 这些层不得依赖后端
 RUNTIME_CRATE = "nes-runtime"                      # 引擎组装层：全链顶端叶子
+# S13 第 2 期：runtime 正向接入音频（runtime ──▶ nes-audio 方向唯一）。
 RUNTIME_ALLOWED = ("nes-asset", "nes-scene", "nes-render-api",
-                   "nes-render-extract", "nes-render-wgpu")
+                   "nes-render-extract", "nes-render-wgpu", "nes-audio")
 SOURCE_FORBIDDEN_RE = re.compile(r"nes[-_]render", re.IGNORECASE)
 SOURCE_SCAN_EXT = (".rs", ".toml")
 # 提取层源码里不得出现对资源层类型的真实引用（注释里提名字不算，故只匹配 use / 路径限定调用）。
 EXTRACT_ASSET_RE = re.compile(
     r"\buse\s+nes_asset\b|\bextern\s+crate\s+nes_asset\b|\bnes_asset\s*::"
 )
+AUDIO_CRATE = "nes-audio"                          # S13 音频核心：依赖树的纯叶子（wav + 混音 + waveOut）
+# 不得依赖 nes-audio 的 crate：S13 第 2 期起 runtime 正向接入（runtime ──▶
+# nes-audio 方向唯一，由 G11 的白名单正向钉住），反向禁令不再含 runtime。
+NO_DEP_ON_AUDIO = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE)
 
 
 class Colors:
@@ -176,7 +186,7 @@ def main() -> int:
         print("cargo 不在 PATH 中，无法执行依赖方向检查", file=sys.stderr)
         return 2
 
-    crates = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE, RUNTIME_CRATE)
+    crates = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE, RUNTIME_CRATE, AUDIO_CRATE)
     missing = [c for c in crates if not os.path.isfile(os.path.join(root, c, "Cargo.toml"))]
     if missing:
         print("缺少 crate 清单文件：%s" % ", ".join(missing), file=sys.stderr)
@@ -397,8 +407,8 @@ def main() -> int:
         ", ".join("%s[%s]%s" % (n, k, "(path)" if p else "(registry)") for n, k, p in rt_declared)
         or "(无)",
     )
-    detail += "\n传递依赖 %d 个：%s" % (len(rt_trans), ", ".join(rt_trans) if rt_trans else "(无)")
-    detail += "\n合法直接依赖白名单：五个项目 crate（全部 path）"
+    detail += "\n传递依赖 %d 个：%s" % (len(rt_trans), ", ".join(rt_trans))
+    detail += "\n合法直接依赖白名单：六个项目 crate（全部 path；含 S13 第 2 期正向接入的 nes-audio）"
     detail += "\n" + "\n".join(rt_rev_lines)
     if rt_illegal:
         detail += "\n越界依赖：" + ", ".join(rt_illegal)
@@ -410,9 +420,60 @@ def main() -> int:
         detail += "\n违规反向依赖：" + ", ".join(rt_rev_bad)
     record(
         "G11",
-        "%s 仅向下依赖五个项目 crate（path）、零第三方、独立工作区根、无人反向依赖"
+        "%s 仅向下依赖六个项目 crate（path）、零第三方、独立工作区根、无人反向依赖"
         % RUNTIME_CRATE,
         not (rt_illegal or rt_unpathed or rt_registry or not rt_own_ws or rt_rev_bad),
+        detail,
+    )
+
+    # ---- G12：nes-audio 是依赖树的纯叶子（零依赖、无 build.rs、独立根、
+    #      除 runtime 正向接入外无人依赖它）----
+    au_declared = declared_deps(metas[AUDIO_CRATE], AUDIO_CRATE)
+    au_trans = root_dep_names(metas[AUDIO_CRATE])
+    au_registry = [n for n, _k, p in au_declared if not p]
+    au_build_rs = os.path.isfile(os.path.join(root, AUDIO_CRATE, "build.rs"))
+    au_ws_root = os.path.normcase(
+        os.path.abspath(metas[AUDIO_CRATE].get("workspace_root", ""))
+    )
+    au_own_ws = au_ws_root == os.path.normcase(os.path.join(root, AUDIO_CRATE))
+    au_rev_bad = []
+    au_rev_lines = []
+    for crate in NO_DEP_ON_AUDIO:
+        deps = root_dep_names(metas[crate])
+        au_rev_lines.append("%s：传递依赖 %d 个" % (crate, len(deps)))
+        for d in deps:
+            if d == AUDIO_CRATE:
+                au_rev_bad.append("%s -> %s" % (crate, d))
+    detail = "声明依赖 %d 条：%s" % (
+        len(au_declared),
+        ", ".join("%s[%s]" % (n, k) for n, k, _ in au_declared) if au_declared else "(无)",
+    )
+    detail += "\n传递依赖 %d 个：%s" % (len(au_trans), ", ".join(au_trans) if au_trans else "(无)")
+    detail += "\nregistry（非 path）依赖 %d 条：%s" % (
+        len(au_registry),
+        ", ".join(au_registry) if au_registry else "(无)",
+    )
+    detail += "\nbuild.rs 存在：%s（应为否：WAV 手写解析、winmm 绑定手写 #[repr(C)]）" % (
+        "是" if au_build_rs else "否"
+    )
+    detail += "\nworkspace_root：%s（%s）" % (
+        metas[AUDIO_CRATE].get("workspace_root", "(未知)"),
+        "独立工作区根" if au_own_ws else "被上层工作区吞并",
+    )
+    detail += "\n" + "\n".join(au_rev_lines)
+    if au_declared:
+        detail += "\n出现依赖即越界：音频核心 P0 是零依赖纯叶子（第 2 期 runtime 正向接入时另行放宽）"
+    if au_build_rs:
+        detail += "\n出现 build.rs：本 crate 的纪律是手写解析 + 手写 FFI，不需要构建脚本"
+    if not au_own_ws:
+        detail += "\n音频核心未钉成独立工作区根：须以空 [workspace] 表钉回独立根"
+    if au_rev_bad:
+        detail += "\n违规反向依赖：" + ", ".join(au_rev_bad)
+    record(
+        "G12",
+        "%s 零依赖（normal/dev/build 均为空）、无 build.rs、独立工作区根、除 runtime 正向外无人反向依赖"
+        % AUDIO_CRATE,
+        not (au_declared or au_registry or au_build_rs or not au_own_ws or au_rev_bad),
         detail,
     )
 

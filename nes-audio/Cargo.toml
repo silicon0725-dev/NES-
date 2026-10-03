@@ -1,0 +1,27 @@
+[package]
+name = "nes-audio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 audio core (S13 part 1): WAV decoder + sample mixer + winmm waveOut device thread"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_audio"
+path = "src/lib.rs"
+
+# 零依赖纪律（与 nes-asset / nes-render-api / nes-render-wgpu 同一条线，由
+# check_dependency_direction.py 的 G12 校验）：
+#   * 本 crate 是依赖树的**纯叶子**：连本仓库其它 crate 也不依赖，wav / 混音 /
+#     waveOut FFI 全部自足。第 2 期接入 nes-runtime 时，方向只能是
+#     runtime ──▶ nes-audio（届时由守卫另行放宽正向白名单），反向一律禁止；
+#   * 不引入任何第三方 crate：WAV 解析手写（bmp/png 先例）、winmm 绑定手写
+#     `#[repr(C)]` + `#[link(name = "winmm")]`（winmm.lib 属 Windows SDK，
+#     MSVC 工具链开箱即链，不需要 build.rs，也不需要 import 库生成器）。
+#
+# 本 crate 刻意**不并入**上层任何工作区：空 `[workspace]` 表把它显式钉成
+# 自己的工作区根，保证 `cargo test` 只构建本 crate（G12 校验独立根）。
+[dependencies]
+
+[workspace]

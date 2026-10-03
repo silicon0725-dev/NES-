@@ -1,4 +1,4 @@
-//! NES 2.0 引擎组装层：把五个 crate 装配成一条帧循环。
+//! NES 2.0 引擎组装层：把六个 crate 装配成一条帧循环。
 //!
 //! # 这一层是什么
 //!
@@ -10,19 +10,25 @@
 //!   └─ bind: ResourceTable -> AssetRegistry（FsLoader 从磁盘加载字节）
 //!        └─ upload: BMP 解码 -> TextureRegistry（按键注册 GPU 纹理，键位 =
 //!           AssetKey::as_render_key 的位镜像，与提取层 `render_key_of_bits` 同源）
+//!        └─ register: WAV 解码 -> Mixer（S13 第 2 期；键 = 资源路径去扩展名，
+//!           已开音频时随 bind 注册，脚本 `play` 按键引用）
 //!   └─ frame: SceneTree::tick（结构落地 + enter/ready/process 生命周期 +
 //!        变换冲洗，宿主行为经 SceneObserver 挂入）-> RenderExtractor::extract_into
 //!        （语义 -> 渲染物的唯一翻译点，推给 WgpuRenderServer 并产出命令流）
 //!        -> CommandConsumer::consume（命令 -> 清屏/精灵/控件/文本 -> 离屏读回）
-//! ```
+//!   └─ audio: open_audio 一次装配（Mixer + waveOut 设备线程）；混音由设备
+//!        线程自动跑（~10ms 一缓冲），帧循环只把脚本 `play` 落地的
+//!        Cmd::PlaySound 键转交混音器 —— 音频不进语义状态与指纹。
 //!
 //! # 不做什么（边界纪律）
 //!
 //! - **不实现语义**：变换、z 序、相机、锚点、排版的算式分别冻结在
-//!   `nes-scene` / `nes-render-api`；本层只搬运与组合；
-//! - **不改上游**：五个 crate 一行不动（本层是它们之上的新叶子，G11 钉住）；
+//!   `nes-scene` / `nes-render-api`；音频的解码/混音/设备语义冻结在
+//!   `nes-audio`；本层只搬运与组合；
+//! - **不改上游**：六个 crate 一行不动（本层是它们之上的新叶子，G11 钉住）；
 //! - **纹理解码口径**：资产以 **BMP** 交付（`nes-render-wgpu::bmp` 手写解析，
-//!   零依赖纪律）；其他格式由外部预处理转换（见各示例的资产生成脚本说明）。
+//!   零依赖纪律）；声音以 **16-bit PCM WAV** 交付（`nes-audio::wav` 同律）；
+//!   其他格式由外部预处理转换（见各示例的资产生成脚本说明）。
 //!
 //! # 帧循环
 //!
@@ -42,6 +48,7 @@ pub mod headless;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use nes_asset::{AssetKey, AssetKind, AssetRegistry, FsLoader, ReloadReport};
 use nes_render_api::input::{InputCollector, InputSnapshot};
@@ -58,6 +65,7 @@ use nes_scene::scene_io::{instantiate_doc_with_resources, parse_ron, write_ron_w
 use nes_scene::{
     AdoptReport, BindReport, NoObserver, PackOptions, ResId, ResourceTable, SceneDoc, SceneObserver,
     SceneTree, ScriptVm, TableError, Value, UiVm};
+use nes_audio::{AudioDevice, Mixer};
 
 pub use headless::{run, HeadlessReport};
 
@@ -101,6 +109,18 @@ pub struct NesRuntime {
     step_remainder: f32,
     /// 螺旋钳制丢弃的模拟步累计数（S8.1 如实计数）。
     steps_dropped: u64,
+    /// 混音器（S13 第 2 期；`None` = 未开音频）。与设备线程共享同一份
+    ///（`Arc<Mutex>`：设备填充线程每 ~10ms 锁一次做 mix_into；宿主侧
+    /// 注册/播放走同一把锁，毒化容忍 —— 音频不因别处 panic 哑掉）。
+    /// **不开音频的路径完全不构造它** —— 逐位同基线。
+    mixer: Option<Arc<Mutex<Mixer>>>,
+    /// waveOut 输出设备（`open_audio` 打开；STOP/编辑不关 —— 幂等无害，
+    /// 空混音器静音填充）。设备线程自动跑混音，帧循环**不做**每帧混音。
+    device: Option<AudioDevice>,
+    /// 已声明的声音槽位（上传遍历用，声明序确定；与 `texture_slots` 同构）。
+    sound_slots: Vec<ResId>,
+    /// 槽位 -> 已注册进混音器的资产版本（热重载重注册判定）。
+    registered_version: BTreeMap<ResId, u32>,
 }
 
 impl NesRuntime {
@@ -203,6 +223,10 @@ impl NesRuntime {
             fixed_step: None,
             step_remainder: 0.0,
             steps_dropped: 0,
+            mixer: None,
+            device: None,
+            sound_slots: Vec::new(),
+            registered_version: BTreeMap::new(),
         };
         rt.extractor.attach_ui(rt.ui_vm.states_rc());
         // S12.1：UI 状态机的输入读面在装配处直接挂上 —— 输入视图只共享
@@ -345,8 +369,15 @@ impl NesRuntime {
             .filter(|e| e.kind() == Some(AssetKind::Texture))
             .map(|e| e.id())
             .collect();
+        // 声音槽位同理重建（S13 第 2 期）：声明序确定，注册遍历不依赖表序。
+        self.sound_slots = table
+            .iter()
+            .filter(|e| e.kind() == Some(AssetKind::Audio))
+            .map(|e| e.id())
+            .collect();
         self.table = table;
         self.uploaded_version.clear();
+        self.registered_version.clear();
         self.scene_source = None;
         // 加载习语收口（S8.2 实证缺口）：整表替换后新表槽位**没有键** ——
         // 不 bind 则提取层拿不到 RenderAssetKey，场景里的纹理精灵整个
@@ -471,8 +502,159 @@ impl NesRuntime {
     }
 
     /// 把资源表接到资产注册表（注册 -> 加载 -> 场景持有；幂等）。
+    ///
+    /// 音频面（S13 第 2 期）：已开音频时，紧接着把就绪且版本变化的
+    /// Sound 类资源解码注册进混音器；解码失败按槽位进 `report.failed`
+    /// 缺口清单（与装载失败同一家法：编辑器红条、不阻塞场景）。未开音频
+    /// 时零动作 —— **不开音频的路径逐位同基线**。
     pub fn bind_assets(&mut self) -> BindReport {
-        self.table.bind(&mut self.registry)
+        let mut report = self.table.bind(&mut self.registry);
+        if self.mixer.is_some() {
+            report.failed.extend(self.register_sounds_collecting());
+        }
+        report
+    }
+
+    // ---------- 音频（S13 第 2 期：runtime ──▶ nes-audio 正向装配）----------
+
+    /// 打开音频：构造混音器 + waveOut 设备（48000 Hz / 2 声道），随后把
+    /// 已就绪的 Sound 资源注册进混音器。**幂等**：已开返回 `Ok(())`。
+    ///
+    /// 失败纪律与 GPU 用例同家法：无设备（`waveOutGetNumDevs() == 0`）、
+    /// 打开失败一律返回 `Err`，**不 panic、不静默换路**；调用方（编辑器
+    /// PLAY、游戏宿主）决定报行还是降级。headless 也能开（同一运行时），
+    /// 但通常不开 —— 不开时脚本 `play` 的 Cmd 落地后被静默丢弃。
+    ///
+    /// 混音由**设备线程**自动驱动（nes-audio 第 1 期设计：线程每 ~10ms
+    /// `mix_into` 一缓冲）；帧循环**不做**每帧混音 —— 全链只有这一处填充，
+    /// 无双重填充。单条解码失败不阻塞开音频（返回 `Ok`，失败清单进
+    /// 下一次 `bind_assets` 的缺口口径 —— 与"部分成功如实上报"同律）。
+    pub fn open_audio(&mut self) -> Result<(), BackendError> {
+        if self.device.is_some() {
+            return Ok(()); // 幂等：同一时刻只允许一个设备（nes-audio 纪律）
+        }
+        let mixer = self
+            .mixer
+            .get_or_insert_with(|| Arc::new(Mutex::new(Mixer::new())));
+        let device = AudioDevice::open(Arc::clone(mixer), 48_000, 2)
+            .map_err(|e| BackendError::Io(e.to_string()))?;
+        self.device = Some(device);
+        // 晚开音频（PLAY 时场景早已 bind）：已就绪的声音此刻一次性注册；
+        // 失败（坏 WAV）不阻塞开音频 —— 键未注册，play 时按未注册键静默丢弃。
+        let _ = self.register_sounds_collecting();
+        Ok(())
+    }
+
+    /// 混音器访问器（宿主直接注册声音/调音量用）。
+    ///
+    /// 设备**未开**时返回 `Some`（`Arc` 独占 —— 直接可变借用）；设备**已开**
+    /// 时如实返回 `None`（填充线程持有 `Arc` 克隆、每个 tick 锁一次，
+    /// Rust 无法证明无别名 —— 不假装能给出 `&mut`）。已开设备的宿主走
+    /// 场景装载链（`bind_assets` / `declare_sound`）注册声音。
+    pub fn audio(&mut self) -> Option<&mut Mixer> {
+        // Arc 独占（设备未开）→ &mut Mutex；`Mutex::get_mut` 是安全 API
+        //（&mut Mutex 即已证明无并发持有），不走 lock、不留毒化窗口。
+        // 锁中毒（混音中 panic 过）如实 None —— 不假装健康。
+        let mutex = Arc::get_mut(self.mixer.as_mut()?)?;
+        mutex.get_mut().ok()
+    }
+
+    /// 声明一个声音资源（记录槽位，供注册遍历；与 [`Self::declare_texture`]
+    /// 同构）。
+    pub fn declare_sound(&mut self, path: &str) -> Result<ResId, TableError> {
+        let id = self.table.declare(path, AssetKind::Audio)?;
+        self.sound_slots.push(id);
+        Ok(id)
+    }
+
+    /// 把就绪且**版本变化**的 Sound 资源解码并注册进混音器。
+    ///
+    /// * 返回本次注册数；解码失败**不中断**，指名路径的失败清单交调用方
+    ///   （`bind_assets` 挂进缺口、`open_audio` 忽略）—— 一个坏文件不挡
+    ///   其他声音（与脚本装载的 issues 通道同律）；
+    /// * 键约定：**资源路径去扩展名**（`Audio/beep.wav` -> `Audio/beep`）
+    ///   —— 脚本 `play "Audio/beep"` 按此引用；路径键无碰撞、随场景文件
+    ///   稳定；
+    /// * 热重载按版本重注册（同键覆盖，正在播的旧 `Arc` 声部继续播完
+    ///   —— nes-audio 既有语义）；解码失败时版本不记账（修复后下次重试）。
+    pub fn register_pending_sounds(&mut self) -> (usize, Vec<(ResId, String)>) {
+        let Some(mixer) = &self.mixer else {
+            return (0, Vec::new()); // 未开音频：零动作（逐位同基线）
+        };
+        let mut registered = 0;
+        let mut failures: Vec<(ResId, String)> = Vec::new();
+        let slots: Vec<ResId> = self.sound_slots.clone();
+        for id in slots {
+            let (path_text, version, bytes) = {
+                let Some(entry) = self.table.entry(id) else {
+                    continue;
+                };
+                let Some(key) = entry.key() else {
+                    continue; // 未绑定（还没 bind）
+                };
+                let Some(loaded) = self.registry.loaded(key) else {
+                    continue; // 未就绪 / 加载失败（状态留在表里，宿主可重试）
+                };
+                let path_text = entry
+                    .path()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| format!("slot {}", id.get()));
+                (path_text, loaded.version, loaded.bytes.clone())
+            };
+            if self.registered_version.get(&id).copied() == Some(version) {
+                continue; // 版本没变（热重载判定，与纹理上传同构）
+            }
+            match nes_audio::wav::parse(&bytes) {
+                Ok(wav) => {
+                    // 键 = 路径去扩展名；毒化容忍与设备线程同一把锁。
+                    let mut guard =
+                        mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.register(sound_key_of(&path_text), Arc::new(wav));
+                    drop(guard);
+                    self.registered_version.insert(id, version);
+                    registered += 1;
+                }
+                Err(e) => {
+                    failures.push((id, format!("声音 {path_text} 解码失败：{e}")));
+                }
+            }
+        }
+        (registered, failures)
+    }
+
+    /// [`Self::register_pending_sounds`] 的收集式内用形态（开音频与
+    /// bind 复用；签名面向调用方便利）。
+    fn register_sounds_collecting(&mut self) -> Vec<(ResId, String)> {
+        self.register_pending_sounds().1
+    }
+
+    /// 把脚本 `play` 落地的声音键转交混音器（tick 后的 Cmd 消费点）。
+    ///
+    /// 消费纪律：
+    /// - **每次 tick 后取走**（`simulate` 与 `tick_headless` 两处入口）——
+    ///   缓冲即取即清，不跨帧积压；
+    /// - 未开音频：照常取走**直接丢弃** —— headless 确定性的音频面语义
+    ///   （指纹不采样缓冲，取走与否不影响语义输出）；
+    /// - 未注册的键：静默丢弃（音频不是语义状态，坏键不崩帧；与
+    ///   `SetProp` 写错属性名的静默口径同家法）。
+    fn consume_played_sounds(&mut self) {
+        let keys = self.tree.take_played_sounds();
+        if keys.is_empty() {
+            return;
+        }
+        let Some(mixer) = &self.mixer else {
+            return; // headless / 未开音频：静默丢弃（确定性不受影响）
+        };
+        let mut guard = mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for key in keys {
+            // 音量 1.0、播一遍（循环播归后续里程碑，见 S13 文档 §5）。
+            let _ = guard.play(&key, 1.0, false);
+        }
+    }
+
+    /// 音频是否已开（诊断/测试用）。
+    pub fn audio_open(&self) -> bool {
+        self.device.is_some()
     }
 
     // ---------- 游戏节拍（S8.1：内建 tick + 固定步长蓄步）----------
@@ -525,6 +707,9 @@ impl NesRuntime {
         self.tree.emit_signal("tick", Value::I64(frame_no));
         for _ in 0..steps {
             self.tree.tick(delta, obs);
+            // Cmd::PlaySound 的消费点（S13 第 2 期）：每步 tick 后取走 ——
+            // 未开音频时即取即弃（headless 确定性；缓冲不跨帧积压）。
+            self.consume_played_sounds();
         }
         steps
     }
@@ -839,6 +1024,17 @@ pub fn write_bmp_rgba(
     Ok(())
 }
 
+/// 声音键 = 资源路径去扩展名（`Audio/beep.wav` -> `Audio/beep`）。
+///
+/// 脚本 `play "…"` 按此约定引用；路径键无碰撞、随场景文件稳定（装载注册
+/// 与 Cmd 转交两侧共用同一推导，不允许两套口径）。
+fn sound_key_of(path: &str) -> String {
+    match path.rsplit_once('.') {
+        Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
+        _ => path.to_string(),
+    }
+}
+
 /// 从消费器借出 GPU 上下文引用（组装层内部用：表面创建需要 &GpuContext）。
 /// 输入快照的脚本只读视图（S8.2b-3）：`mount_input_view` 的注入体。
 struct SnapshotView(Rc<RefCell<InputSnapshot>>);
@@ -889,6 +1085,12 @@ fn consumer_ctx(consumer: &CommandConsumer) -> &GpuContext {
 /// 已上传纹理数（诊断用）。
 pub fn uploaded_texture_count(runtime: &NesRuntime) -> usize {
     runtime.uploaded_version.len()
+}
+
+/// 已注册进混音器的声音槽位数（诊断用；与纹理上传账目同构 —— 装载链
+/// 注册后非零，场景替换清零重记）。
+pub fn registered_sound_count(runtime: &NesRuntime) -> usize {
+    runtime.registered_version.len()
 }
 
 /// 槽位当前绑定的资产键（诊断用；未绑定返回 `None`）。

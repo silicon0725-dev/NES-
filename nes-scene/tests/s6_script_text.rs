@@ -1366,3 +1366,86 @@ fn t_cmp_32_xy_construct_and_components() {
         "xy 非数值分量停机"
     );
 }
+
+// ------------------------------------------------------------ play（S13 第 2 期）
+
+/// T-Cmp-33：`play "key"` 语句 —— 编译产物逐指令相等 + 运行时经
+/// Cmd::PlaySound 入既有 Cmd 流（process 与信号两入口同权，照 emit 口径）。
+#[test]
+fn t_cmp_33_play_statement_compiles_and_flows_through_cmds() {
+    // 编译产物：语句级 Op::Play，零栈交互（前后无压弹指令）。
+    let script = compile_script(r#"every { play "boom" }"#).expect("编译");
+    assert_eq!(script.entry, ScriptEntry::Process);
+    assert_eq!(script.ops, vec![Op::Play { key: "boom".into() }]);
+
+    // process 入口：每帧一条，发射序保持；键名落地取走缓冲（Cmd 流的
+    // 落地面 —— 树不解释音频，只收键名）。
+    let (mut t, _sprite, brain) = tree2d();
+    t.set_prop(brain, "registry_key", Value::Str("p".into())).unwrap();
+    let mut vm = ScriptVm::new();
+    vm.register("p", script);
+    assert!(vm.attach(&mut t, brain).is_ok());
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(
+        t.take_played_sounds(),
+        vec!["boom".to_string(), "boom".to_string()],
+        "两帧各发一条，发射序保持"
+    );
+    // 取走即清空：再 tick 再取，互不粘连。
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(t.take_played_sounds(), vec!["boom".to_string()]);
+    assert!(t.take_played_sounds().is_empty(), "取走幂等（无人再发则空）");
+
+    // 信号入口：on "go" { play "s" } 同一条 Cmd 通道。
+    let (mut t2, _s, brain2) = tree2d();
+    t2.set_prop(brain2, "source", Value::Str(r#"on "go" { play "s" }"#.into())).unwrap();
+    let mut vm2 = ScriptVm::new();
+    assert!(vm2.attach_all(&mut t2).is_empty());
+    t2.emit_signal("go", Value::I64(0));
+    let _ = t2.tick(1.0 / 60.0, &mut vm2);
+    assert_eq!(t2.take_played_sounds(), vec!["s".to_string()], "信号入口同权");
+
+    // 语法错误口径：play 后必须跟字符串字面量；play 是保留字（不得作变量名）。
+    assert!(compile_script(r#"every { play 42 }"#).is_err());
+    assert!(compile_script(r#"every { play = 1 }"#).is_err());
+}
+
+/// T-Cmp-34：播放请求**不是树状态** —— 消费（取走）与否不影响语义指纹，
+/// 同一轨迹跑两遍指纹逐位相同（headless 确定性的音频面契约；音频本身
+/// 不进指纹 —— 指纹采样面只看结构/变换/属性/局部，见 determinism.rs）。
+#[test]
+fn t_cmp_34_played_sounds_are_not_semantic_state() {
+    let run_once = || {
+        let (mut t, _sprite, brain) = tree2d();
+        // 指纹含持久身份（uid 是 canonical 语义身份）—— 代码搭树的 new_v4
+        // 是进程内随机源，两遍会不同；这里钉成确定性派生身份（与场景文件
+        // 装载路径同机制），让"两遍跑"只考音频面而非 uid 面。
+        for (i, n) in t.preorder().into_iter().enumerate() {
+            t.set_uid(n, nes_scene::Uid::derive_legacy(&format!("/p{i}")))
+                .unwrap();
+        }
+        t.set_prop(
+            brain,
+            "source",
+            Value::Str("every { if n < 2 { n = n + 1\n  play \"s\" } }".into()),
+        )
+        .unwrap();
+        let mut vm = ScriptVm::new();
+        assert!(vm.attach_all(&mut t).is_empty());
+        let mut hashes = Vec::new();
+        let mut played = Vec::new();
+        for _ in 0..3 {
+            let _ = t.tick(1.0 / 60.0, &mut vm);
+            hashes.push(nes_scene::scene_fingerprint(&t, Some(&vm)));
+            // 每帧取走并累计 —— 消费（取走）本身不得改变下一帧的指纹。
+            played.extend(t.take_played_sounds());
+        }
+        (hashes, played)
+    };
+    let (h1, played1) = run_once();
+    let (h2, played2) = run_once();
+    assert_eq!(h1, h2, "两遍指纹逐位相同");
+    assert_eq!(played1, vec!["s".to_string(), "s".to_string()]);
+    assert_eq!(played2, played1, "发射序确定");
+}

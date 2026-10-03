@@ -431,6 +431,18 @@ pub enum Cmd {
         /// 新值。
         value: Value,
     },
+    /// 请求播放一个声音（S13 第 2 期；`play "key"` 语句的编译产物）。
+    ///
+    /// 通道裁决：树**不认识音频** —— 不解码、不混音、不碰设备；本命令
+    /// 只是脚本"出声"意图进入既有 Cmd 流的唯一形态（照 `Emit` 的思路：
+    /// 脚本面单一出口，不另开第二通道）。落地见 [`SceneTree::apply_cmd`]：
+    /// 键名收进 [`Self::take_played_sounds`] 的取走缓冲，由宿主
+    ///（nes-runtime）在 tick 后转交混音器；无人取走即自然蒸发（headless
+    /// 不接音频时零成本丢弃，确定性不受影响 —— 缓冲不进语义指纹）。
+    PlaySound {
+        /// 声音键（资产装载链注册进混音器的键，约定 = 资源路径去扩展名）。
+        key: String,
+    },
 }
 
 /// 行为代码看到的树句柄：**只读树 + 命令缓冲**。
@@ -565,6 +577,14 @@ impl<'a> NodeCtx<'a> {
             payload,
             event: None,
         });
+    }
+
+    /// 请求播放一个声音（S13 第 2 期）：入既有 Cmd 流（[`Cmd::PlaySound`]），
+    /// 键名落地到 [`SceneTree::take_played_sounds`] 的取走缓冲，宿主 tick 后
+    /// 转交混音器。**不写树**（音频不是树状态）—— 与 `emit` 同一条纪律：
+    /// process 入口与信号入口都可发。
+    pub fn play_sound(&mut self, key: &str) {
+        self.cmds.push(Cmd::PlaySound { key: key.to_string() });
     }
 }
 
@@ -764,6 +784,12 @@ impl<'a> SignalCtx<'a> {
             value,
         });
     }
+
+    /// 请求播放一个声音（S13 第 2 期；与 [`NodeCtx::play_sound`] 同一条
+    /// Cmd 通道 —— 信号入口照发不误）。
+    pub fn play_sound(&mut self, key: &str) {
+        self.cmds.push(Cmd::PlaySound { key: key.to_string() });
+    }
 }
 
 /// 空观察者：宿主没有行为代码时的缺省。
@@ -930,6 +956,12 @@ pub struct SceneTree {
     /// 全局时间缩放（草案 §9）。只乘 `delta`，不改遍历次数（确定性优先）。
     /// 写入时钳到 `[0, +∞)`——负时间没有可解释的语义，宁可夹住不放行。
     time_scale: f32,
+    /// [`Cmd::PlaySound`] 的落地缓冲（S13 第 2 期）：树不解释音频，只把
+    /// 脚本请求的声音键按发射序收在这里，宿主经 [`Self::take_played_sounds`]
+    /// 取走转交混音器。与 `pending`/`signal_queue` 同一家法 —— 单帧内
+    /// 聚积的副作用缓冲，不进语义指纹（音频不是树状态，取走与否不影响
+    /// 结构/属性/局部）；无人取走时仅占内存、不影响任何语义输出。
+    played_sounds: Vec<String>,
 }
 
 impl SceneTree {
@@ -972,6 +1004,7 @@ impl SceneTree {
             signal_handlers: HashMap::new(),
             paused: false,
             time_scale: 1.0,
+            played_sounds: Vec::new(),
         }
     }
 
@@ -2003,6 +2036,16 @@ impl SceneTree {
         stats
     }
 
+    /// 取走自上次取走以来脚本请求播放的声音键（S13 第 2 期；**发射序**，
+    /// 每条 `play` 一个元素，可重复）。宿主（nes-runtime）在 tick 后调它，
+    /// 把键转交混音器；headless 不接音频时不调即静默丢弃。
+    ///
+    /// 缓冲是副作用通道不是状态：不进语义指纹、不进序列化，取走与否
+    /// 不影响树的结构/属性/局部 —— 同一轨迹跑两遍指纹逐位相同。
+    pub fn take_played_sounds(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.played_sounds)
+    }
+
     // ---------- 内部：不变式维护 ----------
 
     fn next_order(&mut self) -> u64 {
@@ -2032,6 +2075,12 @@ impl SceneTree {
                     parent,
                     at: None,
                 });
+            }
+            Cmd::PlaySound { key } => {
+                // 树不认识音频：只收下键名（发射序），宿主 tick 后经
+                // take_played_sounds 取走转交混音器；无人取走即自然蒸发
+                //（headless 零成本丢弃，确定性不受影响 —— 缓冲不进指纹）。
+                self.played_sounds.push(key);
             }
         }
     }

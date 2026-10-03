@@ -7,6 +7,10 @@ name = "nes-asset"
 version = "0.1.0"
 
 [[package]]
+name = "nes-audio"
+version = "0.1.0"
+
+[[package]]
 name = "nes-render-api"
 version = "0.1.0"
 
@@ -30,6 +34,7 @@ name = "nes-runtime"
 version = "0.1.0"
 dependencies = [
  "nes-asset",
+ "nes-audio",
  "nes-render-api",
  "nes-render-extract",
  "nes-render-wgpu",

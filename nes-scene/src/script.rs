@@ -115,8 +115,7 @@ pub enum Op {
     Key,
     /// 弹 y、x（栈序），压 `Vec2(x, y)`（S7.4 真实项目解锁：任意表达式
     /// 构造向量 —— `xy(px + dx, py)`；数字字面量仍走 Const 折叠）。
-    Pack,
-    /// 弹 Vec2，压 x 分量（F32）。S7.4：`node.pos.x`。
+    Pack,    /// 弹 Vec2，压 x 分量（F32）。S7.4：`node.pos.x`。
     GetX,
     /// 弹 Vec2，压 y 分量（F32）。S7.4：`node.pos.y`。
     GetY,
@@ -153,6 +152,16 @@ pub enum Op {
     /// 最高 z_index 优先，世界包围盒含点即命中，压 NodeHandle；
     /// 无命中压 Bool(false)。
     Hit,
+    /// 播放一个声音（S13 第 2 期）：`play "key"` 的编译产物。**无栈交互**
+    /// （键名是编译期常量，不弹不压 —— 语句级副作用，与 `Emit` 的"弹载荷"
+    /// 不同：声音没有载荷可编）。执行 = 经 [`VmCtx::play_sound`] 发
+    /// [`crate::tree::Cmd::PlaySound`] 入既有 Cmd 流，树落地、宿主转混音器；
+    /// headless 无混音器时键名自然蒸发（确定性不受影响）。循环播
+    ///（`play_loop` 一类）P0 不做，归后续里程碑（见 S13 文档 §5）。
+    Play {
+        /// 声音键（资产装载链注册进混音器的键，约定 = 资源路径去扩展名）。
+        key: String,
+    },
 }
 
 /// 脚本入口。
@@ -242,6 +251,15 @@ impl VmCtx<'_, '_> {
         match self {
             VmCtx::Node(c) => c.emit(name, payload),
             VmCtx::Signal(c) => c.emit(name, payload),
+        }
+    }
+
+    /// 播放声音（S13 第 2 期）：两入口同权（照 `emit` 的口径 —— process
+    /// 入口与信号入口都可发；play 不写树，NodeCtx 的"只写自身"纪律不涉及）。
+    fn play_sound(&mut self, key: &str) {
+        match self {
+            VmCtx::Node(c) => c.play_sound(key),
+            VmCtx::Signal(c) => c.play_sound(key),
         }
     }
 }
@@ -775,6 +793,13 @@ fn run<'a, 'b>(
                     .collect();
                 stack.push(StackVal::V(Value::Array(children)));
             }
+            Op::Play { key } => {
+                // play "key"（S13 第 2 期）：语句级副作用，零栈交互 ——
+                // 发 Cmd::PlaySound 入既有 Cmd 流（两入口同权，照 emit 口径；
+                // play 不写树，"process 只写自身"纪律不涉及）。键未注册等
+                // 错误在宿主转混音器处如实报告，VM 层不校验（键面归音频）。
+                ctx.play_sound(key);
+            }
         }
         pc += 1;
     }
@@ -1301,11 +1326,12 @@ impl SceneObserver for ScriptVm {
 //     sprite.flip_h = true           // 属性读写（节点.属性名）
 //     if 2 < n { emit "done" n }     // 条件（无 else；比较单级）
 //     emit "tick" (1.0, 0.0)         // 发射（名 + 载荷；Vec2 字面量仅数字）
+//     play "boom"                    // 播放声音（S13 第 2 期；语句级，无载荷）
 // }
 // ```
 //
 // 栈序由编译器按构造保证（如 `x.pos = x.pos + d` 自然编译为
-// [N,GetT,d...,N,SetT] —— 节点压两次）；保留字：on/every/if/emit/
+// [N,GetT,d...,N,SetT] —— 节点压两次）；保留字：on/every/if/emit/play/
 // arg/this/true/false；`//` 行注释；语句以换行或 `;` 分隔。
 
 use crate::scene_io::ParseError;
@@ -1582,9 +1608,9 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 15] = [
+const RESERVED: [&str; 16] = [
     "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
-    "arg", "this", "true", "false",
+    "arg", "this", "true", "false", "play",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -2104,6 +2130,14 @@ impl TextParser {
                 ops.push(Op::Emit(name));
                 Ok(())
             }
+            // play 语句（S13 第 2 期）：`play "key"` —— 照 emit 的解析样式
+            //（语句级关键字 + 字符串字面量）；键是编译期常量，无载荷表达式。
+            Tok::Ident(k) if k == "play" => {
+                self.pos += 1;
+                let key = self.expect_str()?;
+                ops.push(Op::Play { key });
+                Ok(())
+            }
             // push/pop 语句（S8.2b-2）：读-改-写局部绑定（变异的是绑定，
             // v1.1 冻结）。push(a, e) / pop(a)。
             Tok::Ident(k) if k == "push" && matches!(self.peek2().tok, Tok::Sym('(')) => {
@@ -2407,7 +2441,9 @@ impl TextParser {
                 }
                 }
             }
-            _ => Err(self.err_here("期望语句（赋值 / if / while / for / break / continue / emit）")),
+            _ => Err(self.err_here(
+                "期望语句（赋值 / if / while / for / break / continue / emit / play）",
+            )),
         }
     }
 
