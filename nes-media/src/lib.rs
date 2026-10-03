@@ -27,6 +27,9 @@
 //! * 音频：[`decode_audio`] -> `nes_audio::Wav` **同构**（任意源率/声道
 //!   如实保留，16-bit 交错 PCM）—— Mixer 自带线性重采样与 1/2 声道换算，
 //!   上层对"这条声音来自 MP3 还是 WAV"零感知；
+//! * 视频（S14.2"小而完整"实验）：[`avi::AviVideo`] —— AVI 容器手写
+//!   RIFF（wav.rs 同族家法），帧解码 DIB 手写 / MJPG 走 `image`，音轨
+//!   PCM 直接产 `nes_audio::Wav` 进混音器；产物同为上面两个 DTO；
 //! * 错误：[`MediaError`] 三态（格式不支持 / 解码失败 / IO），Display 中文。
 //!
 //! # 覆盖面与边界
@@ -36,8 +39,10 @@
 //! * 音频覆盖面 = symphonia features（mp3/flac/ogg/vorbis/pcm/wav/
 //!   isomp4/aac）；解码是**全轨进内存**（一首 4 分钟曲子约 40-80MB
 //!   PCM —— P0 可接受，流式是后续，见 S14 文档 §5）；
-//! * **视频不做**（AMV 解码为下一轮）：适配层已留位 —— 新格式 = 本
-//!   crate 新模块 + G13 白名单扩条，引擎核心不动。
+//! * 视频：AVI 1.0 单段（DIB / MJPG 帧 + PCM 音轨），覆盖面与 AMV /
+//!   avio（FFmpeg）路线的边界见 [`avi`] 模块文档；
+//! * **AMV 不做**（下一轮 Adapter 通用性试金石）：适配层已留位 —— 新
+//!   格式 = 本 crate 新模块 + G13 白名单扩条，引擎核心不动。
 //!
 //! # unsafe 与测试纪律
 //!
@@ -48,9 +53,11 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod avi;
 pub mod audio;
 pub mod image;
 
+pub use avi::{AviVideo, VideoCodec, VideoInfo};
 pub use audio::decode_audio;
 pub use image::{decode_image, DecodedImage};
 
