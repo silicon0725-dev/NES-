@@ -1,4 +1,4 @@
-//! 手写 WAV 解析器：RIFF 块遍历 + 16-bit PCM，只做这一种。
+//! 手写 WAV 解析器：RIFF 块遍历 + 16/24-bit PCM（24-bit 取高 16 位）。
 //!
 //! # 写出（[`write_wav`]，S13 第 2 期）
 //!
@@ -117,7 +117,7 @@ pub fn parse(data: &[u8]) -> Result<Wav, WavError> {
         return Err(WavError::NotWave);
     }
 
-    let mut fmt: Option<(u32, u16)> = None; // (sample_rate, channels)
+    let mut fmt: Option<(u32, u16, u16)> = None; // (sample_rate, channels)
     let mut pcm_range: Option<std::ops::Range<usize>> = None;
     let mut pos = 12usize;
 
@@ -147,10 +147,10 @@ pub fn parse(data: &[u8]) -> Result<Wav, WavError> {
                     data[body + 4..body + 8].try_into().expect("采样率固定 4 字节"),
                 );
                 let bits = read_u16(data, body + 14);
-                if bits != 16 {
+                if bits != 16 && bits != 24 {
                     return Err(WavError::UnsupportedBits(bits));
                 }
-                fmt = Some((sample_rate, channels));
+                fmt = Some((sample_rate, channels, bits));
             }
             b"data" => pcm_range = Some(body..body + size),
             // LIST / fact / JUNK / 任何未知块：按块头长度跳过（S13 契约明确要求）。
@@ -164,17 +164,34 @@ pub fn parse(data: &[u8]) -> Result<Wav, WavError> {
         }
     }
 
-    let (sample_rate, channels) = fmt.ok_or(WavError::MissingChunk("fmt "))?;
+    let (sample_rate, channels, bits) = fmt.ok_or(WavError::MissingChunk("fmt "))?;
     let range = pcm_range.ok_or(WavError::MissingChunk("data"))?;
-    if range.len() % 2 != 0 {
-        // data 长度是奇数字节：16-bit 样本对不齐，按截断处理。
+    let bytes_per = usize::from(bits) / 8;
+    if range.len() % bytes_per != 0 {
+        // data 长度不是样本整倍数：按截断处理（16-bit 奇字节 / 24-bit 非整帧）。
         return Err(WavError::Truncated);
     }
-    let samples = range
-        .clone()
-        .step_by(2)
-        .map(|i| i16::from_le_bytes([data[i], data[i + 1]]))
-        .collect();
+    // 16-bit 直读；24-bit 取高 16 位（算术右移，保留符号——动态范围
+    // 48dB 截断，引擎 SFX 用途足够；文档与 2026-10-03 实测口径一致：
+    // 用户音效包 1665 个 WAV 中 344 个为 24-bit，为此放宽契约）。
+    let samples: Vec<i16> = if bits == 16 {
+        range
+            .clone()
+            .step_by(2)
+            .map(|i| i16::from_le_bytes([data[i], data[i + 1]]))
+            .collect()
+    } else {
+        range
+            .clone()
+            .step_by(3)
+            .map(|i| {
+                let v = (data[i] as i32) | ((data[i + 1] as i32) << 8) | ((data[i + 2] as i32) << 16);
+                // 24 位符号扩展到 32 位后取高 16 位。
+                let ext = (v << 8) >> 8; // 符号扩展
+                (ext >> 8) as i16
+            })
+            .collect()
+    };
 
     Ok(Wav { sample_rate, channels, samples })
 }
@@ -312,12 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn t_wav05_24bit_rejected() {
+    fn t_wav05_24bit_top16() {
+        // 2026-10-03 真实音效包实测（1665 个 WAV 中 344 个 24-bit）：
+        // 契约从"拒绝"演进为"取高 16 位"。24-bit 小端三字节 0x12 0x34 0x56
+        // = 0x00563412，符号扩展后 >>8 = 0x5634。
         let mut bytes = wav_bytes(1, 8000, &[1]);
-        // fmt 体偏移 14 是 wBitsPerSample（RIFF 头 12 + fmt 块头 8 + 14）。
-        let at = 12 + 8 + 14;
-        bytes[at..at + 2].copy_from_slice(&24u16.to_le_bytes());
-        assert_eq!(parse(&bytes), Err(WavError::UnsupportedBits(24)));
+        // 布局（wav_bytes 固定形）：RIFF 头 12 | fmt 块头 8 + 体 18 | data 块头 8 + 体 2。
+        let fmt_at = 12 + 8; // fmt 体起点（20）
+        bytes[fmt_at + 14..fmt_at + 16].copy_from_slice(&24u16.to_le_bytes());
+        let data_hdr = fmt_at + 18; // data 块头起点（38）
+        bytes[data_hdr + 4..data_hdr + 8].copy_from_slice(&3u32.to_le_bytes()); // 块长 3
+        bytes.truncate(data_hdr + 8); // 丢原 16-bit 样本
+        bytes.extend_from_slice(&[0x12, 0x34, 0x56]); // 24-bit 单样本
+        let riff_len = (bytes.len() as u32) - 8;
+        bytes[4..8].copy_from_slice(&riff_len.to_le_bytes());
+
+        let wav = parse(&bytes).expect("24-bit 必须可解析");
+        assert_eq!(wav.samples, vec![0x5634i16]);
     }
 
     #[test]

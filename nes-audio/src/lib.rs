@@ -49,4 +49,4 @@ pub mod wav;
 
 pub use device::{AudioDevice, AudioError};
 pub use mixer::{Mixer, MixerError, Voice};
-pub use wav::{Wav, WavError};
+pub use wav::{parse, Wav, WavError};
