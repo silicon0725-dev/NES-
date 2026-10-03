@@ -30,7 +30,7 @@
     G8 / G9 / G10 为 S4「后端 crate 接入」新增，与 nes-render-wgpu/Cargo.toml
     的依赖纪律注释一一对应。
 
-    G11 nes-runtime（引擎组装层）的直接依赖只能是六个项目 crate（path 依赖），
+    G11 nes-runtime（引擎组装层）的直接依赖只能是七个项目 crate（path 依赖），
         且零第三方依赖、独立工作区根；任何 crate 不得依赖 nes-runtime
         —— 组装层是全链顶端叶子，只许被可执行目标（示例/测试）消费
 
@@ -38,6 +38,18 @@
         无 build.rs、独立工作区根；除 nes-runtime 正向接入（S13 第 2 期，
         runtime ──▶ nes-audio 方向唯一）外，任何 crate 不得（直接或传递）
         依赖它 —— 音频核心是依赖树的纯叶子，正向白名单仅含组装层，反向一律禁止
+
+    G13 nes-media（S14 编解码适配层）是**全仓库唯一允许第三方依赖的 crate**：
+        其依赖树中的第三方（registry）crate 必须全部落在白名单家族内 ——
+        image 系（image 及其全部传递依赖）+ symphonia 系（symphonia 及其
+        全部传递依赖）；仓库内直接依赖只许 nes-audio（path）。其它任何
+        registry 依赖一律越界；除 nes-runtime 正向接入外，任何 crate 不得
+        依赖 nes-media —— 第三方被收口在最外圈的一个叶子上，引擎核心
+        （G3/G10/G12 钉住的那七个）零第三方纪律不变。
+
+    G13 为 S14「媒体解码适配层第 1 期」新增：依赖分层政策（用户裁决）
+    由本条正向钉住 —— 编解码器采用成熟 Rust 库（image 0.25 系 /
+    symphonia 0.5 系），与既有守卫互不侵扰（G1-G12 逐条保持）。
 
 退出码：0 = 全部通过；1 = 有检查项失败；2 = 环境/参数错误（例如 cargo 不可用）。
 仅使用 Python 标准库，可直接接入 CI。
@@ -66,9 +78,12 @@ BACKEND_ALLOWED = (CONTRACT_CRATE,)                # 后端唯一合法直接依
 BACKEND_FORBIDDEN_UPSTREAM = ("nes-scene", "nes-asset", "nes-render-extract")
 NO_DEP_ON_BACKEND = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE)  # 这些层不得依赖后端
 RUNTIME_CRATE = "nes-runtime"                      # 引擎组装层：全链顶端叶子
+MEDIA_CRATE = "nes-media"                          # S14 编解码适配层：唯一允许第三方的 crate
 # S13 第 2 期：runtime 正向接入音频（runtime ──▶ nes-audio 方向唯一）。
+# S14 第 1 期：runtime 正向接入编解码适配层（解码产物 -> 既有纹理/Wav 面）。
 RUNTIME_ALLOWED = ("nes-asset", "nes-scene", "nes-render-api",
-                   "nes-render-extract", "nes-render-wgpu", "nes-audio")
+                   "nes-render-extract", "nes-render-wgpu", "nes-audio",
+                   MEDIA_CRATE)
 SOURCE_FORBIDDEN_RE = re.compile(r"nes[-_]render", re.IGNORECASE)
 SOURCE_SCAN_EXT = (".rs", ".toml")
 # 提取层源码里不得出现对资源层类型的真实引用（注释里提名字不算，故只匹配 use / 路径限定调用）。
@@ -78,7 +93,12 @@ EXTRACT_ASSET_RE = re.compile(
 AUDIO_CRATE = "nes-audio"                          # S13 音频核心：依赖树的纯叶子（wav + 混音 + waveOut）
 # 不得依赖 nes-audio 的 crate：S13 第 2 期起 runtime 正向接入（runtime ──▶
 # nes-audio 方向唯一，由 G11 的白名单正向钉住），反向禁令不再含 runtime。
+# S14 第 1 期起 nes-media 亦正向依赖它（编解码适配层产 nes_audio::Wav
+# 同构 DTO）—— 该方向的合法性由 G13 的白名单钉住，不在此清单内。
 NO_DEP_ON_AUDIO = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE)
+MEDIA_THIRD_ROOTS = ("image", "symphonia")         # 第三方白名单根（及其全部传递依赖）
+MEDIA_REPO_ALLOWED = ("nes-audio",)                # 仓库内白名单（必须 path 依赖）
+MEDIA_CONSUMERS_ALLOWED = (RUNTIME_CRATE,)         # 唯一消费方：引擎组装层
 
 
 class Colors:
@@ -130,6 +150,28 @@ def root_dep_names(meta: dict) -> list:
             queue.append(pid)
     names = {pkg["name"] for pkg in meta.get("packages", []) if pkg["id"] in seen}
     return sorted(names)
+
+
+def reachable_names_from(meta: dict, start_name: str) -> set:
+    """返回依赖图中从指定包名出发可达的**全部包名**（含起点自身）。
+
+    G13 用它圈出白名单家族：`image` / `symphonia` 各自的传递闭包 ——
+    白名单根带来的依赖是白名单的内在成本，跟踪家族闭包而不是逐个
+    枚举包名，第三方补丁版本换依赖时守卫不需要跟着改。
+    """
+    nodes = {n["id"]: n for n in meta.get("resolve", {}).get("nodes", [])}
+    name_of = {pkg["id"]: pkg["name"] for pkg in meta.get("packages", [])}
+    start_ids = [pid for pid, name in name_of.items() if name == start_name]
+    seen, queue = set(), list(start_ids)
+    while queue:
+        nid = queue.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        for dep in nodes.get(nid, {}).get("deps", []):
+            if dep["pkg"] not in seen:
+                queue.append(dep["pkg"])
+    return {name_of[pid] for pid in seen if pid in name_of}
 
 
 def declared_deps(meta: dict, crate: str) -> list:
@@ -186,7 +228,8 @@ def main() -> int:
         print("cargo 不在 PATH 中，无法执行依赖方向检查", file=sys.stderr)
         return 2
 
-    crates = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE, RUNTIME_CRATE, AUDIO_CRATE)
+    crates = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE, RUNTIME_CRATE,
+                          AUDIO_CRATE, MEDIA_CRATE)
     missing = [c for c in crates if not os.path.isfile(os.path.join(root, c, "Cargo.toml"))]
     if missing:
         print("缺少 crate 清单文件：%s" % ", ".join(missing), file=sys.stderr)
@@ -408,7 +451,7 @@ def main() -> int:
         or "(无)",
     )
     detail += "\n传递依赖 %d 个：%s" % (len(rt_trans), ", ".join(rt_trans))
-    detail += "\n合法直接依赖白名单：六个项目 crate（全部 path；含 S13 第 2 期正向接入的 nes-audio）"
+    detail += "\n合法直接依赖白名单：七个项目 crate（全部 path；含 S13 第 2 期正向接入的 nes-audio、S14 第 1 期正向接入的 nes-media）"
     detail += "\n" + "\n".join(rt_rev_lines)
     if rt_illegal:
         detail += "\n越界依赖：" + ", ".join(rt_illegal)
@@ -420,7 +463,7 @@ def main() -> int:
         detail += "\n违规反向依赖：" + ", ".join(rt_rev_bad)
     record(
         "G11",
-        "%s 仅向下依赖六个项目 crate（path）、零第三方、独立工作区根、无人反向依赖"
+        "%s 仅向下依赖七个项目 crate（path）、零第三方、独立工作区根、无人反向依赖"
         % RUNTIME_CRATE,
         not (rt_illegal or rt_unpathed or rt_registry or not rt_own_ws or rt_rev_bad),
         detail,
@@ -471,9 +514,66 @@ def main() -> int:
         detail += "\n违规反向依赖：" + ", ".join(au_rev_bad)
     record(
         "G12",
-        "%s 零依赖（normal/dev/build 均为空）、无 build.rs、独立工作区根、除 runtime 正向外无人反向依赖"
+        "%s 零依赖（normal/dev/build 均为空）、无 build.rs、独立工作区根、除 runtime 正向接入外无人反向依赖"
         % AUDIO_CRATE,
         not (au_declared or au_registry or au_build_rs or not au_own_ws or au_rev_bad),
+        detail,
+    )
+
+    # ---- G13：nes-media 是全仓库唯一允许第三方依赖的 crate（S14 依赖分层政策）----
+    #      第三方（registry）依赖树必须全部落在 image 系 / symphonia 系两个
+    #      白名单家族的传递闭包内；仓库内直接依赖只许 nes-audio（path）；
+    #      除 nes-runtime 正向接入外无人依赖它。引擎核心的零第三方纪律
+    #      （G3/G10/G11/G12）不受影响 —— 第三方被收口在最外圈的一个叶子上。
+    md_declared = declared_deps(metas[MEDIA_CRATE], MEDIA_CRATE)
+    md_trans = root_dep_names(metas[MEDIA_CRATE])
+    allowed_third: set = set()
+    for family_root in MEDIA_THIRD_ROOTS:
+        allowed_third |= reachable_names_from(metas[MEDIA_CRATE], family_root)
+    # 家族闭包只该圈住第三方 —— 仓库内 crate 若混进闭包（白名单根路径依赖
+    # 了仓库 crate），按"仓库依赖单列"的口径剔除，由下面的 repo 规则管辖。
+    md_illegal = [
+        d for d in md_trans
+        if d not in allowed_third and d not in MEDIA_REPO_ALLOWED
+    ]
+    md_repo = [n for n, _k, p in md_declared if p]
+    md_repo_bad = [n for n in md_repo if n not in MEDIA_REPO_ALLOWED]
+    md_unpathed = [
+        n for n, _k, p in md_declared if not p and n not in allowed_third
+    ]
+    md_rev_bad = []
+    md_rev_lines = []
+    for crate in PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE,
+                              AUDIO_CRATE, MEDIA_CRATE):
+        deps = root_dep_names(metas[crate])
+        md_rev_lines.append("%s：传递依赖 %d 个" % (crate, len(deps)))
+        for d in deps:
+            if d == MEDIA_CRATE:
+                md_rev_bad.append("%s -> %s" % (crate, d))
+    detail = "声明依赖 %d 条：%s" % (
+        len(md_declared),
+        ", ".join("%s[%s]%s" % (n, k, "(path)" if p else "(registry)") for n, k, p in md_declared)
+        or "(无)",
+    )
+    detail += "\n传递依赖 %d 个：%s" % (len(md_trans), ", ".join(md_trans) or "(无)")
+    detail += "\n第三方白名单（传递闭包 %d 包）：%s" % (
+        len(allowed_third), ", ".join(sorted(allowed_third)))
+    detail += "\n仓库内白名单：%s（必须 path）" % ", ".join(MEDIA_REPO_ALLOWED)
+    detail += "\n" + "\n".join(md_rev_lines)
+    if md_illegal:
+        detail += "\n越界的第三方依赖（白名单外）：" + ", ".join(md_illegal)
+    if md_repo_bad:
+        detail += "\n越界的仓库内依赖（只许 nes-audio）：" + ", ".join(md_repo_bad)
+    if md_unpathed:
+        detail += "\n非 path 且不在任何白名单家族内的直接依赖：" + ", ".join(md_unpathed)
+    if md_rev_bad:
+        detail += "\n违规反向依赖（唯一合法消费方是 %s）：%s" % (
+            " / ".join(MEDIA_CONSUMERS_ALLOWED), ", ".join(md_rev_bad))
+    record(
+        "G13",
+        "%s 第三方依赖全部落在 image/symphonia 白名单家族内、仓库内仅 nes-audio（path）、"
+        "除 runtime 正向接入外无人反向依赖" % MEDIA_CRATE,
+        not (md_illegal or md_repo_bad or md_unpathed or md_rev_bad),
         detail,
     )
 

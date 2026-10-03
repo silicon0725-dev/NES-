@@ -545,10 +545,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
-name = "nes-asset"
-version = "0.1.0"
-
-[[package]]
 name = "nes-audio"
 version = "0.1.0"
 
@@ -559,45 +555,6 @@ dependencies = [
  "image",
  "nes-audio",
  "symphonia",
-]
-
-[[package]]
-name = "nes-render-api"
-version = "0.1.0"
-
-[[package]]
-name = "nes-render-extract"
-version = "0.1.0"
-dependencies = [
- "nes-render-api",
- "nes-scene",
-]
-
-[[package]]
-name = "nes-render-wgpu"
-version = "0.1.0"
-dependencies = [
- "nes-render-api",
-]
-
-[[package]]
-name = "nes-runtime"
-version = "0.1.0"
-dependencies = [
- "nes-asset",
- "nes-audio",
- "nes-media",
- "nes-render-api",
- "nes-render-extract",
- "nes-render-wgpu",
- "nes-scene",
-]
-
-[[package]]
-name = "nes-scene"
-version = "0.1.0"
-dependencies = [
- "nes-asset",
 ]
 
 [[package]]

@@ -15,7 +15,7 @@ path = "src/lib.rs"
 name = "engine_frame"
 path = "examples/engine_frame.rs"
 
-# 依赖方向（组装层是全链的**顶端叶子**，位于所有 crate 之上）：
+# 依赖方向（组装层是全链的**顶端叶子**）：
 #
 #     nes-asset ──▶ nes-scene ──▶ nes-render-extract ──▶ nes-render-api ──▶ nes-render-wgpu
 #                          └──────────────────┴──────────────┴────────────────┘
@@ -24,14 +24,21 @@ path = "examples/engine_frame.rs"
 #     nes-audio ──▶ 本 crate（S13 第 2 期正向接入：runtime ──▶ nes-audio，
 #                   方向唯一；守卫 G12 的反向禁令不含 runtime —— 正向白名单已放宽）
 #
-# 本 crate 是"引擎"的雏形：把五个 crate 装配成「场景树 -> 资源 -> 每帧提取 ->
-# 命令流 -> GPU -> 像素」的一条帧循环。它不实现任何渲染/场景语义 —— 语义在
-# 各 crate 里已冻结，这里只做组合。音频同理（S13 第 2 期）：解码/混音/设备
-# 语义全部在 nes-audio，本层只做装配（open_audio）、Sound 资源装载注册与
-# 脚本 Cmd::PlaySound 的转交 —— 音频不进语义状态。
+#     nes-media ──▶ 本 crate（S14 第 1 期正向接入：编解码适配层是全仓库唯一
+#                   允许第三方的 crate（G13 白名单：image 系 / symphonia 系 /
+#                   nes-audio）；解码产物映射到既有类型 —— 图像 RGBA8 走纹理
+#                   注册/上传路径、音频 nes_audio::Wav 同构直进混音器，上层
+#                   对第三方解码器零感知）
 #
-# 零第三方依赖（全部 path 依赖）；空 [workspace] 表钉成独立工作区根，
-# 与 GPU 侧 crate 同一纪律。
+# 本 crate 是"引擎"的雏形：把 crate 装配成「场景树 -> 资源 -> 每帧提取 ->
+# 命令流 -> GPU -> 像素」的一条帧循环。它不实现任何渲染/场景/解码语义 ——
+# 语义在各 crate 里已冻结，这里只做组合。音频同理（S13 第 2 期起）：解码/
+# 混音/设备语义在 nes-audio、扩展格式解码在 nes-media（S14），本层只做
+# 装配（open_audio）、Sound 资源装载注册与脚本 Cmd::PlaySound 的转交 ——
+# 音频不进语义状态。
+#
+# 除 nes-media 一条（适配层自身按 G13 白名单携带第三方）外零第三方依赖；
+# 空 [workspace] 表钉成独立工作区根，与 GPU 侧 crate 同一纪律。
 [dependencies]
 nes-asset = { path = "../nes-asset" }
 nes-scene = { path = "../nes-scene" }
@@ -39,5 +46,6 @@ nes-render-api = { path = "../nes-render-api" }
 nes-render-extract = { path = "../nes-render-extract" }
 nes-render-wgpu = { path = "../nes-render-wgpu" }
 nes-audio = { path = "../nes-audio" }
+nes-media = { path = "../nes-media" }
 
 [workspace]

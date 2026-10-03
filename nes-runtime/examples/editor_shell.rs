@@ -132,6 +132,19 @@
 //! 无害：空混音器静音填充）。游戏脚本 `play "…"` 的 Cmd::PlaySound 由
 //! 运行时在 tick 后转交混音器 —— play-in-editor 运行态由此出声。
 //!
+//! S14 第 1 期（媒体解码适配层接入）：① res:// 白名单扩到外部交付格式
+//! （jpg/jpeg/webp/gif + flac/mp3/ogg/m4a —— 只是**列出**；装载/解码在
+//! 场景声明它们之后走 nes-media 适配层，见 runtime 的 declare_image 与
+//! Sound 装载回落序）；② **用户实测音乐接入**：装配时若用户音乐目录里
+//! 有实测曲（FLAC/MP3，不在仓库 —— CI/他机安全跳过），经 nes-media
+//! 解码成全量 PCM 宿主直注混音器（键 "music"/"music2"）。**数字键 0 =
+//! 三态循环**：心似烟火(FLAC) -> Montagem Nada(MP3) -> 停 -> 回到第一首
+//! （编辑态专属；改名框持焦让位输入）。整曲解码进内存（一首 4 分钟
+//! 44.1kHz 立体声约 40-80MB PCM，P0 可接受）—— **流式是后续**（见 S14
+//! 文档 §5 遗留）。Output 记 `music loaded (flac, 96000Hz stereo, N sec)`
+//! 一行/曲，三态切换各记一行（ASCII 标签 —— 文件名是用户数据，不进
+//! 日志与断言）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -171,6 +184,57 @@ fn beep_samples(duration_ms: u32, amplitude: i16) -> Vec<i16> {
         .collect()
 }
 
+// ---- S14：用户实测音乐（nes-media 适配层的真实交付物实测链路）----
+//
+// 文件在**用户机器**上（不在仓库 —— CI/他机安全跳过）；文件名是用户
+// 数据：as-is 字符串常量拼接路径，但**打印与断言一律 ASCII 标签**
+// （"flac"/"mp3"），中文文件名不进 Output 也不进 demo 断言。
+
+/// 用户音乐目录（实测曲所在）。
+const MUSIC_DIR: &str = "C:/Users/Administrator/Music/text";
+/// 实测曲 1：FLAC（无损）。键 = "music"。
+const MUSIC_FLAC_NAME: &str = "心似烟火.flac";
+/// 实测曲 2：MP3（有损）。键 = "music2"。
+const MUSIC_MP3_NAME: &str = "Montagem Nada.mp3";
+
+/// 装载一首用户音乐：读盘 -> nes-media 全量解码 -> 宿主直注混音器。
+/// 成功返回 `Some(信息行)`（ASCII：`music loaded (flac, 44100Hz stereo,
+/// N sec, X KB, Y ms)`），文件缺失/解码失败返回 `None`（后者另记失败行）。
+fn load_user_music(
+    rt: &mut NesRuntime,
+    file_name: &str,
+    fmt_label: &str,
+    mixer_key: &str,
+    ring: &Rc<RefCell<VecDeque<String>>>,
+) -> Option<String> {
+    let bytes = std::fs::read(std::path::Path::new(MUSIC_DIR).join(file_name)).ok()?;
+    let started = Instant::now();
+    match nes_media::decode_audio(&bytes) {
+        Ok(wav) => {
+            let secs = if wav.sample_rate > 0 {
+                wav.frames() as u64 / u64::from(wav.sample_rate)
+            } else {
+                0
+            };
+            let channels = if wav.channels == 1 { "mono" } else { "stereo" };
+            let rate = wav.sample_rate;
+            rt.register_host_sound(mixer_key, std::sync::Arc::new(wav));
+            let line = format!(
+                "music loaded ({}, {}Hz {}, {} sec, {} KB, {} ms)",
+                fmt_label,
+                // 采样率从解码产物读 —— 以实测为准，不预设文件元数据。
+                rate, channels, secs, bytes.len() / 1024,
+                started.elapsed().as_millis(),
+            );
+            Some(line)
+        }
+        Err(e) => {
+            log_line(ring, format!("music load failed ({fmt_label}): {e}"));
+            None
+        }
+    }
+}
+
 /// 布局常量（S12-4 冻结、S12-6 扩底部 dock）：面板**恒定宽** —— 最大化
 /// 只扩中间世界视口，侧面板不跟着拉伸（消除"整个画面被拉长"观感的关键）。
 /// - 左层级面板：x = 8..188（宽 180），y = 40..ch-dock 上缘；
@@ -196,8 +260,9 @@ const DOCK_ROW_H: f32 = 18.0;
 /// 起 12 行、S12-9 起 20 行：冒烟钩子要同时断言 Enter 与 FileSystem
 /// 双击**两条挂载路径**、play/stop/reset 全链路日志（一轮流程约 17
 /// 行，早期行不再被新行挤出断言窗；dock 可见窗仍只显最新几行，显示
-/// 面不变）。
-const EDITOR_LOG_KEEP: usize = 20;
+/// 面不变）。S14 第 1 期起 26 行：音乐接入再加 2 行装载 + 3 行三态
+/// 切换，既有断言行的窗口余量照旧保住。
+const EDITOR_LOG_KEEP: usize = 26;
 /// dock 行显示截宽（字符数）：Output dock 是 ListView 行（ListState
 /// **位图路径**，S12-11 壳层接入不改 —— 见模块头），等宽 advance=16
 /// 不随真字体装载变化，40 字 × 16px = 640px，最小窗 768 下 dock 内衬
@@ -221,7 +286,14 @@ const FS_ROW_H: f32 = 18.0;
 const FS_SCAN_DEPTH: usize = 2;
 /// 资产白名单后缀（`.` 隐藏项与无后缀垃圾一律不进树）。S13 第 2 期起
 /// 含 `wav` —— 声音资产与纹理/脚本同为项目资产，res:// 树如实列出。
-const FS_EXT_WHITELIST: [&str; 7] = ["nes", "bmp", "png", "ron", "ttf", "txt", "wav"];
+/// S14 第 1 期起再扩外部交付格式：图片（jpg/jpeg/webp/gif —— 解码经
+/// nes-media 适配层，PNG/BMP 快路径在先）与音频（flac/mp3/ogg/m4a ——
+/// Sound 装载先试手写 WAV、失手回落 nes-media）。白名单只是**列出**：
+/// 场景没声明它们就只是树里的一行，不产生解码成本。
+const FS_EXT_WHITELIST: [&str; 15] = [
+    "nes", "bmp", "png", "ron", "ttf", "txt", "wav", //
+    "jpg", "jpeg", "webp", "gif", "flac", "mp3", "ogg", "m4a",
+];
 /// 双击裁决窗（帧）：同行两次行点击报告沿间隔 <30 帧 = 双击。UiVm
 /// 行回调只有单击 —— 双击是宿主会话态的边沿合成（60fps 下 <0.5s，
 /// 与鼠标双击时长同量级；行回调沿 = 抬键沿，与按下沿间隔至差一帧，
@@ -1246,6 +1318,21 @@ fn main() {
     if !ttf_active {
         log_line(&editor_log, "font: bitmap fallback (no system font)".into());
     }
+    // 用户实测音乐装载（S14，nes-media 适配层实测链路；缺失只静默跳过
+    // —— 文件不在仓库，CI/他机安全；解码失败记一行不阻塞 —— 带病也能
+    // 跑的既有口径）。music_tracks = 实际装载成功的 (混音器键, ASCII 标签)
+    // 表，数字键 0 的三态循环按它轮换；music_state 是编辑器会话态。
+    let mut music_tracks: Vec<(&str, &str)> = Vec::new();
+    for (file_name, fmt_label, key) in [
+        (MUSIC_FLAC_NAME, "flac", "music"),
+        (MUSIC_MP3_NAME, "mp3", "music2"),
+    ] {
+        if let Some(line) = load_user_music(&mut rt, file_name, fmt_label, key, &editor_log) {
+            log_line(&editor_log, line);
+            music_tracks.push((key, fmt_label));
+        }
+    }
+    let mut music_state: usize = 0; // 0 = 停；1..=len = music_tracks[i-1] 在播
     // UiVm 提交钩子的落点（UiVm 零写权 —— 值经共享缓冲传回宿主，
     // 宿主帧后落 Inspector::modify_name 一条 Modified 事务）。
     let rename_sink: Rc<RefCell<Vec<(Uid, String)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1417,6 +1504,24 @@ fn main() {
                 202 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 204 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 210 => inject_input(InputEvent::Char(0x4E2D)),
+                // S14：数字键 0 三态音乐循环取证 —— 先 Esc 回滚改名草稿
+                //（帧 210 注入的 '中' 还在草稿里；失焦 = 提交是 UiVm 契约，
+                // 不回滚就把 obj1 改名成 "obj1中"，后续树形态断言会踩空），
+                // 再点 Output dock（在 over_ui 护盾内：不清选中，且把焦点
+                // 从改名框挪走 —— 焦点门让位输入的对面即"失焦后 0 键归
+                // 编辑器"）再连按三次 0（间隔 >1 帧，每次 down/up 成对）：
+                // flac -> mp3 -> 停，Output 三行状态由循环尾断言取证。
+                216 => inject_input(InputEvent::Key { key: Key::Escape, down: true }),
+                218 => inject_input(InputEvent::Key { key: Key::Escape, down: false }),
+                222 => inject_input(InputEvent::MouseMove { x: 400.0, y: 396.0 }),
+                224 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                226 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                232 => inject_input(InputEvent::Key { key: Key::Num0, down: true }),
+                234 => inject_input(InputEvent::Key { key: Key::Num0, down: false }),
+                238 => inject_input(InputEvent::Key { key: Key::Num0, down: true }),
+                240 => inject_input(InputEvent::Key { key: Key::Num0, down: false }),
+                244 => inject_input(InputEvent::Key { key: Key::Num0, down: true }),
+                246 => inject_input(InputEvent::Key { key: Key::Num0, down: false }),
                 _ => {}
             }
         }
@@ -1892,6 +1997,32 @@ fn main() {
                     }
                     None => log_line(&editor_log, "enable: no script node".into()),
                 }
+            }
+            // 数字键 0：三态音乐预览循环（S14；编辑态专属 —— 运行态混音器
+            // 归游戏脚本；改名框持焦让位输入，焦点门与挂载流同门）。三态 =
+            // 停 -> 曲1(FLAC) -> 曲2(MP3) -> 停…，只按**实际装载成功**的
+            // 曲目轮换（缺曲/失败时循环自动退化为二态/一态 —— 用户目录
+            // 不在仓库，CI/他机天然安全）。切态先 stop_all（曲间不打架）；
+            // looped 循环 —— Output 状态行与实际出声一致。整曲 PCM 已在
+            // 内存（一首 4 分钟约 40-80MB）—— **流式是后续**（S14 文档 §5）。
+            // 播放失败（无 waveOut 设备等）如实记行、回停态，不崩帧。
+            if snap.pressed.contains(&Key::Num0) && !music_tracks.is_empty() {
+                let next = (music_state + 1) % (music_tracks.len() + 1);
+                rt.stop_host_sounds();
+                let mut landed = 0usize; // 失败落点 = 停态（如实）
+                if next == 0 {
+                    log_line(&editor_log, "music: stopped".into());
+                } else {
+                    let (key, label) = music_tracks[next - 1];
+                    match rt.play_host_sound(key, 1.0, true) {
+                        Ok(()) => {
+                            log_line(&editor_log, format!("music: {label} (looped)"));
+                            landed = next;
+                        }
+                        Err(e) => log_line(&editor_log, format!("music: play failed: {e}")),
+                    }
+                }
+                music_state = landed;
             }
             }
         }
@@ -2732,6 +2863,25 @@ fn main() {
                 !lines.iter().any(|l| l.contains("ttf parse failed")),
                 "font parse error leaked: {lines:?}"
             );
+        }
+        // S14：用户音乐接入取证（音乐在场时；文件不在仓库的机器整段
+        // 天然跳过）。三态循环按实际装载的曲目数取证 —— 首曲必然经过、
+        // 双曲时第二曲也经过、循环尾必然回停态；行内容全 ASCII
+        //（"flac"/"mp3" 标签 —— 中文文件名是用户数据，不进日志/断言）。
+        if !music_tracks.is_empty() {
+            assert!(has("music loaded"), "music loaded log missing: {lines:?}");
+            let (first_key, first_label) = music_tracks[0];
+            assert!(
+                has(&format!("music: {first_label} (looped)")),
+                "music first track ({first_key}) state missing: {lines:?}"
+            );
+            if music_tracks.len() > 1 {
+                assert!(
+                    has("music: mp3 (looped)"),
+                    "music second track state missing: {lines:?}"
+                );
+            }
+            assert!(has("music: stopped"), "music stop state missing: {lines:?}");
         }
         {
             let tree = rt.tree_mut();

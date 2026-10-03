@@ -1,0 +1,59 @@
+[package]
+name = "nes-media"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 media codec adapter (S14 part 1): image -> RGBA8, audio -> nes-audio Wav; the only crate in the repo allowed third-party dependencies"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_media"
+path = "src/lib.rs"
+
+# ============================================================
+# 依赖分层政策（S14 用户裁决，守卫 G13 校验）
+# ============================================================
+#
+# **本 crate 是全仓库唯一允许第三方依赖的 crate** —— 编解码适配层。
+# 引擎核心（nes-asset / nes-scene / nes-render-api / nes-render-extract /
+# nes-render-wgpu / nes-audio）维持零第三方依赖纪律不变（既有 G3/G10/G12
+# 等守卫逐条保持）；本 crate 把成熟编解码库收口在**最外圈的叶子**上：
+#
+#     nes-image/symphonia 系 ──▶ nes-media ──▶ nes-audio
+#                                    │
+#                                    ▼（path，唯一消费方）
+#                               nes-runtime
+#
+# 对引擎的面是**干净 DTO**：解码产物映射到既有类型（音频 ->
+# `nes_audio::Wav` 同构；图像 -> RGBA8），上层不感知任何第三方类型。
+# 白名单：`image` 系（含全部传递依赖）+ `symphonia` 系（含全部传递依赖）
+# + 仓库内 `nes-audio`（path）—— 其它任何 registry 依赖一律越界（G13）。
+#
+# 选型记录：
+#   * 图像 image 0.25 系（image-rs；zune-image 亦在评估清单，见 S14 文档 §5
+#     遗留 —— 0.25 内部已用 zune-jpeg 做 JPEG 解码，等价覆盖）；
+#   * 音频 symphonia 0.5 系（纯 Rust、容器/解码器按 feature 收口：
+#     mp3/flac/ogg/vorbis/pcm/wav/isomp4/aac —— mp4-aac 面向 M4A 交付物）；
+#   * 视频（AMV 解码）下一轮：适配层已留位（新格式 = 本 crate 新模块 +
+#     G13 白名单扩条，引擎核心不动），Beta 不做完整视频管线。
+#
+# 版本纪律：caret（不锁死 minor）—— 安全修复随 registry 自动跟进。
+#
+# 本 crate 刻意**不并入**上层任何工作区：空 `[workspace]` 表把它显式钉成
+# 自己的工作区根（与 nes-audio / nes-render-wgpu 同一纪律）。
+[dependencies]
+nes-audio = { path = "../nes-audio" }
+image = "0.25"
+symphonia = { version = "0.5", features = [
+    "mp3",
+    "flac",
+    "ogg",
+    "vorbis",
+    "pcm",
+    "wav",
+    "isomp4",
+    "aac",
+] }
+
+[workspace]

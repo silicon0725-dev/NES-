@@ -1,4 +1,4 @@
-//! NES 2.0 引擎组装层：把六个 crate 装配成一条帧循环。
+//! NES 2.0 引擎组装层：把七个 crate 装配成一条帧循环。
 //!
 //! # 这一层是什么
 //!
@@ -25,10 +25,13 @@
 //! - **不实现语义**：变换、z 序、相机、锚点、排版的算式分别冻结在
 //!   `nes-scene` / `nes-render-api`；音频的解码/混音/设备语义冻结在
 //!   `nes-audio`；本层只搬运与组合；
-//! - **不改上游**：六个 crate 一行不动（本层是它们之上的新叶子，G11 钉住）；
+//! - **不改上游**：七个 crate 一行不动（本层是它们之上的新叶子，G11 钉住）；
 //! - **纹理解码口径**：资产以 **BMP** 交付（`nes-render-wgpu::bmp` 手写解析，
-//!   零依赖纪律）；声音以 **16-bit PCM WAV** 交付（`nes-audio::wav` 同律）；
-//!   其他格式由外部预处理转换（见各示例的资产生成脚本说明）。
+//!   零依赖纪律，快路径）；S14 起图片（PNG/JPEG/GIF/WebP…）与扩展音频
+//!   （MP3/FLAC/OGG/M4A）经 **nes-media 适配层**解码（全仓库唯一允许第三
+//!   方的 crate，G13 白名单：image 系 / symphonia 系）—— 解码产物映射到
+//!   既有类型（RGBA8 -> 纹理注册表；`nes_audio::Wav` 同构 -> 混音器），
+//!   装载序恒为 **手写快路径优先、适配层回落**（零解码开销者优先）。
 //!
 //! # 帧循环
 //!
@@ -327,6 +330,27 @@ impl NesRuntime {
         Ok(id)
     }
 
+    /// 声明一张**图片**资源（S14：经 nes-media 适配层解码 —— PNG/JPEG/
+    /// GIF/WebP 等白名单格式；格式按文件头内容探测，不看扩展名）。
+    ///
+    /// 与 [`Self::declare_texture`] 同一条纹理通道：kind = Texture
+    /// （`AssetKind` 没有 Image 变体 —— 图片与 BMP 纹理是同一渲染面的两种
+    /// 交付格式），槽位进同一上传队列；上传时解码序为 **BMP 快路径优先、
+    /// nes-media 回落**（见 [`Self::upload_pending_textures`]）。解码失败
+    /// 与既有纹理契约同律：指名路径如实报错，不静默跳过（BMP 与适配层
+    /// 两路原因都带上 —— 编辑器按行展示，不崩帧）。
+    ///
+    /// 返回 `Err` 仅当路径本身非法/与既有声明冲突（[`TableError`]，与
+    /// [`Self::declare_texture`] 同口径换成 [`BackendError::Io`] 承载）。
+    pub fn declare_image(&mut self, rel: &str) -> Result<ResId, BackendError> {
+        let id = self
+            .table
+            .declare(rel, AssetKind::Texture)
+            .map_err(|e| BackendError::Io(format!("声明图片 {rel} 失败：{e}")))?;
+        self.texture_slots.push(id);
+        Ok(id)
+    }
+
     /// 从磁盘加载场景文件（相对资产根的 RON），实例化并**替换**当前树与资源表。
     ///
     /// `sub_scene` 引用（子场景嵌套，草案 §10）在实例化前**递归展开**：被引
@@ -572,6 +596,9 @@ impl NesRuntime {
     /// * 返回本次注册数；解码失败**不中断**，指名路径的失败清单交调用方
     ///   （`bind_assets` 挂进缺口、`open_audio` 忽略）—— 一个坏文件不挡
     ///   其他声音（与脚本装载的 issues 通道同律）；
+    /// * 解析序（S14）：手写 WAV 快路径优先，失手回落 nes-media 适配层
+    ///   （MP3/FLAC/OGG/M4A 通吃；两路原因都进失败清单 —— 编辑器红条
+    ///   如实指名）；
     /// * 键约定：**资源路径去扩展名**（`Audio/beep.wav` -> `Audio/beep`）
     ///   —— 脚本 `play "Audio/beep"` 按此引用；路径键无碰撞、随场景文件
     ///   稳定；
@@ -604,6 +631,11 @@ impl NesRuntime {
             if self.registered_version.get(&id).copied() == Some(version) {
                 continue; // 版本没变（热重载判定，与纹理上传同构）
             }
+            // 解析序（S14）：**手写 WAV 快路径优先**（几个块头读取，零解码
+            // 开销），失手再回落 nes-media 适配层（symphonia 全量解码 ——
+            // MP3/FLAC/OGG/M4A 通吃；8-bit/float WAV 等原生解析器拒收的
+            // 变体也顺带被接住）。快路径在前是纯开销排序：绝大多数声音
+            // 资产就是 16-bit PCM WAV，不该为它们付一次 symphonia probe。
             match nes_audio::wav::parse(&bytes) {
                 Ok(wav) => {
                     // 键 = 路径去扩展名；毒化容忍与设备线程同一把锁。
@@ -614,9 +646,24 @@ impl NesRuntime {
                     self.registered_version.insert(id, version);
                     registered += 1;
                 }
-                Err(e) => {
-                    failures.push((id, format!("声音 {path_text} 解码失败：{e}")));
-                }
+                Err(wav_err) => match nes_media::decode_audio(&bytes) {
+                    Ok(wav) => {
+                        let mut guard =
+                            mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.register(sound_key_of(&path_text), Arc::new(wav));
+                        drop(guard);
+                        self.registered_version.insert(id, version);
+                        registered += 1;
+                    }
+                    Err(media_err) => {
+                        failures.push((
+                            id,
+                            format!(
+                                "声音 {path_text} 解码失败：WAV：{wav_err}；nes-media：{media_err}"
+                            ),
+                        ));
+                    }
+                },
             }
         }
         (registered, failures)
@@ -655,6 +702,47 @@ impl NesRuntime {
     /// 音频是否已开（诊断/测试用）。
     pub fn audio_open(&self) -> bool {
         self.device.is_some()
+    }
+
+    // ---------- 宿主直注声音（S14：编辑器音乐预览等宿主级装配）----------
+
+    /// 把解码完成的 PCM 按键**直注**进混音器（S14 编辑器音乐预览用）。
+    ///
+    /// 与场景装载链（[`Self::declare_sound`] -> bind -> 注册）平行：宿主
+    /// 已在手里持有解码产物（例如经 nes-media 解码的用户实测音乐），无需
+    /// 走磁盘资产面即可登记。未开音频也登记（混音器 Arc 惰性构造 ——
+    /// 设备打开前静默，打开后 [`Self::play_host_sound`] 即可播放）；同键
+    /// 覆盖（与 [`Mixer::register`] 同语义）。
+    ///
+    /// 键空间与场景声音键（路径去扩展名）共享：宿主键请用不会与资源路径
+    /// 相撞的命名（编辑器用 `music` / `music2`）。
+    pub fn register_host_sound(&mut self, key: &str, wav: Arc<nes_audio::Wav>) {
+        let mixer = self
+            .mixer
+            .get_or_insert_with(|| Arc::new(Mutex::new(Mixer::new())));
+        let mut guard = mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.register(key, wav);
+    }
+
+    /// 宿主播放一个已登记键（S14 预览；未开音频先开 —— 幂等）。
+    ///
+    /// 无 waveOut 设备 / 键未注册如实报 `Err`（宿主决定报行还是降级，
+    /// 不 panic 不静默）。`looped = true` 即背景音乐循环语义。
+    pub fn play_host_sound(&mut self, key: &str, volume: f32, looped: bool) -> Result<(), BackendError> {
+        self.open_audio()?;
+        let mixer = self.mixer.as_ref().expect("open_audio 已构造混音器");
+        let mut guard = mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .play(key, volume, looped)
+            .map_err(|e| BackendError::Io(e.to_string()))
+    }
+
+    /// 宿主停声（S14 预览）：停掉全部声部（声音库保留；未开音频零动作）。
+    pub fn stop_host_sounds(&mut self) {
+        if let Some(mixer) = &self.mixer {
+            let mut guard = mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.stop_all();
+        }
     }
 
     // ---------- 游戏节拍（S8.1：内建 tick + 固定步长蓄步）----------
@@ -895,7 +983,10 @@ impl NesRuntime {
     /// 键位衔接：`AssetKey::as_render_key().to_bits()` 与提取层
     /// `render_key_of_bits` 是同一位镜像 —— 场景节点引用的槽位、提取层推出的
     /// `RenderAssetKey`、GPU 注册表里的纹理，三者由同一组位对齐。
-    /// 解码失败（非 BMP / 数据截断）如实报错并指名路径，不静默跳过。
+    /// 解码序（S14）：**BMP 快路径优先**（`nes-render-wgpu::bmp` 手写解析，
+    /// 零解码开销），失手再回落 **nes-media 适配层**（PNG/JPEG/GIF/WebP…
+    /// 白名单格式，产物 RGBA8 同形直通）—— 既有 BMP 资产零行为变化。
+    /// 两路全失手如实报错并指名路径（两路原因都带上），不静默跳过。
     pub fn upload_pending_textures(&mut self) -> Result<usize, BackendError> {
         let mut uploaded = 0;
         let slots: Vec<ResId> = self.texture_slots.clone();
@@ -922,8 +1013,18 @@ impl NesRuntime {
             let Some(view) = key.as_render_key() else {
                 continue; // 非渲染类（本方法只管纹理）
             };
-            let (w, h, rgba) = bmp::load_rgba(&bytes)
-                .map_err(|e| BackendError::Io(format!("纹理 {path_text} 解码失败：{e}")))?;
+            // 解码分发：手写 BMP 快路径 -> nes-media 适配层回落（S14）。
+            let (w, h, rgba) = match bmp::load_rgba(&bytes) {
+                Ok(wh) => wh,
+                Err(bmp_err) => {
+                    let img = nes_media::decode_image(&bytes).map_err(|media_err| {
+                        BackendError::Io(format!(
+                            "纹理 {path_text} 解码失败：BMP：{bmp_err}；nes-media：{media_err}"
+                        ))
+                    })?;
+                    (img.width, img.height, img.rgba)
+                }
+            };
             let Some(consumer) = &mut self.consumer else {
                 return Err(BackendError::ConfigMismatch(
                     "headless 运行时没有渲染端（纹理无需上传）".into(),
