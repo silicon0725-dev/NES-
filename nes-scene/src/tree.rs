@@ -1579,6 +1579,19 @@ impl SceneTree {
         }
     }
 
+    /// 移除单个属性（schema 不参与 —— 数据还原的逆向通道）。返回被移
+    /// 除的旧值；节点或键不存在返回 `None`。
+    ///
+    /// S12-9 play-in-editor 的 RESET 用：schema 键出生即满配
+    ///（`default_store`），校验通道写不进新键 —— 运行期新增键只可能
+    /// 来自 [`Self::set_prop_raw`] 前向兼容通道；快照数据还原只覆盖
+    /// 快照里有的键，这种键必须显式摘掉才是诚实的"回到运行前"
+    ///（`SubtreeSnapshot::apply_data` 的写回不含删除语义）。
+    pub fn remove_prop(&mut self, id: NodeId, name: &str) -> Option<Value> {
+        let nd = self.nodes.get_mut(id)?;
+        nd.props.remove(name)
+    }
+
     /// 立即写本地变换并标记脏。世界矩阵在下一次 `refresh_transforms` / `tick` 时重算。
     ///
     /// 脏标记分两份：自身 `DIRTY_XFORM`（自己的世界矩阵要重算），

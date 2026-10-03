@@ -91,7 +91,13 @@ impl SubtreeSnapshot {
     }
 
     /// 应用一份节点数据到已存在节点（修改方向）。
-    fn apply_data(tree: &mut SceneTree, id: NodeId, d: &NodeData2) -> Result<(), String> {
+    ///
+    /// S12-9 起公开：play-in-editor 的 RESET 与事务的 Modified 方向走
+    /// **同一条数据还原路** —— 运行期树结构不变（脚本没有结构指令、
+    /// 编辑交互已禁用），按 uid 寻回节点后整体写回设计数据即可。结构
+    /// 层的 [`Self::restore`] 会换 NodeId（删了重加），编辑器壳层持有
+    /// 的控件手柄经不起 —— 所以还原只走数据面，不动结构。
+    pub fn apply_data(tree: &mut SceneTree, id: NodeId, d: &NodeData2) -> Result<(), String> {
         tree.rename(id, &d.name);
         tree.set_local(id, d.local);
         tree.set_process_mode(id, d.process_mode);

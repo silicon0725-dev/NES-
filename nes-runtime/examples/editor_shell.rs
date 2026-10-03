@@ -34,8 +34,9 @@
 //! ① Inspector 分区化 —— Transform（name/x/y/z + 改名框）/ Script
 //!    （挂载流）两组，组标题行（text_dim 色 + "+"/"-" 前缀）点击或
 //!    F7 循环切换折叠；折叠 = 该组行不投影，后续行上移（行序即布局）。
-//! ② F-4 挂载流（键盘两步）：F5 扫 `Scripts/*.nes`（资产根相对路径，
-//!    另每 60 帧自动刷）→ F6 轮换候选 → Enter 挂载 → U 卸载 → E 切
+//! ② F-4 挂载流（键盘两步）：F8 扫 `Scripts/*.nes`（原 F5，S12-9 起
+//!    让位给 PLAY；资产根相对路径，另每 60 帧自动刷）→ F6 轮换候选
+//!    → Enter 挂载 → U 卸载 → E 切
 //!    enabled。**落账走 Inspector 事务**：选中不是 Script 节点时挂载 =
 //!    同一事务内 Created（Script 子节点，名字 = 脚本基名）+ Modified
 //!    （registry_key）—— 引擎口径脚本住 Script 节点（attach 只认
@@ -63,6 +64,44 @@
 //! 起点 —— FileSystem 与 Inspector 两处入口同一挂载流。F9 切换两段
 //! 分割档（焦点段占大头；P0 不做拖拽，比例是会话态不进树）。
 //!
+//! S12-9（**play-in-editor**，Godot F5 的直感）：工具栏加 PLAY/STOP/
+//! RESET 三按钮（F5 = PLAY / 重启，Shift+F5 = STOP，Godot 同款；
+//! 手动资产扫描让位给 F8 —— F 键不产文本，按码比对的既有路径照抄）。
+//! 核心裁决：**运行态 = 原地换观察者**（引擎纪律"CLI 不是第二个运行
+//! 时"同款）—— PLAY 时建 `ScriptVm`：① 全树快照（SubtreeSnapshot，
+//! uid 锚定，见 RESET）；② **宿主按同键注册**（S12-7 挂载只落
+//! registry_key 数据，这里把键 = 资产根相对路径的 .nes 文本读入、
+//! 编译、按同键 register —— 编译失败报行号错误、该节点跳过）；③
+//! attach_all_with_sources 装载全部挂载脚本（issues 通道逐行上报，
+//! **不回编辑态** —— Godot 行为近似：带病也能跑）；④
+//! mount_input_view 接输入读面。此后每帧 `frame_windowed_with` 的
+//! 观察者参数从 NoObserver 换成该 VM —— ScriptVm 实现
+//! SceneObserver，process 脚本（every）由此逐帧驱动；信号脚本经
+//! attach 时装进树的处理器表照常交付。渲染/UiVm/布局投影**零分支
+//! 照常**。STOP：playing=false、drop VM —— 脚本停、事务历史保留、
+//! **不自动还原**（Godot 语义：运行期改动就是真改）。
+//!
+//! RESET（从快照还原）的方案裁决：整树重载（parse RON ->
+//! instantiate_scene）会换掉全部 NodeId —— 壳层持有的工具栏/面板/
+//! 输入框手柄与 UiVm 行映射全部打散，不可用。改走**数据面还原**：
+//! 快照 = PLAY 时全树前序逐节点的 SubtreeSnapshot（uid 锚定、含属性
+//! 表全集）；RESET 时按 uid 寻回节点、摘掉快照没有的键（运行期新增
+//! —— set_prop 只认 schema 键且出生即满配，新增键只可能来自
+//! set_prop_raw 前向兼容通道）、`SubtreeSnapshot::apply_data` 整体
+//! 写回（S12-9 起公开 —— 与事务 Modified 方向同一条代码）。uid 与
+//! NodeId 双双不动：层级树行映射、选择、输入框绑定、UiVm 状态（其
+//! update 本就有死节点清扫，见 ui.rs）全部无感。正确性前提（文档写
+//! 明）：**运行期树结构不变** —— 脚本没有结构指令（process 只写自
+//! 身、信号只写属性/变换），编辑交互在运行态全部禁用（下方护盾），
+//! 故快照 uid 在 RESET 时必然尽数存活。
+//!
+//! 运行态编辑禁用口径：gizmo/框选/点选/Tab 循环/方向键/Delete/
+//! undo-redo/F6..F9/Enter/U/E/改名提交/行点击落账全部让路（各动作
+//! 入口 `if !playing` 一层护盾）；相机置中与全部面板投影照常 ——
+//! 编辑器快捷键（F5/F6/Del…）在运行态仍会进检测，但动作被禁用故
+//! 无副作用；游戏键（WASD 等）经同一输入快照直达脚本 —— 编辑器与
+//! 游戏共享同一快照源（S8.2b-3 既有口径）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -78,8 +117,8 @@ use nes_render_wgpu::window::inject_input;
 use nes_render_wgpu::{bmp, FontParams};
 use nes_runtime::{write_bmp_rgba, NesRuntime};
 use nes_scene::editor::{Hierarchy, Inspector, Selection};
-use nes_scene::transaction::TransactionLog;
-use nes_scene::{NodeKind, ScriptVm, Transform2D, Value, Uid};
+use nes_scene::transaction::{SubtreeSnapshot, TransactionLog};
+use nes_scene::{compile_script, NodeKind, NoObserver, ScriptVm, Transform2D, Value, Uid};
 
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
@@ -107,10 +146,11 @@ const DOCK_H: f32 = 96.0;
 const DOCK_ROW_H: f32 = 18.0;
 /// 编辑器日志环形保留行数（新行在下，满 N 丢最旧 —— Godot Output
 /// 的最小语义；可见窗只放最新能放下的几行，最新行永远可见）。S12-8
-/// 起 12 行：冒烟钩子要同时断言 Enter 与 FileSystem 双击**两条挂载
-/// 路径**的日志（一轮流程恰好 12 行，早期行不再被新行挤出断言窗；
-/// dock 可见窗仍只显最新几行，显示面不变）。
-const EDITOR_LOG_KEEP: usize = 12;
+/// 起 12 行、S12-9 起 20 行：冒烟钩子要同时断言 Enter 与 FileSystem
+/// 双击**两条挂载路径**、play/stop/reset 全链路日志（一轮流程约 17
+/// 行，早期行不再被新行挤出断言窗；dock 可见窗仍只显最新几行，显示
+/// 面不变）。
+const EDITOR_LOG_KEEP: usize = 20;
 /// dock 行显示截宽（字符数）：40 字 × 16px advance = 640px，最小窗
 /// 768 下 dock 内衬（≈748px）也放得下，行尾不裁字。
 const DOCK_LINE_CHARS: usize = 40;
@@ -162,14 +202,17 @@ const TOOLBAR_BTN_W: f32 = 48.0;
 const TOOLBAR_BTN_H: f32 = 20.0;
 const TOOLBAR_BTN_STEP: f32 = 52.0;
 
-/// F5/F6/F7/F9 的 Win32 虚拟键码。Key 契约未列举 F 键 —— 平台层把未列举
+/// F5/F6/F7/F8/F9 的 Win32 虚拟键码。Key 契约未列举 F 键 —— 平台层把未列举
 /// 虚拟键原样保留为 `Key::Other(原码)`（vk_to_key 兜底分支），边缘
 /// 检测直接按 `Key::Other(VK_*)` 比对 pressed 集。选 F 键有个工程
 /// 理由：F 键不产生 WM_CHAR 文本 —— 与改名输入框的键入天然无冲突
-/// （字母键做不到）。
+/// （字母键做不到）。S12-9 起 F5 = PLAY/重启（Shift+F5 = STOP，Godot
+/// 同款）；原 F5 手动资产扫描让位给 F8（同码路径照抄）。
 const VK_F5: u32 = 0x74;
 const VK_F6: u32 = 0x75;
 const VK_F7: u32 = 0x76;
+/// F8：手动刷新资产扫描（原 F5 职责，S12-9 让位给 PLAY —— 见上注）。
+const VK_F8: u32 = 0x77;
 /// F9：左栏 Scene/FileSystem 分割档切换（S12-8，两档见 FS_SPLIT_*）。
 const VK_F9: u32 = 0x78;
 
@@ -430,6 +473,178 @@ fn log_line(ring: &Rc<RefCell<VecDeque<String>>>, line: String) {
     q.push_back(line);
 }
 
+/// play-in-editor 运行会话态（S12-9；编辑器会话态 —— 不进树、不落盘）：
+/// - `playing`：运行态开关 —— 帧循环观察者参数与编辑交互护盾的唯一判据；
+/// - `vm`：运行态的 ScriptVm（编辑态为 None；STOP 即 drop —— 脚本停、
+///   局部/连接随 VM 蒸发，事务历史在宿主手里不动）；
+/// - `snapshot`：PLAY 时的全树快照（前序逐节点 SubtreeSnapshot，uid
+///   锚定）。RESET 从它数据面还原（见模块头 S12-9 裁决）。从首次 PLAY
+///   存活到 RESET；运行中重启（再按 PLAY）**不刷新** —— 重启也要能
+///   回到同一个"进入运行态之前"。
+struct PlaySession {
+    playing: bool,
+    vm: Option<ScriptVm>,
+    snapshot: Vec<SubtreeSnapshot>,
+}
+
+impl PlaySession {
+    fn new() -> Self {
+        PlaySession {
+            playing: false,
+            vm: None,
+            snapshot: Vec::new(),
+        }
+    }
+
+    /// PLAY（编辑态进入运行态；运行态再按 = 重启：drop 旧 VM 重建，
+    /// 快照保留首次进入时的那份）。全链路：快照 -> 同键注册 ->
+    /// attach_all_with_sources -> mount_input_view。装载缺口（编译错
+    /// /读失败/空键）逐行进 Output、对应节点跳过，**不回编辑态**。
+    fn start(
+        &mut self,
+        rt: &mut NesRuntime,
+        assets: &Path,
+        ring: &Rc<RefCell<VecDeque<String>>>,
+    ) {
+        if self.playing {
+            self.vm = None; // 重启：只换 VM，快照不动（见结构体注）。
+        } else {
+            // 首次进入：快照全树（前序逐节点，uid 锚定、含属性表全集）。
+            self.snapshot = {
+                let tree = rt.tree_mut();
+                let root_uid = tree.uid_of(tree.root()).unwrap();
+                tree.preorder()
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, n)| {
+                        let parent = tree
+                            .parent(n)
+                            .and_then(|p| tree.uid_of(p))
+                            .unwrap_or_else(|| root_uid.clone());
+                        SubtreeSnapshot::capture(tree, n, parent, i)
+                    })
+                    .collect()
+            };
+            log_line(
+                ring,
+                format!("snapshot {} nodes (RESET to restore)", self.snapshot.len()),
+            );
+        }
+        // 宿主按同键注册（S12-7 口径的运行时半边）：registry_key =
+        // 资产根相对路径，读文件 -> 编译 -> register。编译失败报行号
+        // 错误、该键不注册（对应节点随后的 attach 如实报缺口、跳过）。
+        let mut vm = ScriptVm::new();
+        let keys: Vec<String> = {
+            let tree = rt.tree_mut();
+            let mut keys: Vec<String> = tree
+                .preorder()
+                .into_iter()
+                .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Script))
+                .filter_map(|n| match tree.prop(n, "registry_key") {
+                    Some(Value::Str(k)) if !k.is_empty() => Some(k.clone()),
+                    _ => None,
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        for key in &keys {
+            match std::fs::read_to_string(assets.join(key)) {
+                Ok(text) => match compile_script(&text) {
+                    Ok(script) => {
+                        vm.register(key, script);
+                    }
+                    Err(e) => {
+                        // ParseError 的 Display 自带行/列（"第 L 行第 C 列"）。
+                        log_line(ring, format!("play: {} {e}", base_name(key)));
+                    }
+                },
+                Err(_) => {
+                    log_line(ring, format!("play: {} read failed", base_name(key)));
+                }
+            }
+        }
+        // 全路径装载（内嵌 source / registry_key 注册表 / 外置 script 槽
+        // 三路同口）—— issues 通道逐行上报，不挡其他节点。
+        let table = rt.resources_mut().clone();
+        let total;
+        let issues;
+        {
+            let tree = rt.tree_mut();
+            total = tree
+                .preorder()
+                .into_iter()
+                .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Script))
+                .count();
+            issues = vm.attach_all_with_sources(tree, &table, &mut |rel| {
+                std::fs::read_to_string(assets.join(rel)).map_err(|e| e.to_string())
+            });
+        }
+        for (node, why) in &issues {
+            let name = rt.tree_mut().name(*node).unwrap_or("?").to_string();
+            log_line(ring, format!("play: skip {name}: {why}"));
+        }
+        let attached = total - issues.len();
+        rt.mount_input_view(&mut vm);
+        self.vm = Some(vm);
+        self.playing = true;
+        log_line(ring, format!("play ({attached} scripts)"));
+    }
+
+    /// STOP（Shift+F5 / 工具栏）：脚本停（drop VM）、事务历史不动、
+    /// **不自动还原** —— Godot 语义：运行期改动就是真改；RESET 才回。
+    fn stop(&mut self, ring: &Rc<RefCell<VecDeque<String>>>) {
+        if !self.playing {
+            return;
+        }
+        self.vm = None;
+        self.playing = false;
+        log_line(ring, "stop".into());
+    }
+
+    /// RESET（工具栏；仅编辑态可用）：从快照数据面还原 —— 按 uid 寻回
+    /// 节点、摘掉快照没有的键、apply_data 整体写回（名字/变换/处理模
+    /// 式/属性全集）。结构不变是正确性前提（运行期编辑禁用 + 脚本无
+    /// 结构指令），寻不回的快照如实跳过（不发生，防御性容错）。
+    fn reset(&mut self, rt: &mut NesRuntime, ring: &Rc<RefCell<VecDeque<String>>>) {
+        if self.playing {
+            log_line(ring, "reset: playing (stop first)".into());
+            return;
+        }
+        if self.snapshot.is_empty() {
+            log_line(ring, "reset: no snapshot".into());
+            return;
+        }
+        {
+            let tree = rt.tree_mut();
+            for snap in &self.snapshot {
+                let Some(id) = tree.find_by_uid(&snap.data.uid) else {
+                    continue;
+                };
+                // 快照没有的键 = 运行期新增 —— 摘掉（apply_data 只覆盖
+                // 快照键；schema 键出生即满配，这只在裸通道写入时发生）。
+                let extra: Vec<String> = tree
+                    .props(id)
+                    .map(|p| {
+                        p.iter()
+                            .map(|(k, _)| k.to_string())
+                            .filter(|k| snap.data.props.get(k).is_none())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for k in extra {
+                    tree.remove_prop(id, &k);
+                }
+                let _ = SubtreeSnapshot::apply_data(tree, id, &snap.data);
+            }
+            tree.apply_pending();
+        }
+        self.snapshot.clear();
+        log_line(ring, "reset".into());
+    }
+}
+
 fn main() {
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
     let tex = assets.join("Textures");
@@ -499,7 +714,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // 视口网格（S12-5 Godot 观感）：条带池 —— 竖条 1px 宽 × 视口高、
@@ -660,6 +875,24 @@ fn main() {
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 2.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_grid, "text", Value::Str("GRID".into()));
+        // S12-9：PLAY / STOP / RESET（Godot 视口工具栏右上角的运行三键
+        // 直感，P0 摆在编辑三键右侧同一工具带）。文本投影每帧重写
+        //（PLAY 运行中带 * 后缀），offset 装配期占位、每帧布局投影重写。
+        let tool_play = tree.add_node(toolbar, "tool_play", NodeKind::Button);
+        let _ = tree.set_prop(tool_play, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(tool_play, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 3.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
+        let _ = tree.set_prop(tool_play, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
+        let _ = tree.set_prop(tool_play, "text", Value::Str("PLAY".into()));
+        let tool_stop = tree.add_node(toolbar, "tool_stop", NodeKind::Button);
+        let _ = tree.set_prop(tool_stop, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(tool_stop, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 4.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
+        let _ = tree.set_prop(tool_stop, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
+        let _ = tree.set_prop(tool_stop, "text", Value::Str("STOP".into()));
+        let tool_reset = tree.add_node(toolbar, "tool_reset", NodeKind::Button);
+        let _ = tree.set_prop(tool_reset, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(tool_reset, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 5.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
+        let _ = tree.set_prop(tool_reset, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
+        let _ = tree.set_prop(tool_reset, "text", Value::Str("RESET".into()));
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
         tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
         let obj1 = tree.add_node(root, "obj1", NodeKind::Sprite2D);
@@ -748,15 +981,17 @@ fn main() {
         tree.set_local(ins_script, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
     };
     let _ = (obj1, obj2, obj3);
 
     // 编辑器状态（会话态 —— 不进事务、不落盘）。
     let mut sel = Selection::new();
     let mut log = TransactionLog::new();
-    let mut vm = ScriptVm::new();
-    rt.mount_input_view(&mut vm);
+    // S12-9：运行会话态（PLAY/STOP/RESET）。编辑态的帧循环观察者是
+    // NoObserver —— 既有 editor ScriptVm 空转观察者退役（它从未装载过
+    // 脚本，语义与 NoObserver 等价；输入读面在装配处已挂 UiVm）。
+    let mut play = PlaySession::new();
     // 初始选择第一个对象。
     if let Some(uid) = rt.tree_mut().uid_of(obj1) {
         sel.select(uid);
@@ -850,6 +1085,9 @@ fn main() {
             (tool_sel, "sel"),
             (tool_snap, "snap"),
             (tool_grid, "grid"),
+            (tool_play, "play"),
+            (tool_stop, "stop"),
+            (tool_reset, "reset"),
         ]
         .into_iter()
         .collect();
@@ -874,6 +1112,11 @@ fn main() {
     let demo = std::env::var("NES_EDIT_DEMO").ok().as_deref() == Some("1");
     let mut transient = 0u64;
     const TRANSIENT_LIMIT: u64 = 120;
+    // 运行态取证（S12-9 冒烟钩子，帧 176 采样 —— 见循环内注）：
+    // spin 节点位移（> 0 = 脚本在运行态真实驱动过）与工具栏 PLAY 文本
+    //（运行中应为 "PLAY*"）。
+    let mut demo_spin_x = 0.0f32;
+    let mut demo_play_text = String::new();
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -919,8 +1162,8 @@ fn main() {
                 52 => inject_input(InputEvent::Key { key: Key::Other(VK_F7), down: false }),
                 60 => inject_input(InputEvent::Key { key: Key::Other(VK_F7), down: true }),
                 62 => inject_input(InputEvent::Key { key: Key::Other(VK_F7), down: false }),
-                70 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
-                72 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
+                70 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: true }),
+                72 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: false }),
                 // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
                 // spin.nes 行（(60, 256)：768x432 客户区、默认 Scene
                 // 55% 档下第 2 行），两次点击沿间隔 10 帧 < 30（双击
@@ -933,6 +1176,25 @@ fn main() {
                 92 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 100 => inject_input(InputEvent::Key { key: Key::U, down: true }),
                 102 => inject_input(InputEvent::Key { key: Key::U, down: false }),
+                // S12-9：play-in-editor 全链路 —— Enter 重挂 spin.nes
+                //（上面 100 的 U 已卸载；fs 单击已把候选指回 spin.nes）
+                //→ F5 PLAY → 跑约 56 帧（spin 脚本每帧右移 0.3）→
+                // Shift+F5 STOP → 点工具栏 RESET（第 6 个按钮：768 宽
+                // 客户区下 gx0=188，x = 188+4+5*52 = 452..500，取中
+                // (476, 52)）→ U 卸载回空 registry_key（树形态断言兼容）。
+                104 => inject_input(InputEvent::Key { key: Key::Enter, down: true }),
+                106 => inject_input(InputEvent::Key { key: Key::Enter, down: false }),
+                112 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
+                114 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
+                168 => inject_input(InputEvent::Key { key: Key::LShift, down: true }),
+                170 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
+                172 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
+                174 => inject_input(InputEvent::Key { key: Key::LShift, down: false }),
+                178 => inject_input(InputEvent::MouseMove { x: 476.0, y: 52.0 }),
+                180 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                182 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                190 => inject_input(InputEvent::Key { key: Key::U, down: true }),
+                192 => inject_input(InputEvent::Key { key: Key::U, down: false }),
                 _ => {}
             }
         }
@@ -947,20 +1209,42 @@ fn main() {
         );
         let _ = (z_now, y_now);
         // F 键与挂载流的按下沿（pressed 集即本帧边缘 —— 无需 prev 表）。
-        // F5 刷资产扫描 / F6 轮换候选 / F7 循环组折叠 / F9 切左栏分割
-        // 档；Enter 挂载、U 卸载、E 切 enabled（后三者有焦点门，见挂
-        // 载段）。
-        let (f5_now, f6_now, f7_now, f9_now, enter_now, u_now, e_now) = (
+        // F5 = PLAY / 重启（Shift+F5 = STOP，S12-9）/ F6 轮换候选 /
+        // F7 循环组折叠 / F8 刷资产扫描 / F9 切左栏分割档；Enter 挂载、
+        // U 卸载、E 切 enabled（后三者有焦点门，见挂载段）。
+        let (f5_now, f6_now, f7_now, f8_now, f9_now, enter_now, u_now, e_now) = (
             snap.pressed.contains(&Key::Other(VK_F5)),
             snap.pressed.contains(&Key::Other(VK_F6)),
             snap.pressed.contains(&Key::Other(VK_F7)),
+            snap.pressed.contains(&Key::Other(VK_F8)),
             snap.pressed.contains(&Key::Other(VK_F9)),
             snap.pressed.contains(&Key::Enter),
             snap.pressed.contains(&Key::U),
             snap.pressed.contains(&Key::E),
         );
+        // 冒烟钩子的运行态取证（S12-9）：帧 160（运行中）读工具栏
+        // PLAY 文本（应为 "PLAY*"）；STOP 沿后的帧 176 读 spin 节点位移
+        // —— 退出断言要用"脚本在运行态真实驱动过"与"PLAY* 文本投影"
+        // 两件事实；此刻快照未被 RESET 污染。
+        if demo && index == 160 {
+            demo_play_text = rt
+                .tree_mut()
+                .prop(tool_play, "text")
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+        }
+        if demo && index == 176 {
+            let tree = rt.tree_mut();
+            if let Some(spin) = tree.find_by_name("spin") {
+                demo_spin_x = tree.local(spin).unwrap_or_default().pos.x;
+            }
+        }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
-        if tab_now && !prev_tab {
+        // 运行态（S12-9）：编辑交互整体让路 —— Tab 循环也一样。
+        if !play.playing && tab_now && !prev_tab {
             // Tab 保留（备用循环）— 但主要路径改为鼠标点击。
             let sprites: Vec<Uid> = {
                 let tree = rt.tree_mut();
@@ -1004,7 +1288,7 @@ fn main() {
                 mx >= *rx && mx < *rx + INSPECTOR_W && my >= *ry && my < *ry + 16.0
             })
             .map(|(_, _, gi)| *gi);
-        if mouse_left_held && !prev_click && title_click.is_none() && tool_sel_on {
+        if mouse_left_held && !prev_click && title_click.is_none() && tool_sel_on && !play.playing {
             // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。
             // 压在编辑器 UI（改名输入框 / 层级树 / Output dock / 标尺
             // 条带）上 = 面板交互：护住选中（不清空、不框选）。输入框
@@ -1014,7 +1298,7 @@ fn main() {
                 let tree = rt.tree_mut();
                 [
                     name_input, hud_tree, hud_dock, ruler_h, ruler_v, ruler_corner,
-                    tool_sel, tool_snap, tool_grid,
+                    tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset,
                     fs_bg, fs_sep, fs_tree,
                 ]
                 .iter()
@@ -1085,7 +1369,7 @@ fn main() {
                 drag_start = Some((mx, my));
                 sel.clear(); // 框选重置（Shift 保留已有选择）
             }
-        } else if mouse_left_held && !prev_click {
+        } else if mouse_left_held && !prev_click && !play.playing {
             // 标题点击 = 翻对应组折叠位（会话态）；本次按下就此消费 ——
             // 不清选中、不框选、不给精灵命中（护盾口径与面板点击一致）。
             // SEL off：纯观察 —— 点击不选中不拖拽不框选（工具栏按钮
@@ -1108,6 +1392,8 @@ fn main() {
         // 松开 → Inspector.modify_local 一次事务。按住 Ctrl 吸附 8px 栅格
         //（S12-5：Godot 2D 的 Ctrl 拖动直感，状态栏 Ctrl=snap）—— 目标
         // 位置取整到 GRID_SNAP 的整数倍，松开提交的也是已取整的终值。
+        // 运行态：编辑动作让路（gizmo 在 PLAY 时已强制收尾/丢弃）。
+        if !play.playing {
         if let Some((ref uid, ox, oy)) = gizmo {
             if mouse_left_held {
                 // preview：直写树位置（会话态，微批次之外）。吸附口径
@@ -1145,8 +1431,10 @@ fn main() {
                 gizmo = None;
             }
         }
+        }
 
-        // 框选拖拽中：mouse up → 选中矩形内全部 Sprite。
+        // 框选拖拽中：mouse up → 选中矩形内全部 Sprite（运行态让路）。
+        if !play.playing {
         if let Some((sx, sy)) = drag_start {
             if !mouse_left_held {
                 // 松开：框选完成。
@@ -1177,6 +1465,7 @@ fn main() {
                 drag_start = None;
             }
         }
+        }
         prev_click = mouse_left_held;
 
         // 方向键：移动选中（Inspector 事务）。
@@ -1189,7 +1478,9 @@ fn main() {
             if s.is_down("ArrowDown") { d.1 += 2.0; }
             d
         };
-        if dx != 0.0 || dy != 0.0 {
+        // 方向键：移动选中（Inspector 事务）。运行态让路（方向键属于
+        // 游戏输入 —— WASD/方向键直达脚本）。
+        if (dx != 0.0 || dy != 0.0) && !play.playing {
             if let Some(p) = sel.primary(rt.tree_mut()) {
                 if let Some(uid) = rt.tree_mut().uid_of(p) {
                     let cur = rt.tree_mut().local(p).unwrap_or_default();
@@ -1204,8 +1495,9 @@ fn main() {
                 }
             }
         }
-        // Delete：删除子树（Hierarchy 事务）。
-        if del_now && !prev_del {
+        // Delete：删除子树（Hierarchy 事务）。运行态让路（Del 是编辑
+        // 快捷键，运行期不得动树 —— 结构不变是 RESET 的正确性前提）。
+        if del_now && !prev_del && !play.playing {
             if let Some(p) = sel.primary(rt.tree_mut()) {
                 if let Some(uid) = rt.tree_mut().uid_of(p) {
                     let root_uid = { let tree = rt.tree_mut(); tree.uid_of(tree.root()).unwrap() };
@@ -1247,8 +1539,24 @@ fn main() {
         // 结果（一帧滞后，与既有 UI 命中口径一致）。
         let renaming = rt.ui_vm_mut().focus() == Some(name_input);
         if !renaming {
-            // F5：手动刷新资产扫描（带日志；周期刷新不打扰 Output）。
+            // F5：PLAY / 重启（Shift+F5 = STOP，Godot 同款；S12-9）。
+            // 运行态编辑会话随 PLAY 收尾：拖拽/框选半途即刻作废（结构
+            // 不变是 RESET 还原的正确性前提）。
             if f5_now {
+                if snap.is_down("LShift") {
+                    play.stop(&editor_log);
+                } else {
+                    drag_start = None;
+                    gizmo = None;
+                    play.start(&mut rt, &assets, &editor_log);
+                }
+            }
+            // 编辑态专属键（S12-9 护盾：运行态编辑动作全部让路 —— 检测
+            // 照常、动作禁用，故无副作用）。
+            if !play.playing {
+            // F8：手动刷新资产扫描（带日志；周期刷新不打扰 Output。原
+            // F5 职责，S12-9 让位给 PLAY）。
+            if f8_now {
                 fs_entries = scan_assets(&assets);
                 scripts = script_pool(&fs_entries);
                 if script_idx >= scripts.len() {
@@ -1280,7 +1588,7 @@ fn main() {
             // F6：轮换挂载候选。
             if f6_now {
                 if scripts.is_empty() {
-                    log_line(&editor_log, "cand: none (F5 to scan)".into());
+                    log_line(&editor_log, "cand: none (F8 to scan)".into());
                 } else {
                     script_idx = (script_idx + 1) % scripts.len();
                     log_line(
@@ -1303,7 +1611,7 @@ fn main() {
                         false
                     }
                     None => {
-                        log_line(&editor_log, "mount: no candidate (F5 to scan)".into());
+                        log_line(&editor_log, "mount: no candidate (F8 to scan)".into());
                         false
                     }
                 };
@@ -1354,17 +1662,19 @@ fn main() {
                     None => log_line(&editor_log, "enable: no script node".into()),
                 }
             }
+            }
         }
         // Ctrl+Z / Ctrl+Y：undo / redo（直接消费事务历史）。落账后
         // 文档真相可能已变（改名被回滚/重放）—— 输入框投影与草稿
         // 跟随（S12-4 ④）：reset_text 置草稿 = 当前名、不触发
         // on_commit（回滚值不会再记账），持焦中的旧草稿即刻作废。
+        // 运行态让路（事务历史只在编辑态动 —— STOP 后原样保留）。
         let mut doc_changed = false;
-        if z_now && !prev_z && log.undo(rt.tree_mut()).unwrap_or(false) {
+        if !play.playing && z_now && !prev_z && log.undo(rt.tree_mut()).unwrap_or(false) {
             doc_changed = true;
             log_line(&editor_log, "undo".into());
         }
-        if y_now && !prev_y && log.redo(rt.tree_mut()).unwrap_or(false) {
+        if !play.playing && y_now && !prev_y && log.redo(rt.tree_mut()).unwrap_or(false) {
             doc_changed = true;
             log_line(&editor_log, "redo".into());
         }
@@ -1425,9 +1735,11 @@ fn main() {
             let vy1 = gy1;
 
             // 视口工具栏布线（S12-7）：panel 槽铺底 + 底缘 1px border
-            // 分隔线 + 三个开关按钮。gx0 恒定（面板恒宽），沿投影纪律
-            // 每帧重写；按钮文本后缀 * = ON —— 开关态是编辑器会话态，
-            // 每帧重写进文本投影（投影无状态口径）。
+            // 分隔线 + 三个开关按钮 + PLAY/STOP/RESET 运行三键（S12-9
+            // —— PLAY 运行中带 * 后缀，同 * = ON 的会话态口径；STOP/
+            // RESET 无 ON 态，恒显素文本）。gx0 恒定（面板恒宽），沿
+            // 投影纪律每帧重写；按钮文本后缀 * = ON —— 开关态是编辑器
+            // 会话态，每帧重写进文本投影（投影无状态口径）。
             let _ = tree.set_prop(tool_bg, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(gx0, TOP_BAND)));
             let _ = tree.set_prop(tool_bg, PROP_CONTROL_SIZE,
@@ -1440,6 +1752,9 @@ fn main() {
                 (tool_sel, tool_sel_on, "SEL"),
                 (tool_snap, tool_snap_on, "SNAP"),
                 (tool_grid, tool_grid_on, "GRID"),
+                (tool_play, play.playing, "PLAY"),
+                (tool_stop, false, "STOP"),
+                (tool_reset, false, "RESET"),
             ];
             for (i, (b, on, name)) in tool_btns.iter().enumerate() {
                 let _ = tree.set_prop(*b, PROP_CONTROL_OFFSET,
@@ -1829,16 +2144,26 @@ fn main() {
             }
 
             // 状态栏（S12-7：工具开关态 + F 键挂载流提示；SNAP 开关
-            // ON 恒吸附、Ctrl 反转 —— tools 段 S/N/G 即三开关现态）。
-            let st = format!(
-                "st> undo:{} redo:{} sel:{} tools:{}{}{} | Click=sel Drag=box Del=del F5=scan F6=cand Enter=mount U=unmount E=enable F7=groups F9=split Ctrl+Z/Y=undo",
-                if log.can_undo() { "Y" } else { "-" },
-                if log.can_redo() { "Y" } else { "-" },
-                sel.len(),
-                if tool_sel_on { "S" } else { "-" },
-                if tool_snap_on { "N" } else { "-" },
-                if tool_grid_on { "G" } else { "-" },
-            );
+            // ON 恒吸附、Ctrl 反转 —— tools 段 S/N/G 即三开关现态。
+            // S12-9：运行态提示 + 运行三键口径）。
+            let st = if play.playing {
+                format!(
+                    "st> PLAYING (F5=restart Shift+F5=stop RESET btn reverts scene) tools:{}{}{}",
+                    if tool_sel_on { "S" } else { "-" },
+                    if tool_snap_on { "N" } else { "-" },
+                    if tool_grid_on { "G" } else { "-" },
+                )
+            } else {
+                format!(
+                    "st> undo:{} redo:{} sel:{} tools:{}{}{} | Click=sel Drag=box Del=del F5=play F8=scan F6=cand Enter=mount U=unmount E=enable F7=groups F9=split Ctrl+Z/Y=undo",
+                    if log.can_undo() { "Y" } else { "-" },
+                    if log.can_redo() { "Y" } else { "-" },
+                    sel.len(),
+                    if tool_sel_on { "S" } else { "-" },
+                    if tool_snap_on { "N" } else { "-" },
+                    if tool_grid_on { "G" } else { "-" },
+                )
+            };
             let _ = tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(st));
 
             // Selection indicator: Control rect follows primary selection.
@@ -1899,7 +2224,19 @@ fn main() {
 
         let _ = rt.emit_input_signals(&snap);
         let frame = FrameInfo::new(index, delta, elapsed, Vec2::new(viewport.0, viewport.1));
-        match rt.frame_windowed_with(&frame, &mut vm) {
+        // S12-9 帧循环分叉：运行态把观察者从 NoObserver 换成 ScriptVm
+        //（原地换观察者 —— 同一运行时、同一条 tick/提取/渲染路径，不是
+        // 第二运行时/第二窗口）。vm 是独立值，与 rt 无借用交集。
+        let frame_result = if play.playing {
+            let vm = play
+                .vm
+                .as_mut()
+                .expect("运行态必有 VM（playing 与 vm 同生命周期）");
+            rt.frame_windowed_with(&frame, vm)
+        } else {
+            rt.frame_windowed_with(&frame, &mut NoObserver)
+        };
+        match frame_result {
             Ok(Some(stats)) => {
                 if stats.driver_errors > 0 {
                     eprintln!("[帧 {index}] driver_errors={}", stats.driver_errors);
@@ -1917,6 +2254,11 @@ fn main() {
         }
         // 重命名提交（帧后落账 —— UiVm 钩子回调在帧内只传值）：
         // 一次提交 = 一条 Modified 事务（Inspector::modify_name）。
+        // 运行态让路：改名属编辑动作 —— 滞留提交直接丢弃（输入框
+        // 提交在运行态本就不该发生，防御性清空防旧草稿落账）。
+        if play.playing {
+            rename_sink.borrow_mut().clear();
+        } else {
         for (uid, new_name) in rename_sink.borrow_mut().drain(..) {
             let tree = rt.tree_mut();
             let unchanged = tree
@@ -1935,36 +2277,63 @@ fn main() {
             // 输入框 text 投影跟着落账后的新名走。
             let _ = tree.set_prop(name_input, "text", Value::Str(new_name));
         }
+        }
 
         // 层级树行点击落账（帧后 —— UiVm 钩子回调在帧内只报行下标）：
         // 一次点击 = 一次 Selection::select（与视口点选同款单选替换语义；
         // 选择是会话态，不进事务不落盘）。下一帧的树投影与 selected 行
-        // 高亮随之跟上。
-        for uid in row_clicks.borrow_mut().drain(..) {
-            sel.select(uid);
+        // 高亮随之跟上。运行态让路（选择变更属编辑交互）。
+        if play.playing {
+            row_clicks.borrow_mut().clear();
+        } else {
+            for uid in row_clicks.borrow_mut().drain(..) {
+                sel.select(uid);
+            }
         }
 
-        // 工具栏开关落账（帧后 —— UiVm 激活回调帧内只报名字）。开关
-        // 态是编辑器会话态：只翻本地布尔 + Output 一行，不进树不落账。
+        // 工具栏落账（帧后 —— UiVm 激活回调帧内只报名字）。S12-9：
+        // play/stop/reset 三键任何状态都受理（PLAY 运行中 = 重启，Godot
+        // 同款；STOP/RESET 越界按一行说明处理）；SEL/SNAP/GRID 开关是
+        // 编辑动作 —— 运行态静默忽略（按钮可点但无效果，无日志灌水）。
         for name in tool_clicks.borrow_mut().drain(..) {
-            let on = match name.as_str() {
-                "sel" => {
-                    tool_sel_on = !tool_sel_on;
-                    tool_sel_on
+            match name.as_str() {
+                "play" => {
+                    drag_start = None;
+                    gizmo = None;
+                    play.start(&mut rt, &assets, &editor_log);
                 }
-                "snap" => {
-                    tool_snap_on = !tool_snap_on;
-                    tool_snap_on
+                "stop" => {
+                    if play.playing {
+                        play.stop(&editor_log);
+                    } else {
+                        log_line(&editor_log, "stop: not playing".into());
+                    }
                 }
+                "reset" => play.reset(&mut rt, &editor_log),
                 _ => {
-                    tool_grid_on = !tool_grid_on;
-                    tool_grid_on
+                    if play.playing {
+                        continue;
+                    }
+                    let on = match name.as_str() {
+                        "sel" => {
+                            tool_sel_on = !tool_sel_on;
+                            tool_sel_on
+                        }
+                        "snap" => {
+                            tool_snap_on = !tool_snap_on;
+                            tool_snap_on
+                        }
+                        _ => {
+                            tool_grid_on = !tool_grid_on;
+                            tool_grid_on
+                        }
+                    };
+                    log_line(
+                        &editor_log,
+                        format!("tool {} {}", name, if on { "on" } else { "off" }),
+                    );
                 }
-            };
-            log_line(
-                &editor_log,
-                format!("tool {} {}", name, if on { "on" } else { "off" }),
-            );
+            }
         }
 
         // 文件系统 dock 行点击落账（帧后 —— UiVm 钩子帧内只报行下
@@ -1972,10 +2341,13 @@ fn main() {
         // .nes 顺手指为 F6 候选起点（两处入口同一挂载流，池与 res://
         // 树同源必命中）。同行 30 帧内两次点击沿 = 双击（FS_DBLCLICK_
         // FRAMES 裁决；UiVm 行回调只有单击沿，双击是宿主会话态的边沿
-        // 合成）：.ron 场景 = Output 提示（场景打开归 play-in-editor
-        // 里程碑，P0 不实现）；.nes = 直接挂载（与 Enter 同一
-        // mount_script 事务，Output 报结果）；目录/其余后缀 = 提示，
-        // 不落账。
+        // 合成）：.ron 场景 = Output 提示（场景打开归后续里程碑，P0
+        // 不实现）；.nes = 直接挂载（与 Enter 同一 mount_script 事务，
+        // Output 报结果）；目录/其余后缀 = 提示，不落账。运行态让路
+        //（挂载/选中都是编辑动作，滞留点击直接丢弃）。
+        if play.playing {
+            fs_clicks.borrow_mut().clear();
+        } else {
         for row in fs_clicks.borrow_mut().drain(..) {
             let Some(entry) = fs_entries.get(row) else {
                 continue;
@@ -2017,6 +2389,7 @@ fn main() {
             }
             fs_last_press = Some((index, row));
         }
+        }
 
         // 帧节拍：无固定 sleep —— present 的 FIFO 队列自节流（vsync），
         // 帧差以 Instant 实测进 FrameInfo（见循环头的 delta/elapsed）。
@@ -2040,6 +2413,23 @@ fn main() {
         // 形态断言不受影响）。
         assert!(has("fs open spin.nes"), "fs double-click dispatch failed: {lines:?}");
         assert!(has("mount obj1 <- spin.nes"), "fs double-click mount failed: {lines:?}");
+        // S12-9：play-in-editor 全链路 —— 快照提示 + play 行 + stop +
+        // reset 日志齐备；运行态取证：spin 脚本在运行态把宿主节点挪了
+        // 位（demo_spin_x > 0），工具栏 PLAY 文本带 *（运行中）；RESET
+        // 后 spin 位置回 0（快照数据面还原 = 回到运行前；uid 与 NodeId
+        // 不动 —— find_by_name 命中的还是同一个节点）。
+        assert!(has("snapshot "), "play snapshot hint missing: {lines:?}");
+        assert!(has("play (1 scripts)"), "play log missing: {lines:?}");
+        assert!(has("stop"), "stop log missing: {lines:?}");
+        assert!(has("reset"), "reset log missing: {lines:?}");
+        assert!(demo_spin_x > 0.0, "脚本未在运行态驱动（spin.x={demo_spin_x}）");
+        assert_eq!(demo_play_text, "PLAY*", "运行中 PLAY 文本应为 PLAY*");
+        {
+            let tree = rt.tree_mut();
+            let spin = tree.find_by_name("spin").expect("spin 节点存活（uid/NodeId 不动）");
+            let x = tree.local(spin).unwrap_or_default().pos.x;
+            assert_eq!(x, 0.0, "RESET 后 spin 回到运行前位置（实际 {x}）");
+        }
         // 树形态：挂载 Script 子节点留存（名字 = 脚本基名），registry_key
         // 已回空串（卸载），enabled = false（切换后未回改）。
         let tree = rt.tree_mut();
@@ -2053,7 +2443,7 @@ fn main() {
             "卸载 = registry_key 回空串"
         );
         assert_eq!(tree.prop(kids[0], "enabled"), Some(&Value::Bool(false)));
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新 冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset 冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
     let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree);

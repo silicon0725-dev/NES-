@@ -48,16 +48,22 @@ fn t_in_01_events_round_trip() {
         "无人按键：无键/字符事件（系统消息可有）：{initial:?}"
     );
 
-    // W 按下（VK 0x57，泵的 TranslateMessage 会合成 WM_CHAR 'w' —— 真实
-    // 用户的字符到达路径）→ 鼠标移动 (10,20)（lparam 打包）→ 左键按下
-    // → 尺寸 (100,50)。
+    // W 按下（VK 0x57）→ WM_CHAR 'w' 直接投递 → 鼠标移动 (10,20)（lparam
+    // 打包）→ 左键按下 → 尺寸 (100,50)。
+    // （本测试曾依赖泵的 TranslateMessage 为投递的 WM_KEYDOWN 合成
+    // WM_CHAR —— 实测该合成依赖系统键盘布局/IME 状态：中文 IME 激活时
+    // 走 IME 消息路径不产 WM_CHAR，测试随环境确定性失败。字符到达的
+    // **我们的契约**是"WM_CHAR 消息 → Char 事件"映射，直接投递钉死；
+    // 端到端合成是 OS 行为，不属本契约。）
     let lparam_xy = ((20usize << 16) | 10) as isize;
     let lparam_size = ((50usize << 16) | 100) as isize;
+    const WM_CHAR: u32 = 0x0102;
     let posts = [
-        (WM_KEYDOWN, 0x57, 0isize),
-        (WM_MOUSEMOVE, 0, lparam_xy),
-        (WM_LBUTTONDOWN, 0, 0),
-        (WM_SIZE, 0, lparam_size),
+        (WM_KEYDOWN, 0x57usize, 0isize),
+        (WM_CHAR, 'w' as u32 as usize, 0isize),
+        (WM_MOUSEMOVE, 0usize, lparam_xy),
+        (WM_LBUTTONDOWN, 0usize, 0),
+        (WM_SIZE, 0usize, lparam_size),
     ];
     for (msg, wp, lp) in posts {
         assert!(unsafe { PostMessageW(window.hwnd(), msg, wp, lp) } != 0);
@@ -66,13 +72,13 @@ fn t_in_01_events_round_trip() {
     let drained = drain_input();
     let expected = [
         InputEvent::Key { key: Key::W, down: true },
+        InputEvent::Char('w' as u32),
         InputEvent::MouseMove { x: 10.0, y: 20.0 },
         InputEvent::MouseButton { button: MouseButton::Left, down: true },
         InputEvent::Resize { w: 100, h: 50 },
-        InputEvent::Char('w' as u32),
     ];
-    // 合成 WM_CHAR 经第二趟队列遍历才派发（TranslateMessage 投递、
-    // 下轮 Peek 取走）—— 与其他消息的相对序由 OS 决定，钉**保序子序列**。
+    // 投递序即到达序（同队 FIFO）—— 钉**保序子序列**，允许系统自发
+    // 噪声穿插（如布局相关的 TranslateMessage 合成字符）。
     let mut it = drained.iter();
     assert!(
         expected.iter().all(|e| it.any(|d| d == e)),
