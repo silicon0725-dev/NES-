@@ -39,6 +39,11 @@
 //!   S4.4 布局口径：`\n` 多行、行高 = 基准行高 + `line_spacing`、左上锚点、
 //!   字距恒定（等宽口径）；`font_size` 缩放与 `align_*`/`wrap_width` 记账
 //!   不参与布局（需要对齐/换行需先有排版框语义，属后续）。
+//! - `SetText` 的 **TTF 默认字体路径（S12-11 第 2 期）**：[`CommandConsumer::
+//!   set_ttf_default`] 装载真字体后，`font == NIL` 的文本改走动态字形图集
+//!   排版 —— 按比例字宽逐字符步进、字号 clamp 8..128 任意缩放、CJK 可上屏、
+//!   光标位随比例字宽（见 `push_ttf_label` 与 `glyph` 模块）。TTF 未装载时
+//!   一切与位图路径逐位相同；显式 `font` 键（位图字形表）完全不受影响。
 //! - **绘制锚点 = 渲染物局部原点（左上角）**：四边形从局部 `(0,0)` 铺到
 //!   `(CELL_PX, CELL_PX)`。推论：flip 按契约 I8 的 `transform ∘ flip` 绕**原点**
 //!   镜像（水平翻转让精灵出现在锚点左侧），平移分量逐位不变。M5 Scratch
@@ -65,7 +70,9 @@ use nes_render_api::state::{Camera2DState, ControlState, Flip, LabelState, ListA
 use crate::error::BackendError;
 use crate::ffi;
 use crate::gpu::{self, FrameImage, GpuContext, RenderTarget, SpriteAtlas};
+use crate::glyph::{GlyphAtlas, GlyphSlot, GLYPH_PAGE_PX, page_key};
 use crate::png::write_rgba8_png;
+use crate::ttf::TtfFont;
 
 // ------------------------------------------------------------ 常量
 
@@ -1128,6 +1135,12 @@ pub struct CommandConsumer {
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
     fonts: BTreeMap<RenderAssetKey, FontEntry>,
+    /// TTF 默认字体（[`CommandConsumer::set_ttf_default`] 装载；`None` = 未装载，
+    /// 文本一律走位图字形表路径 —— 与基线逐位相同）。
+    ttf: Option<TtfFont>,
+    /// TTF 动态字形图集（shelf 装箱 + (char, 字号) 缓存，见 [`crate::glyph`]）。
+    /// 未装载 TTF 时恒为空集，零行为影响。
+    glyph_atlas: GlyphAtlas,
     // 字段声明序 = 析构序（Rust 逐字段按声明序 drop）：管线 -> 图集 -> 注册表 ->
     // 目标 -> 上下文，与创建序相反。动态库按进程生命周期持有（见
     // ffi::NativeLib 的 Drop 说明），顺序不再是"函数指针失效"意义上的硬约束，
@@ -1215,6 +1228,8 @@ impl CommandConsumer {
             texts: BTreeMap::new(),
             lists: BTreeMap::new(),
             fonts: BTreeMap::new(),
+            ttf: None,
+            glyph_atlas: GlyphAtlas::default(),
             pipeline,
             atlas,
             registry,
@@ -1271,6 +1286,28 @@ impl CommandConsumer {
         rgba: &[u8],
     ) -> Result<u32, BackendError> {
         self.register_font(DEFAULT_FONT_KEY, params, rgba)
+    }
+
+    /// 装载 TTF 默认字体（S12-11 第 2 期）：之后 `LabelState.font == NIL` 的
+    /// 文本改走**真字体动态字形图集**排版 —— 比例字宽、任意字号（clamp
+    /// 8..128）、CJK 可上屏、光标位随比例字宽。
+    ///
+    /// `data` 是一份 `.ttf` 或 `.ttc` 字体文件字节（TTC 取第一个字体，解析
+    /// 由 [`TtfFont::parse`] 完成）。解析失败如实报错（[`BackendError::
+    /// ConfigMismatch`] 携带 [`crate::ttf::TtfError`] 原文），**失败不改动
+    /// 现状**：已装载的旧 TTF 保留、未装载仍是位图路径。重复装载 = 覆写
+    /// （字形缓存与已注册字形页保留不动 —— 页内容只增不改，新字体未命中的
+    /// 字形会继续装箱进既有页序列，混合页面对编辑器场景无观察意义；如需
+    /// 干净状态请新建消费器）。
+    ///
+    /// 显式 `font` 资源键（位图字形表路径）完全不受影响：装载后走 TTF 的
+    /// 只有 `font == NIL` 的条目；未登记键仍退回位图默认字体（基线口径）。
+    pub fn set_ttf_default(&mut self, data: &[u8]) -> Result<(), BackendError> {
+        let font = TtfFont::parse(data).map_err(|err| {
+            BackendError::ConfigMismatch(format!("TTF 默认字体解析失败：{err}"))
+        })?;
+        self.ttf = Some(font);
+        Ok(())
     }
 
     /// 登记自定义字体（`LabelState.font` 指向该键时使用），返回瓦片号。
@@ -1366,6 +1403,199 @@ impl CommandConsumer {
     /// 驱动侧未捕获错误快照（`FrameStats::driver_errors` 的原文出处）。
     pub fn errors_snapshot(&self) -> Vec<String> {
         self.ctx.errors_snapshot()
+    }
+
+    /// 取（或装箱）一个 TTF 字形槽位：缓存键 `(char, size_px)`（见
+    /// [`crate::glyph`] 的缓存语义 —— 进程内不淘汰）。
+    ///
+    /// 未命中路径：cmap 查码点 -> [`TtfFont::rasterize`] -> shelf 装箱 ->
+    /// 字形页整张重注册（[`gpu::TextureRegistry::register`] 的语义是"同键
+    /// 覆写 + 立即 `queueWriteTexture` 上传"—— 本 crate 没有 pending 上传
+    /// 队列，runtime 层的 `upload_pending_textures` 是另一条路径；所以装箱
+    /// 当帧即可采样，无需 flush）。
+    ///
+    /// 缺字形（cmap 查不到）：**跳过不画，只推笔位**（笔位步进取 `.notdef`
+    /// 的 advance）。选跳过而非 notdef 方块兜底：编辑器文本混入未覆盖码点时
+    /// 一排 .notdef 方块比安静留白更吵，且"未知字符占位推进"的排版节奏仍在。
+    fn glyph_slot(&mut self, ch: char, size_px: i32) -> Result<GlyphSlot, BackendError> {
+        if let Some(hit) = self.glyph_atlas.cached(ch, size_px) {
+            return Ok(hit);
+        }
+        let font = self.ttf.as_ref().expect("glyph_slot 只在 TTF 已装载时被调用");
+        let px = size_px as f32;
+        let (bitmap, advance) = match font.glyph_index(ch) {
+            Some(gid) => {
+                let bm = font.rasterize(gid, px).map_err(|err| {
+                    BackendError::ConfigMismatch(format!(
+                        "字形 {ch:?}（gid {gid}，{size_px}px）光栅化失败：{err}"
+                    ))
+                })?;
+                let adv = bm.advance;
+                (Some(bm), adv)
+            }
+            None => (None, font.advance(TtfFont::NOTDEF, px).unwrap_or(0.0)),
+        };
+        let placement = bitmap
+            .as_ref()
+            .and_then(|bm| self.glyph_atlas.place(bm.width, bm.height));
+        let slot = match placement {
+            Some((page, x, y)) => {
+                let bm = bitmap.as_ref().expect("有落位必有位图");
+                GlyphSlot {
+                    page,
+                    x,
+                    y,
+                    w: bm.width,
+                    h: bm.height,
+                    bearing_x: bm.bearing_x as f32,
+                    bearing_y: bm.bearing_y as f32,
+                    advance,
+                }
+            }
+            // 空字形（空格等 0x0 位图）或单边超页：不占页，只记账 advance。
+            None => GlyphSlot {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+                bearing_x: 0.0,
+                bearing_y: 0.0,
+                advance,
+            },
+        };
+        if let Some((page, x, y)) = placement {
+            let bm = bitmap.as_ref().expect("有落位必有位图");
+            self.glyph_atlas.blit(page, x, y, bm.width, bm.height, &bm.coverage);
+            // 字段拆借（blit 已结束）：页缓冲、注册表、上下文三处互不相交，
+            // 免去整页 256 KiB 的克隆。
+            let this = &mut *self;
+            let rgba = this.glyph_atlas.page_rgba(page);
+            this.registry.register(
+                &this.ctx,
+                page_key(page),
+                GLYPH_PAGE_PX,
+                GLYPH_PAGE_PX,
+                rgba,
+            )?;
+        }
+        self.glyph_atlas.cache_insert(ch, size_px, slot);
+        Ok(slot)
+    }
+
+    /// TTF 文本排版（S12-11 第 2 期）：把一条 [`LabelState`] 展开成字形四边形
+    /// 实例（笔基点 `world` 与位图路径同口径：按钮 = 矩形左上 + 4px 内衬，
+    /// 纯 Label = 自身世界变换；调用方算好传入）。
+    ///
+    /// # 布局口径
+    ///
+    /// - 字号：`font_size` clamp 8..128 后取整（f32 -> i32）作缓存键；度量
+    ///   （ascent / line_height）用 clamp 后的 f32 值；
+    /// - 行基线：第 i 行基线 y = `i * (line_height + line_spacing) + ascent`
+    ///   （line_spacing 与位图路径同口径逐行叠加 —— T-Text-13 契约在 TTF
+    ///   路径同样成立）；
+    /// - 字形四边形：左 = 笔位 + `bearing_x`，顶 = 基线 - `bearing_y`，宽高 =
+    ///   位图像素尺寸直出；着色器常量是"世界单位 x 16 = 1 格"，故 scale 取
+    ///   `(w/16, h/16)` —— 与位图路径的 `cell/16` 同一折算口径（像素不再除
+    ///   `CELL_PX` 归一字格，只折算进世界矩阵）；
+    /// - UV：字形页 256x256 整张注册，页内矩形按注册表纹理实际尺寸折算
+    ///   （S8.2 修复口径）；
+    /// - 空格 / 缺字形 / 空位图：只推笔位不画；
+    /// - 光标（[`LabelState::caret`] = `Some(n)`）：竖条宽 1px、高 =
+    ///   `line_height`，x = 第 n 个字符槽位前所有字符的 advance 之和
+    ///   （'\n' 归零换行；单行文本退化为 `笔位起始 + sum(advance of
+    ///   chars[..n])`），颜色同 `label.color`，与条目共用裁剪与 DrawKey 序。
+    #[allow(clippy::too_many_arguments)]
+    fn push_ttf_label(
+        &mut self,
+        sprites: &mut Vec<SpriteInstance>,
+        handle: ItemHandle,
+        clip: [f32; 4],
+        world: &Affine2,
+        label: &LabelState,
+        fill_uv: [f32; 4],
+        glyphs: &mut u64,
+    ) -> Result<(), BackendError> {
+        let size_f = label.font_size.clamp(8.0, 128.0);
+        let size_px = size_f.round() as i32;
+        let metrics = self
+            .ttf
+            .as_ref()
+            .expect("push_ttf_label 只在 TTF 已装载时被调用")
+            .metrics(size_f)
+            .expect("字号 clamp 8..128 后度量不可能失败");
+        let tint = SpriteInstance::tint_of(label.color);
+        let line_h = metrics.line_height + label.line_spacing;
+        for (line_index, line) in label.text.split('\n').enumerate() {
+            let baseline = line_index as f32 * line_h + metrics.ascent;
+            let mut pen_x = 0.0f32;
+            for ch in line.chars() {
+                let slot = self.glyph_slot(ch, size_px)?;
+                if slot.w > 0 && slot.h > 0 {
+                    let quad = world
+                        .mul(&Affine2::translation(
+                            pen_x + slot.bearing_x,
+                            baseline - slot.bearing_y,
+                        ))
+                        .mul(&Affine2::scale(
+                            slot.w as f32 / gpu::CELL_PX as f32,
+                            slot.h as f32 / gpu::CELL_PX as f32,
+                        ));
+                    let (tile, sheet) = self
+                        .registry
+                        .sample_info(page_key(slot.page))
+                        .expect("字形页在装箱时已注册");
+                    // 页内矩形 -> 大纹理 UV：页恒为 256x256 整张注册，
+                    // sample_info 返回注册尺寸的瓦片矩形（S8.2 口径）。
+                    let page = GLYPH_PAGE_PX as f32;
+                    let uv_rect = [
+                        sheet[0] + slot.x as f32 / page * sheet[2],
+                        sheet[1] + slot.y as f32 / page * sheet[3],
+                        slot.w as f32 / page * sheet[2],
+                        slot.h as f32 / page * sheet[3],
+                    ];
+                    sprites.push(SpriteInstance {
+                        handle,
+                        world: quad.to_array(),
+                        uv_rect,
+                        source: [tile as f32, 1.0],
+                        tint,
+                        clip,
+                    });
+                    *glyphs += 1;
+                }
+                pen_x += slot.advance;
+            }
+        }
+        // 光标：n = caret，前 n 个字符的 advance 累加（'\n' 归零换行）。
+        // 缺字形同样按 .notdef advance 推进，与正文的笔位轨迹严格一致。
+        if let Some(caret) = label.caret {
+            let mut caret_line = 0.0f32;
+            let mut caret_x = 0.0f32;
+            for ch in label.text.chars().take(usize::from(caret)) {
+                if ch == '\n' {
+                    caret_line += line_h;
+                    caret_x = 0.0;
+                    continue;
+                }
+                caret_x += self.glyph_slot(ch, size_px)?.advance;
+            }
+            let quad = world
+                .mul(&Affine2::translation(caret_x, caret_line))
+                .mul(&Affine2::scale(
+                    1.0 / gpu::CELL_PX as f32,
+                    metrics.line_height / gpu::CELL_PX as f32,
+                ));
+            sprites.push(SpriteInstance {
+                handle,
+                world: quad.to_array(),
+                uv_rect: fill_uv,
+                source: [0.0, 0.0],
+                tint,
+                clip,
+            });
+        }
+        Ok(())
     }
 
     /// 消费一整条命令流并产出一帧（渲染 + 读回）。
@@ -1513,9 +1743,13 @@ impl CommandConsumer {
 
         // 绘制列表：可见，且（精灵：资源键已绑定 / 控件：有 SetRect / 文本：
         // 有 SetText / 列表：有 SetList），按 DrawKey 升序（契约 I5）。
-        let mut draw_list: Vec<&RenderItem> = self
+        // 拷贝而非借用（RenderItem 是 Copy 的小结构）：条目循环体内的 TTF
+        // 路径需要 &mut self（字形缓存未命中会装箱新页并注册上传），持有
+        // 借用会把整个消费器锁死。
+        let mut draw_list: Vec<RenderItem> = self
             .items
             .values()
+            .copied()
             .filter(|item| {
                 item.visible
                     && (!item.key.is_nil()
@@ -1746,14 +1980,36 @@ impl CommandConsumer {
                         }
                     }
                 }
-            } else if let Some(label) = self.texts.get(&item.handle) {
+            } else if let Some(label) = self.texts.get(&item.handle).cloned() {
                 // 文本（S4.4/S4.5）：世界变换 = 笔起点（首行首字格左上角），每字形
                 // 一个四边形，采样字形表对应字格。字距恒定（等宽口径）、
                 // 行高 = 基准 + line_spacing；空格与表外字符只推进笔位不画。
                 // 字体解析（T-Text-07/08 口径）：`font == NIL` 或指向未登记键
                 // -> 默认字体；指向已登记键 -> 该字体。两种都拿不到时不画。
-                let resolved_font = self.resolve_font(label.font);
-                if let Some((font_key, font)) = resolved_font {
+                // （`.cloned()` 只递增一个 Arc —— push_ttf_label 需要 &mut self，
+                // 不能与这里的只读借用共存；位图分支不受影响。）
+                if label.font.is_nil() && self.ttf.is_some() {
+                    // TTF 默认字体路径（S12-11 第 2 期）：真字体动态字形图集
+                    // 排版 —— 比例字宽、字号 clamp 8..128、CJK 可上屏；笔基点
+                    // 与位图路径同口径（按钮 = 矩形左上 + 4px 内衬，纯 Label =
+                    // 自身世界变换）。显式 font 键与未登记键不走这里（基线不变）。
+                    let world = match (self.rects.get(&item.handle), inv_view) {
+                        (Some(rect_state), Some(inv)) => {
+                            let rect = rect_state.resolve(viewport);
+                            inv.mul(&Affine2::translation(rect.x + 4.0, rect.y + 4.0))
+                        }
+                        _ => item.world_transform(),
+                    };
+                    self.push_ttf_label(
+                        &mut sprites,
+                        item.handle,
+                        item_clip,
+                        &world,
+                        &label,
+                        fill_uv,
+                        &mut stats.glyphs,
+                    )?;
+                } else if let Some((font_key, font)) = self.resolve_font(label.font) {
                     if let Some((tile, sheet_uv)) = self.registry.sample_info(font_key) {
                         // 笔基点：纯 Label = 自身世界变换（既有行为）；
                         // 按钮（同句柄带 rect）= 矩形左上 + 4px 内衬

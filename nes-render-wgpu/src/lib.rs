@@ -40,6 +40,8 @@
 //! | [`ffi`] | `#[repr(C)]` 结构体 + 枚举常量 + 运行时符号解析（无第三方依赖） |
 //! | [`gpu`] | 动态库定位、实例/适配器/设备、离屏目标与像素读回、精灵图集、纹理注册表 |
 //! | [`renderer`] | [`RenderServer`](nes_render_api::RenderServer) 实现 + 命令消费器 + 精灵管线 |
+//! | [`ttf`] | 手写 TrueType 子集解析器 + 标量灰度光栅化器（S12-10 第 1 期） |
+//! | `glyph` | TTF 动态字形图集：shelf 装箱 + (char, 字号) 缓存（S12-11 第 2 期，内部模块） |
 //! | [`bmp`] | 极简 BMP 装载器（外部预处理产物 -> RGBA，供纹理注册表上传） |
 //! | [`png`] | 手写 PNG 编码器（导出可视证据） |
 //! | [`error`] | 每一个失败点都能指名道姓的 [`BackendError`] |
@@ -72,6 +74,7 @@ pub mod error;
 /// 字段级文档在此豁免（重复头文件注释没有信息量），语义决策写在类型级注释里。
 #[allow(missing_docs)]
 pub mod ffi;
+mod glyph;
 pub mod gpu;
 pub mod png;
 pub mod renderer;

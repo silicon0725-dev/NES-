@@ -410,7 +410,11 @@ impl TtfFont {
         let gid = if seg.range_offset == 0 {
             cp.wrapping_add(seg.delta as u16)
         } else {
-            let pos = seg.range_base + 2 * usize::from(cp - seg.start);
+            // idRangeOffset[i] 是相对**本条目自身位置**的字节偏移（规范：指针
+            // 指回 idRangeOffset 数组再前跳），所以基址 = 本条目位置 + 偏移，
+            // 再按码点步进 2 字节读 glyphIdArray。
+            let pos =
+                seg.range_base + usize::from(seg.range_offset) + 2 * usize::from(cp - seg.start);
             let raw = u16_at(&self.data, pos).ok()?;
             if raw == 0 {
                 return None;
@@ -705,7 +709,10 @@ impl TtfFont {
             if flag & 0x02 != 0 {
                 let d = u32::from(u8_at(data, p)?);
                 p += 1;
-                x += if flag & 0x10 != 0 { d as i32 } else { d as i32 - 256 };
+                // X_SHORT：1 字节增量，X_SAME_OR_POSITIVE（0x10）裁决符号 ——
+                // 清位即**负值**（-d，不是 d-256：那是把"无符号字节当补码"
+                // 的错误换算，SimHei 实测抓到 —— 见 S12-11 集成报告）。
+                x += if flag & 0x10 != 0 { d as i32 } else { -(d as i32) };
             } else if flag & 0x10 == 0 {
                 x += i32::from(i16_at(data, p)?);
                 p += 2;
@@ -718,7 +725,8 @@ impl TtfFont {
             if flag & 0x04 != 0 {
                 let d = u32::from(u8_at(data, p)?);
                 p += 1;
-                y += if flag & 0x20 != 0 { d as i32 } else { d as i32 - 256 };
+                // Y_SHORT：同 x 口径（Y_SAME_OR_POSITIVE = 0x20 清位即负值）。
+                y += if flag & 0x20 != 0 { d as i32 } else { -(d as i32) };
             } else if flag & 0x20 == 0 {
                 y += i32::from(i16_at(data, p)?);
                 p += 2;
@@ -1000,9 +1008,10 @@ fn approx_len(a: (f32, f32), b: (f32, f32)) -> f32 {
 mod tests {
     use super::*;
 
-    /// 组装一个只有 3 个字形的合法最小 TTF（long loca，upem=1000）：
+    /// 组装一个只有 4 个字形的合法最小 TTF（long loca，upem=1000）：
     /// gid0 空字形（.notdef）、gid1 三角形（'A'）、gid2 同向双层方环（'B'，
-    /// nonzero 与 even-odd 的区分用例）。
+    /// nonzero 与 even-odd 的区分用例）、gid3 负坐标小方块（'C'，**short
+    /// 向量负增量**回归；经 'D' 以 **idRangeOffset 间接寻址**再映射一次）。
     fn build_minimal_font() -> Vec<u8> {
         // ---- head（54 字节） ----
         let mut head = Vec::new();
@@ -1026,7 +1035,7 @@ mod tests {
         // ---- maxp ----
         let mut maxp = Vec::new();
         maxp.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-        maxp.extend_from_slice(&3u16.to_be_bytes()); // numGlyphs
+        maxp.extend_from_slice(&4u16.to_be_bytes()); // numGlyphs
 
         // ---- hhea ----
         let mut hhea = Vec::new();
@@ -1036,35 +1045,43 @@ mod tests {
         hhea.extend_from_slice(&0i16.to_be_bytes()); // lineGap
         hhea.extend_from_slice(&700u16.to_be_bytes()); // advanceWidthMax
         hhea.extend_from_slice(&[0u8; 22]); // 其余字段本子集不读
-        hhea.extend_from_slice(&3u16.to_be_bytes()); // numberOfHMetrics
+        hhea.extend_from_slice(&4u16.to_be_bytes()); // numberOfHMetrics
 
-        // ---- hmtx：3 个度量 ----
+        // ---- hmtx：4 个度量 ----
         let mut hmtx = Vec::new();
-        for (adv, lsb) in [(500u16, 0i16), (500, 0), (800, 0)] {
+        for (adv, lsb) in [(500u16, 0i16), (500, 0), (800, 0), (300, 0)] {
             hmtx.extend_from_slice(&adv.to_be_bytes());
             hmtx.extend_from_slice(&lsb.to_be_bytes());
         }
 
-        // ---- cmap：format 4，platform 3/1，'A'->1、'B'->2、0xFFFF 哨兵 ----
+        // ---- cmap：format 4，platform 3/1 ----
+        // 'A'->1、'B'->2（delta 式）；'C'->3（delta 式）；'D'->3（**idRangeOffset
+        // 间接式**：glyphIdArray 只放一个 3）；0xFFFF 哨兵。
         let mut sub = Vec::new();
+        const SEGMENTS: usize = 5;
+        // 子表长度 = 头 14 + endCode 10 + pad 2 + startCode 10 + idDelta 10
+        //          + idRangeOffset 10 + glyphIdArray 2 = 58。
         sub.extend_from_slice(&4u16.to_be_bytes()); // format
-        sub.extend_from_slice(&40u16.to_be_bytes()); // length
+        sub.extend_from_slice(&58u16.to_be_bytes()); // length
         sub.extend_from_slice(&0u16.to_be_bytes()); // language
-        sub.extend_from_slice(&6u16.to_be_bytes()); // segCountX2 = 3 段
+        sub.extend_from_slice(&(SEGMENTS as u16 * 2).to_be_bytes()); // segCountX2
         sub.extend_from_slice(&[0u8; 6]); // searchRange/entrySelector/rangeShift
-        for end in [0x41u16, 0x42, 0xFFFF] {
+        for end in [0x41u16, 0x42, 0x43, 0x44, 0xFFFF] {
             sub.extend_from_slice(&end.to_be_bytes());
         }
         sub.extend_from_slice(&0u16.to_be_bytes()); // reservedPad
-        for start in [0x41u16, 0x42, 0xFFFF] {
+        for start in [0x41u16, 0x42, 0x43, 0x44, 0xFFFF] {
             sub.extend_from_slice(&start.to_be_bytes());
         }
-        for delta in [(1i16 - 0x41), (2i16 - 0x42), 1] {
+        for delta in [(1i16 - 0x41), (2i16 - 0x42), (3i16 - 0x43), 0, 1] {
             sub.extend_from_slice(&delta.to_be_bytes());
         }
-        for _ in 0..3 {
-            sub.extend_from_slice(&0u16.to_be_bytes()); // idRangeOffset = 0
+        // idRangeOffset：'D' 条目（第 4 段，条目位置 = 14+10+2+10+10+3*2 = 52）
+        // 指向 glyphIdArray[0]（位置 56），偏移 = 56 - 52 = 4。
+        for ro in [0u16, 0, 0, 4, 0] {
+            sub.extend_from_slice(&ro.to_be_bytes());
         }
+        sub.extend_from_slice(&3u16.to_be_bytes()); // glyphIdArray = [3]
         let mut cmap = Vec::new();
         cmap.extend_from_slice(&0u16.to_be_bytes()); // version
         cmap.extend_from_slice(&1u16.to_be_bytes()); // numTables
@@ -1107,13 +1124,42 @@ mod tests {
             glyph2.extend_from_slice(&d.to_be_bytes()); // y 增量
         }
 
+        // gid3：负坐标小方块 (30,30) -> (-30,30) -> (-30,-30) -> (30,-30)。
+        // 增量全走 **1 字节 short 向量**，其中两组为负 —— 钉住
+        // "X/Y_SAME_OR_POSITIVE 清位即 -d" 的解码（曾误作 d-256，SimHei
+        // 实测抓到，见 S12-11 集成报告）。
+        let mut glyph3 = Vec::new();
+        glyph3.extend_from_slice(&1i16.to_be_bytes()); // numberOfContours
+        glyph3.extend_from_slice(&(-30i16).to_be_bytes()); // xMin
+        glyph3.extend_from_slice(&(-30i16).to_be_bytes()); // yMin
+        glyph3.extend_from_slice(&30i16.to_be_bytes()); // xMax
+        glyph3.extend_from_slice(&30i16.to_be_bytes()); // yMax
+        glyph3.extend_from_slice(&3u16.to_be_bytes()); // endPts = [3]
+        glyph3.extend_from_slice(&0u16.to_be_bytes()); // instructionLength
+        // flags：on+x短+/y短+ | on+x短-/y同 | on+x同/y短- | on+x短+/y同
+        glyph3.extend_from_slice(&[0x37, 0x23, 0x15, 0x33]);
+        for d in [30i16, -60, 60] {
+            glyph3.extend_from_slice(&(d.unsigned_abs() as u8).to_be_bytes()); // x 1 字节
+        }
+        for d in [30i16, -60] {
+            glyph3.extend_from_slice(&(d.unsigned_abs() as u8).to_be_bytes()); // y 1 字节
+        }
+
         let mut glyf = glyph1.clone();
         glyf.extend_from_slice(&glyph2);
+        glyf.extend_from_slice(&glyph3);
         let glyph1_len = glyph1.len() as u32;
+        let glyph2_len = glyph2.len() as u32;
 
-        // ---- loca（long）：gid0 空 / gid1 [0,29) / gid2 [29,85) / 表尾 ----
+        // ---- loca（long）：gid0 空 / gid1 / gid2 / gid3 / 表尾 ----
         let mut loca = Vec::new();
-        for off in [0u32, 0, glyph1_len, glyf.len() as u32] {
+        for off in [
+            0u32,
+            0,
+            glyph1_len,
+            glyph1_len + glyph2_len,
+            glyf.len() as u32,
+        ] {
             loca.extend_from_slice(&off.to_be_bytes());
         }
 
@@ -1159,11 +1205,34 @@ mod tests {
     fn minimal_font_parse_and_cmap() {
         let font = TtfFont::parse(&build_minimal_font()).expect("最小字体必须可解析");
         assert_eq!(font.units_per_em(), 1000);
-        assert_eq!(font.num_glyphs(), 3);
+        assert_eq!(font.num_glyphs(), 4);
         assert_eq!(font.glyph_index('A'), Some(1));
         assert_eq!(font.glyph_index('B'), Some(2));
+        assert_eq!(font.glyph_index('C'), Some(3), "delta 式映射");
+        assert_eq!(font.glyph_index('D'), Some(3), "idRangeOffset 间接式映射");
         assert_eq!(font.glyph_index('Z'), None, "未映射码点必须返回 None");
         assert_eq!(font.glyph_index('中'), None, "合成字体只有 ASCII 段");
+    }
+
+    /// gid3 回归（S12-11 集成期抓到的两处第 1 期解码缺陷，合成字体钉死）：
+    /// ① short 向量负增量：`X/Y_SAME_OR_POSITIVE` 清位即 **-d**（曾误作
+    /// `d - 256`，真实 SimHei 轮廓整体错位/放大 6~27 倍）；② cmap
+    /// idRangeOffset 间接寻址：glyphIdArray 位置 = 本条目位置 + 偏移
+    /// （曾漏加偏移，msyh.ttc 全部间接段查 None / 读垃圾）。
+    #[test]
+    fn minimal_font_negative_short_vectors_and_range_offset() {
+        let font = TtfFont::parse(&build_minimal_font()).expect("解析成功");
+        // 'D' 走间接式（range_offset = 4 -> glyphIdArray[0] = 3）。
+        assert_eq!(font.glyph_index('D'), Some(3), "间接式必须加 range_offset");
+        // 30..-30 字形单位 @16px（scale = 0.016）：位图 [-0.48,0.48)² -> 2x2，
+        // bearing (-1, 1)；advance = 300 * 0.016 = 4.8。旧 d-256 解码会把
+        // p1.x 算成 30 + (30 - 256) = -196，位图宽爆到 4px 且 bearing 错位。
+        let bm = font.rasterize(3, 16.0).expect("方块光栅化");
+        assert_eq!((bm.width, bm.height), (2, 2), "60 字形单位见方的位图尺寸");
+        assert_eq!(bm.bearing_x, -1, "字形越过原点向左：bearing_x 为负");
+        assert_eq!(bm.bearing_y, 1, "顶缘在基线上方 0.48px 取整为 1");
+        assert_eq!(bm.advance, 4.8);
+        assert!(bm.coverage.iter().any(|&c| c > 0), "方块中心像素有覆盖");
     }
 
     #[test]

@@ -699,7 +699,13 @@ fn button_states_of(
         _ => String::new(),
     };
     let text_slot = slot_prop(tree, node, "text_slot", "text");
-    let mut label = LabelState::new(text, 16.0);
+    // 字号：`font_size` 属性（前向兼容通道写入，schema 暂未给 Button 该
+    // 键），缺省 16 = 既有行为逐位不变。S12-11 壳层给工具栏按钮写 14
+    //（真字体下 "RESET" 5 字 ≈38px，48px 按钮装得下；16px 会溢出 4px）。
+    let mut label = LabelState::new(
+        text,
+        f32_prop(tree, node, PROP_LABEL_FONT_SIZE, DEFAULT_LABEL_FONT_SIZE).max(0.0),
+    );
     label.color = theme.slot(&text_slot).unwrap_or(label.color);
     (layout, label)
 }
@@ -744,7 +750,14 @@ fn text_input_states_of(
         },
     };
     let text_slot = slot_prop(tree, node, "text_slot", "text");
-    let mut label = LabelState::new(text, 16.0);
+    // 字号：`font_size` 属性（前向兼容通道写入，schema 暂未给 TextInput
+    // 该键），缺省 16 = 既有行为逐位不变。S12-11 壳层给改名框写 14 ——
+    // 与面板文字同字号，且 IME 锚点的真字宽累加与光标条渲染同源（同
+    // 字号同字体 = 逐字 advance 严格一致，见 editor_shell ime_caret_offset）。
+    let mut label = LabelState::new(
+        text,
+        f32_prop(tree, node, PROP_LABEL_FONT_SIZE, DEFAULT_LABEL_FONT_SIZE).max(0.0),
+    );
     label.color = theme.slot(&text_slot).unwrap_or(label.color);
     // 光标：仅持焦点 + 可见半拍。字符下标口径与场景层冻结一致
     //（`chars().count()`），收进契约层的 u16（越界夹到 u16::MAX）。

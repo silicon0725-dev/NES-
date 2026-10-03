@@ -95,6 +95,29 @@
 //! 身、信号只写属性/变换），编辑交互在运行态全部禁用（下方护盾），
 //! 故快照 uid 在 RESET 时必然尽数存活。
 //!
+//! S12-11（**编辑器壳层切换真字体**）：渲染器第 2 期（动态字形图集 +
+//! `set_ttf_default`）落地后，`font == NIL` 的文本自动走真字体比例排
+//! 版 —— 壳层要做的是供给与口径收口：
+//! ① **启动字体探测链**（[`FONT_CANDIDATES`]：msyh.ttc → simhei.ttf →
+//!    segoeui.ttf，第一个可读且可解析者装载；全部缺失 = 保持位图字体，
+//!    Output 记一行、不 panic —— 优雅回退契约）；
+//! ② **统一字号 14**：全部 Label（含标尺数字）经 schema 键 `font_size`
+//!    写 14；输入框/工具栏按钮 schema 无该键，经 set_prop_raw 前向通
+//!    道写 14（提取层 TextInput/Button 读 `font_size` 属性、缺省 16
+//!    逐位不变）。行步进常量从 16 放宽到 [`INS_ROW_H`] 20（msyh 行高
+//!    ≈1.32em，14px ≈ 18.5px —— 16px 步进下属性行会顶进改名框）；
+//! ③ **IME 组合窗锚点真字宽累加**（第 1 期的 10px 平均步进退役）：
+//!    壳层持同一份字体数据的 TtfFont 实例（重复解析一次可接受 —— 解
+//!    析器纯 CPU 无共享状态，与消费器内实例不共享是刻意的，免去跨所
+//!    有权借用的复杂度），caret_x = 输入框位 + 4px 内衬 + Σ advance
+//!    （与渲染器 push_ttf_label 光标算式同源，见 [`ime_caret_offset`]）；
+//! ④ 布局口径复核：等宽 16px 假设处逐处过一遍（见各常量注）—— 比例
+//!    字体同 px 容字更多，溢出只会变少不会变多，截断预算按"位图回退
+//!    模式仍安全"取界（真字体是可选增强，回退模式不许破相）。
+//! ListView 行文本（层级树/Output dock/FileSystem）走 ListState 位图
+//! 路径不受影响（16px 等宽，字数预算照旧）—— 列表行接真字体归后续
+//! 里程碑（见 S12.11 文档 §5 遗留）。
+//!
 //! 运行态编辑禁用口径：gizmo/框选/点选/Tab 循环/方向键/Delete/
 //! undo-redo/F6..F9/Enter/U/E/改名提交/行点击落账全部让路（各动作
 //! 入口 `if !playing` 一层护盾）；相机置中与全部面板投影照常 ——
@@ -114,6 +137,7 @@ use nes_render_api::input::{InputEvent, Key, MouseButton};
 use nes_render_api::{FrameInfo, Vec2};
 use nes_render_extract::{PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE};
 use nes_render_wgpu::window::inject_input;
+use nes_render_wgpu::ttf::TtfFont;
 use nes_render_wgpu::{bmp, FontParams};
 use nes_runtime::{write_bmp_rgba, NesRuntime};
 use nes_scene::editor::{Hierarchy, Inspector, Selection};
@@ -151,8 +175,10 @@ const DOCK_ROW_H: f32 = 18.0;
 /// 行，早期行不再被新行挤出断言窗；dock 可见窗仍只显最新几行，显示
 /// 面不变）。
 const EDITOR_LOG_KEEP: usize = 20;
-/// dock 行显示截宽（字符数）：40 字 × 16px advance = 640px，最小窗
-/// 768 下 dock 内衬（≈748px）也放得下，行尾不裁字。
+/// dock 行显示截宽（字符数）：Output dock 是 ListView 行（ListState
+/// **位图路径**，S12-11 壳层接入不改 —— 见模块头），等宽 advance=16
+/// 不随真字体装载变化，40 字 × 16px = 640px，最小窗 768 下 dock 内衬
+///（≈748px）也放得下，行尾不裁字。口径复核（S12-11）：不变。
 const DOCK_LINE_CHARS: usize = 40;
 
 /// 文件系统 dock（S12-8，Godot 左下 res:// 面板）布局常量：
@@ -180,9 +206,10 @@ const FS_DBLCLICK_FRAMES: u64 = 30;
 
 /// 2D 标尺条带厚度（Godot 2D 视口顶横/左竖刻度尺观感）。
 const RULER_W: f32 = 16.0;
-/// 标尺最小刻度间距（1px 细条）；数字标签每 2 格（=128px）一个
-/// —— 渲染器字形只按字体单元一种字号展开（font_size 不参与缩放，
-/// 已查证 nes-render-wgpu 展开路径），16px 等宽下 128px 密度放得下。
+/// 标尺最小刻度间距（1px 细条）；数字标签每 2 格（=128px）一个。
+/// 密度复核（S12-11）：数字改真字体 14px 后 3 位数 ≈21px、4 位数
+/// ≈28px，128px 间距余量巨大；位图回退 3 位 48px 同样放得下 ——
+/// 两种模式都无溢出，密度不变。
 const RULER_TICK: f32 = 64.0;
 /// 刻度条带池上限（顶横 48 + 左竖 32 共用一池）：按 2560×1440 客户
 /// 区实测留量（宽向 ≈37 根、高向 ≈21 根），4K 超限少画几根，控件数
@@ -221,18 +248,43 @@ const VK_F9: u32 = 0x78;
 /// （约 1s）自动刷一次 + F5 手动即时刷** —— 不用每帧（代价无谓），
 /// 也不只靠 F5（外部增删 .nes 文件要等按键才可见，观感差）。
 const SCRIPT_SCAN_EVERY: u64 = 60;
-/// Inspector 行内字符预算（S12-6 口径：面板内衬宽 178px、advance=16
-/// ≈ 11 字/行）—— 候选文件名显示按此截断。
+/// Inspector 行内字符预算（S12-6 口径：面板内衬宽 178px、位图等宽
+/// advance=16 ≈ 11 字/行）—— 候选文件名显示按此截断。口径复核
+///（S12-11）：真字体 14px 比例字宽下同 px 容字更多（≈25 字），溢出
+/// 只会变少；截断值**保持 11** —— 真字体是可选增强（系统字体缺失时
+/// 回退位图），预算必须按两种模式都安全取界（位图 11×16=176 ≤ 178）。
 const INS_LINE_CHARS: usize = 11;
 /// 输入框/面板内容的水平内衬。
 const INSPECTOR_INSET: f32 = 6.0;
 
+/// 编辑器 UI 统一字号（S12-11 壳层裁决）：真字体 14px 的可读性优于
+/// 位图 16px 点阵（真字体小字号平滑、位图 16 是放大点阵）。适用面
+/// **逐处列出**：全部 Label（面板标题/Inspector 分区与属性行/状态栏/
+/// 标尺数字 —— 标尺数字 14 的观感理由：14px 行高 ≈18.5px 更贴 16px
+/// 条带，16px 会下探 5px 进视口）+ 改名输入框 + 工具栏六按钮（schema
+/// 无 font_size 键，走 set_prop_raw 前向通道；msyh 实测 16px 下
+/// "RESET" advance 和 ≈46px + 4px 内衬会越过 48px 按钮右缘，14px
+/// 实测 40.6px、墨迹 ≈39px 贴边装得下 —— 实测见 S12.11 文档 §2）。
+const UI_FONT_SIZE: i64 = 14;
+
+/// Inspector 竖向行步进（S12-11 从 16 放宽）：真字体 14px 的行高 =
+/// ascent+descent+lineGap，msyh/segoeui ≈1.32em ≈ 18.5px —— 16px 步
+/// 进下 Inspector 属性行会顶进改名输入框。20px 给足余量；位图回退
+/// 行高恒 16px，20px 步进只是行距略宽（回退模式降级观感，不破相）。
+const INS_ROW_H: f32 = 20.0;
+
 /// IME 组合窗锚点的框内内衬（像素，x/y 同值 —— 单行输入框的 P0 近似）。
 const IME_CARET_INSET: f32 = 4.0;
-/// IME 光标近似步进（px/字符）：中英混排平均取 10 —— 等宽点阵英文
-/// 16px / 全宽中文的真实步进需要渲染器字形度量，归渲染集成期；P0
-/// 只求候选窗"落在输入框附近"（见帧循环接线注）。
-const IME_AVG_ADVANCE: f32 = 10.0;
+
+/// 启动字体探测链（S12-11 壳层，按优先级）：微软雅黑（CJK+拉丁全覆盖
+/// 的现代 UI 字体）→ 黑体（CJK 兜底）→ Segoe UI（纯拉丁兜底）。第一个
+/// 可读且可解析的装载为 TTF 默认字体；全部缺失 = 位图回退（见模块头
+/// ①）。路径用正斜杠：Windows API 接受，跨字符串书写免转义。
+const FONT_CANDIDATES: [&str; 3] = [
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+];
 
 /// 装配时开窗尺寸（客户区 (0,0) 的最小化帧沿用的"上次有效值"初值）。
 const OPEN_CLIENT: (u32, u32) = (768, 432);
@@ -245,6 +297,41 @@ const GRID_SNAP: f32 = 8.0;
 /// 上限 —— 线条数超出池容量就少画几根，不动态扩池，控件数与提取/渲染
 /// 成本恒定有界（90 根 ≈ 1080p 中等窗口两方向都够用）。
 const GRID_POOL: usize = 90;
+
+/// IME 光标 x 偏移（S12-11 第 2 期，**真字宽累加**）：草稿前 `caret`
+/// 个字符的逐字 advance 之和。算式与渲染器 `push_ttf_label` 的光标条
+/// 同源 —— TTF 模式按 (char, 字号) 查 hmtx 度量、缺字形走 `.notdef`
+/// 的 advance（缺字形推进与正文笔位轨迹严格一致，渲染器同款语义）；
+/// `'\n'` 归零换行（单行输入框实际不出现，防御性对齐渲染器口径）。
+/// TTF 未装载（位图回退）按默认字体等宽 advance 逐字累加 —— 也比第 1
+/// 期的 10px 平均步进准（位图 advance=16）。
+///
+/// 字号必须与输入框**渲染字号同源**（壳层给输入框写 font_size 14、提
+/// 取层读同一属性）—— 同字体同字号下累加值与光标条逐位一致，这才是
+/// "锚点精确化"的判据。
+fn ime_caret_offset(
+    font: Option<&TtfFont>,
+    draft: &str,
+    caret: usize,
+    size_px: f32,
+    bitmap_advance: f32,
+) -> f32 {
+    let mut x = 0.0f32;
+    for ch in draft.chars().take(caret) {
+        if ch == '\n' {
+            x = 0.0;
+            continue;
+        }
+        x += match font {
+            Some(f) => f
+                .glyph_index(ch)
+                .and_then(|gid| f.advance(gid, size_px).ok())
+                .unwrap_or_else(|| f.advance(TtfFont::NOTDEF, size_px).unwrap_or(0.0)),
+            None => bitmap_advance,
+        };
+    }
+    x
+}
 
 /// 按压点（**视图空间**）是否落在控件矩形内 —— 与 UiVm 命中同一口径
 ///（`anchor * viewport + offset` + `size`，不可见即不参与命中）。宿主
@@ -682,6 +769,9 @@ fn main() {
     let report = rt.bind_assets();
     assert_eq!(report.loaded.len(), 5);
     assert_eq!(rt.upload_pending_textures().expect("上传"), 5);
+    // 位图默认字体的等宽 advance（IME 锚点在位图回退模式下的累加步进
+    // —— 从 font_metrics 实读，不写死 16）。
+    let bitmap_advance: f32;
     {
         let font_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../nes-render-wgpu/examples/assets");
@@ -701,7 +791,7 @@ fn main() {
             .and_then(|c| c.split_once('x'))
             .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
             .expect("cell 格式");
-        rt.consumer_mut()
+        bitmap_advance = field("advance");        rt.consumer_mut()
             .expect("GPU 消费器")
             .set_default_font(
                 FontParams {
@@ -781,12 +871,14 @@ fn main() {
         // 数字标签池：Label 空文本 = 提取层判空不上屏（免 visible 接
         // 线）。Godot 竖标尺数字是旋转 90° 排版，等宽点阵字体先横排
         // —— 3 位数（48px 宽）会溢出 16px 条带压到视口最左缘，观感
-        // 等同刻度注记，取舍记此。
+        // 等同刻度注记，取舍记此。S12-11：字号 14（真字体下 3 位 ≈21px
+        // 且行高 ≈18.5px 更贴条带；密度复核见 RULER_TICK 注）。
         let mut ruler_labels = Vec::with_capacity(RULER_LABELS_H + RULER_LABELS_V);
         for _ in 0..RULER_LABELS_H + RULER_LABELS_V {
             let lab = tree.add_node(ruler, "ruler_label", NodeKind::Label);
             tree.set_local(lab, Transform2D::from_pos(-1000.0, -1000.0));
             let _ = tree.set_prop(lab, PROP_LABEL_TEXT, Value::Str(String::new()));
+            let _ = tree.set_prop(lab, "font_size", Value::I64(UI_FONT_SIZE));
             tree.set_prop_raw(lab, "z_index", Value::I64(-90));
             ruler_labels.push(lab);
         }
@@ -805,6 +897,7 @@ fn main() {
         let dock_title = tree.add_node(dock, "dock_title", NodeKind::Label);
         tree.set_local(dock_title, Transform2D::from_pos(MARGIN + 2.0, 320.0));
         let _ = tree.set_prop(dock_title, PROP_LABEL_TEXT, Value::Str("Output".into()));
+        let _ = tree.set_prop(dock_title, "font_size", Value::I64(UI_FONT_SIZE));
         tree.set_prop_raw(dock_title, "z_index", Value::I64(-80));
         let hud_dock = tree.add_node(dock, "hud_dock", NodeKind::ListView);
         let _ = tree.set_prop(hud_dock, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
@@ -833,6 +926,7 @@ fn main() {
         let fs_title = tree.add_node(fsdock, "fs_title", NodeKind::Label);
         tree.set_local(fs_title, Transform2D::from_pos(MARGIN + 2.0, 242.0));
         let _ = tree.set_prop(fs_title, PROP_LABEL_TEXT, Value::Str("res:/".into()));
+        let _ = tree.set_prop(fs_title, "font_size", Value::I64(UI_FONT_SIZE));
         tree.set_prop_raw(fs_title, "z_index", Value::I64(-60));
         let fs_sep = tree.add_node(fsdock, "fs_sep", NodeKind::Control);
         let _ = tree.set_prop(fs_sep, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
@@ -872,16 +966,22 @@ fn main() {
         let _ = tree.set_prop(tool_sel, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_sel, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_sel, "text", Value::Str("SEL".into()));
+        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
+        tree.set_prop_raw(tool_sel, "font_size", Value::I64(UI_FONT_SIZE));
         let tool_snap = tree.add_node(toolbar, "tool_snap", NodeKind::Button);
         let _ = tree.set_prop(tool_snap, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_snap, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_snap, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_snap, "text", Value::Str("SNAP".into()));
+        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
+        tree.set_prop_raw(tool_snap, "font_size", Value::I64(UI_FONT_SIZE));
         let tool_grid = tree.add_node(toolbar, "tool_grid", NodeKind::Button);
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 2.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_grid, "text", Value::Str("GRID".into()));
+        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
+        tree.set_prop_raw(tool_grid, "font_size", Value::I64(UI_FONT_SIZE));
         // S12-9：PLAY / STOP / RESET（Godot 视口工具栏右上角的运行三键
         // 直感，P0 摆在编辑三键右侧同一工具带）。文本投影每帧重写
         //（PLAY 运行中带 * 后缀），offset 装配期占位、每帧布局投影重写。
@@ -890,16 +990,22 @@ fn main() {
         let _ = tree.set_prop(tool_play, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 3.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_play, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_play, "text", Value::Str("PLAY".into()));
+        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
+        tree.set_prop_raw(tool_play, "font_size", Value::I64(UI_FONT_SIZE));
         let tool_stop = tree.add_node(toolbar, "tool_stop", NodeKind::Button);
         let _ = tree.set_prop(tool_stop, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_stop, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 4.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_stop, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_stop, "text", Value::Str("STOP".into()));
+        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
+        tree.set_prop_raw(tool_stop, "font_size", Value::I64(UI_FONT_SIZE));
         let tool_reset = tree.add_node(toolbar, "tool_reset", NodeKind::Button);
         let _ = tree.set_prop(tool_reset, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_reset, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 5.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
         let _ = tree.set_prop(tool_reset, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
         let _ = tree.set_prop(tool_reset, "text", Value::Str("RESET".into()));
+        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
+        tree.set_prop_raw(tool_reset, "font_size", Value::I64(UI_FONT_SIZE));
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
         tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
         let obj1 = tree.add_node(root, "obj1", NodeKind::Sprite2D);
@@ -937,6 +1043,7 @@ fn main() {
         let hud_ins = tree.add_node(root, "hud_ins", NodeKind::Label);
         tree.set_local(hud_ins, Transform2D::from_pos(578.0, 12.0));
         tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        let _ = tree.set_prop(hud_ins, "font_size", Value::I64(UI_FONT_SIZE));
         // 状态栏。
         // Selection indicator (Control border following primary selection).
         // S12-5 Godot 化：边框换 accent 槽（Godot 2D 选中的浅蓝高亮）；
@@ -957,10 +1064,12 @@ fn main() {
         let hud_scene = tree.add_node(root, "hud_scene", NodeKind::Label);
         tree.set_local(hud_scene, Transform2D::from_pos(MARGIN + 2.0, 12.0));
         tree.set_prop(hud_scene, PROP_LABEL_TEXT, Value::Str("Scene".into())).unwrap();
+        let _ = tree.set_prop(hud_scene, "font_size", Value::I64(UI_FONT_SIZE));
 
         let hud_st = tree.add_node(root, "hud_st", NodeKind::Label);
         tree.set_local(hud_st, Transform2D::from_pos(8.0, 410.0));
         tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
+        let _ = tree.set_prop(hud_st, "font_size", Value::I64(UI_FONT_SIZE));
         // Inspector 的节点重命名输入框（S12-2 TextInput —— 视口锚定，
         // 与 UiVm 命中/焦点路由同一口径）。选中节点时显示并绑定其名字。
         // S12-6 根修"改名框浮在网格上"：offset 不再是装配期写死的旧值
@@ -972,6 +1081,11 @@ fn main() {
         tree.set_prop(name_input, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W - 2.0 * INSPECTOR_INSET, 20.0))).unwrap();
         tree.set_prop(name_input, "text", Value::Str(String::new())).unwrap();
         tree.set_prop(name_input, "visible", Value::Bool(false)).unwrap();
+        // 字号 14 与面板文字同源（S12-11）：TextInput schema 无 font_size
+        // 键，走 set_prop_raw 前向通道（z_index/border_w 先例）；提取层
+        // TextInput 读该属性、缺省 16 逐位不变。IME 锚点累加同字号（见
+        // ime_caret_offset 注 —— 同字体同字号才是"精确"的判据）。
+        tree.set_prop_raw(name_input, "font_size", Value::I64(UI_FONT_SIZE));
         // Inspector 分区标题（S12-7 Godot 分组观感）：text_dim 色小节
         // 标题，"+" 折叠 / "-" 展开；点击标题行（宿主矩形命中）或 F7
         // 切换折叠。位置/文本每帧投影（跟随右面板与组布局）。
@@ -979,14 +1093,17 @@ fn main() {
         let ins_tf_title = tree.add_node(root, "ins_tf_title", NodeKind::Label);
         tree.set_local(ins_tf_title, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT, Value::Str("- Transform".into()));
+        let _ = tree.set_prop(ins_tf_title, "font_size", Value::I64(UI_FONT_SIZE));
         let _ = tree.set_prop(ins_tf_title, "color_slot", Value::Str("text_dim".into()));
         let ins_sc_title = tree.add_node(root, "ins_sc_title", NodeKind::Label);
         tree.set_local(ins_sc_title, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_sc_title, PROP_LABEL_TEXT, Value::Str("- Script".into()));
+        let _ = tree.set_prop(ins_sc_title, "font_size", Value::I64(UI_FONT_SIZE));
         let _ = tree.set_prop(ins_sc_title, "color_slot", Value::Str("text_dim".into()));
         let ins_script = tree.add_node(root, "ins_script", NodeKind::Label);
         tree.set_local(ins_script, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
+        let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
         (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
     };
@@ -1047,6 +1164,42 @@ fn main() {
     let editor_log: Rc<RefCell<VecDeque<String>>> =
         Rc::new(RefCell::new(VecDeque::with_capacity(EDITOR_LOG_KEEP)));
     log_line(&editor_log, "editor ready".into());
+    // 真字体默认字体装载（S12-11 壳层①，见模块头与 FONT_CANDIDATES 注）：
+    // 按优先级探测，第一个可读且可解析的经 `set_ttf_default` 装载 —— 此后
+    // font==NIL 文本（全部 Label/输入框/按钮）自动走真字体动态字形图集排
+    // 版。全部缺失/解析失败 = 位图回退，只记一行 Output、不 panic（优雅
+    // 回退契约；位图默认字体已在上方登记，回退路径永远可用）。每次尝试
+    // 都落一行（命中/失败/回退），冒烟断言按行取证。
+    let mut ime_font: Option<TtfFont> = None;
+    let mut ttf_active = false;
+    for path in FONT_CANDIDATES {
+        let Ok(data) = std::fs::read(path) else {
+            continue; // 读不到（不存在/无权限）：静默试下一个候选。
+        };
+        match rt.consumer_mut().expect("GPU 消费器").set_ttf_default(&data) {
+            Ok(()) => {
+                ttf_active = true;
+                // IME 锚点累加器持同一份字体数据的独立 TtfFont 实例（重复
+                // 解析一次可接受 —— 解析器纯 CPU 无共享状态；不共享是刻意
+                // 的：消费器在 rt 内部，取出实例要跨所有权，抄一份字节再
+                // parse 最省事，见模块头③）。
+                ime_font = TtfFont::parse(&data).ok();
+                log_line(&editor_log, format!("font: {} (ttf)", base_name(path)));
+                break;
+            }
+            Err(err) => {
+                // 解析失败（损坏/截断的字体文件）：如实记行，继续下一个
+                // 候选 —— 探测链的意义就是单点失败不致命。
+                log_line(
+                    &editor_log,
+                    format!("font: {} ttf parse failed ({err})", base_name(path)),
+                );
+            }
+        }
+    }
+    if !ttf_active {
+        log_line(&editor_log, "font: bitmap fallback (no system font)".into());
+    }
     // UiVm 提交钩子的落点（UiVm 零写权 —— 值经共享缓冲传回宿主，
     // 宿主帧后落 Inspector::modify_name 一条 Modified 事务）。
     let rename_sink: Rc<RefCell<Vec<(Uid, String)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1206,12 +1359,13 @@ fn main() {
                 192 => inject_input(InputEvent::Key { key: Key::U, down: false }),
                 // IME 第 1 期冒烟（真人在改名框打中文留人工 —— 自动化只
                 // 钉"Unicode 字符入草稿"链路）：点击改名输入框（768x432
-                // 客户区、obj1 选中、Transform 组展开：offset = (568,112)
-                // 尺寸 (178,20)，取 (600,120)）夺焦 → 注入 Char(0x4E2D)
-                //（'中'，走 inject_input 同队列通道 = WM_CHAR 直投口径，
-                // 不经系统 IME 合成 —— 与环境键盘布局无关，t_in_01 同款
-                // 确定性）→ 帧 214 取证草稿。
-                200 => inject_input(InputEvent::MouseMove { x: 600.0, y: 120.0 }),
+                // 客户区、obj1 选中、Transform 组展开：S12-11 起行步进
+                // INS_ROW_H=20，offset = (568,136) 尺寸 (178,20)，取
+                // (600,145)）夺焦 → 注入 Char(0x4E2D)（'中'，走
+                // inject_input 同队列通道 = WM_CHAR 直投口径，不经系统
+                // IME 合成 —— 与环境键盘布局无关，t_in_01 同款确定性）
+                // → 帧 214 取证草稿。
+                200 => inject_input(InputEvent::MouseMove { x: 600.0, y: 145.0 }),
                 202 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 204 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 210 => inject_input(InputEvent::Char(0x4E2D)),
@@ -1308,11 +1462,13 @@ fn main() {
         let mouse_left_held = snap.button_down("left");
         let mouse_shift = snap.is_down("LShift");
         // 分区标题行命中（S12-7 分组折叠）：上一帧投影记出的标题矩形。
-        // Label 无 anchor/size —— 矩形 = 标题行整条面板宽 x 16px 行高。
+        // Label 无 anchor/size —— 矩形 = 标题行整条面板宽 x 行高
+        //（S12-11 起 INS_ROW_H：真字体 14px 行高 ≈18.5px，16px 命中带
+        // 会漏下半行）。
         let title_click: Option<usize> = title_rows
             .iter()
             .find(|(rx, ry, _)| {
-                mx >= *rx && mx < *rx + INSPECTOR_W && my >= *ry && my < *ry + 16.0
+                mx >= *rx && mx < *rx + INSPECTOR_W && my >= *ry && my < *ry + INS_ROW_H
             })
             .map(|(_, _, gi)| *gi);
         if mouse_left_held && !prev_click && title_click.is_none() && tool_sel_on && !play.playing {
@@ -2083,10 +2239,11 @@ fn main() {
                 Some(p) => {
                     let tf_open = group_stage & 1 == 0;
                     let sc_open = group_stage & 2 == 0;
-                    // Transform 组标题（面板第 2 行）：前缀 "-" 展开 /
-                    // "+" 折叠，text_dim 色（装配期定槽，此处只翻文本）。
-                    title_rows.push((ins_x, 12.0 + 16.0, 0));
-                    tree.set_local(ins_tf_title, Transform2D::from_pos(ins_x, 12.0 + 16.0));
+                    // Transform 组标题（面板第 2 行，S12-11 起步进
+                    // INS_ROW_H）：前缀 "-" 展开 / "+" 折叠，text_dim 色
+                    //（装配期定槽，此处只翻文本）。
+                    title_rows.push((ins_x, 12.0 + INS_ROW_H, 0));
+                    tree.set_local(ins_tf_title, Transform2D::from_pos(ins_x, 12.0 + INS_ROW_H));
                     let _ = tree.set_prop(ins_tf_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT,
                         Value::Str(if tf_open { "- Transform" } else { "+ Transform" }.into()));
@@ -2113,10 +2270,13 @@ fn main() {
                     tree.set_local(hud_ins, Transform2D::from_pos(ins_x, 12.0));
 
                     // 改名输入框 = Transform 组成员：折叠即隐藏；展开时
-                    // 槽位紧跟组行（行高动态 —— 不再是装配期写死的常量，
-                    // S12-6 ①根修口径延续：每帧重写，窗口一变当帧跟上）。
-                    let input_y =
-                        12.0 + 2.0 * 16.0 + if tf_open { 4.0 * 16.0 } else { 0.0 } + 4.0;
+                    // 槽位紧跟组行（行高 INS_ROW_H —— 不再是装配期写死的
+                    // 常量，S12-6 ①根修口径延续：每帧重写，窗口一变当帧
+                    // 跟上；S12-11 步进 20 见常量注）。
+                    let input_y = 12.0
+                        + 2.0 * INS_ROW_H
+                        + if tf_open { 4.0 * INS_ROW_H } else { 0.0 }
+                        + 4.0;
                     let _ = tree.set_prop(name_input, "visible", Value::Bool(tf_open));
                     let _ = tree.set_prop(name_input, PROP_CONTROL_OFFSET,
                         Value::Vec2(nes_scene::Vec2::new(
@@ -2146,7 +2306,7 @@ fn main() {
                             .get(script_idx)
                             .map(|r| base_name(r).chars().take(INS_LINE_CHARS).collect())
                             .unwrap_or_else(|| "-".into());
-                        tree.set_local(ins_script, Transform2D::from_pos(ins_x, sc_y + 16.0));
+                        tree.set_local(ins_script, Transform2D::from_pos(ins_x, sc_y + INS_ROW_H));
                         let _ = tree.set_prop(ins_script, "visible", Value::Bool(true));
                         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT,
                             Value::Str(format!(
@@ -2249,12 +2409,17 @@ fn main() {
             rt.ui_vm_mut().reset_text(name_input, &name);
         }
 
-        // IME 组合窗定位（第 1 期）：改名输入框**持焦且可见**的帧，把
-        // 候选窗钉到近似光标位（客户区坐标）。近似公式（P0）：输入框
-        // 视口位 + 4px 内衬 + 光标字符数 × 10px 平均步进 —— 本壳默认
-        // 开窗 768x432 客户区==视口 1:1，公式按 1:1 直算；窗口缩放后
-        // 有偏差（准确步进与缩放折算归渲染集成期）。失焦/不可见帧
-        // **不调** —— IME 窗停在系统默认位（定位是持焦期间的宿主责任）。
+        // IME 组合窗定位（第 2 期：**真字宽累加**，第 1 期的 10px 平均
+        // 步进退役）：改名输入框持焦且可见的帧，把候选窗钉到光标真位
+        // （客户区坐标）。x = 输入框视口位 + 4px 内衬 + 草稿前 caret 个
+        // 字符的逐字 advance 累加（[`ime_caret_offset`]，与渲染器
+        // push_ttf_label 光标条算式同源：TTF 模式 (char,字号) 度量、缺
+        // 字形 .notdef 推进；位图回退按默认字体等宽 advance）。字号与
+        // 输入框渲染同源（font_size 14 —— 输入框文本经提取层走同一条
+        // TTF 路径，同字体同字号 = 累加值与光标条逐位一致）。本壳默认
+        // 开窗 768x432 客户区==视口 1:1 直算；窗口缩放后的折算沿第 1 期
+        // 口径记为已知限制。失焦/不可见帧**不调** —— IME 窗停在系统默
+        // 认位（定位是持焦期间的宿主责任）。
         if rt.ui_vm_mut().focus() == Some(name_input) {
             let (visible, ox, oy) = {
                 let tree = rt.tree_mut();
@@ -2269,12 +2434,23 @@ fn main() {
                 (visible, ox, oy)
             };
             if visible {
-                let caret = rt
+                // 编辑会话读口（S12-2 公开面）：草稿 + 光标一次取回
+                //（无会话 = 未聚焦过，此处 focus 已保证有会话，防御性
+                // 取空草稿 = 锚点回输入框原点）。
+                let (draft, caret) = rt
                     .ui_vm_mut()
                     .text_state(name_input)
-                    .map(|t| t.caret)
-                    .unwrap_or(0);
-                let x = (ox + IME_CARET_INSET + caret as f32 * IME_AVG_ADVANCE) as i32;
+                    .map(|t| (t.draft, t.caret))
+                    .unwrap_or_else(|| (String::new(), 0));
+                let x = (ox
+                    + IME_CARET_INSET
+                    + ime_caret_offset(
+                        ime_font.as_ref(),
+                        &draft,
+                        caret,
+                        UI_FONT_SIZE as f32,
+                        bitmap_advance,
+                    )) as i32;
                 let y = (oy + IME_CARET_INSET) as i32;
                 rt.imm_set_caret_point(x, y);
             }
@@ -2484,8 +2660,24 @@ fn main() {
         assert_eq!(demo_play_text, "PLAY*", "运行中 PLAY 文本应为 PLAY*");
         // IME 第 1 期：Char(0x4E2D) 端到端 —— inject_input（WM_CHAR 口径）
         // → 快照 → SnapshotView → UiVm Unicode 泵 → 草稿 "obj1中"（光标
-        // 5，不属断言面但同源）。
+        // 5，不属断言面但同源）。S12-11 复跑：真字体模式下同一链路照旧
+        //（TTF 只换排版，不改数据面 —— 改名流程既有断言不动应仍绿）。
         assert_eq!(demo_ime_draft, "obj1中", "IME Char(0x4E2D) 未入改名框草稿：{demo_ime_draft:?}");
+        // S12-11：真字体装载取证 —— 探测链必落一行（命中或回退）；真字
+        // 体模式下无回退行、无解析失败行（"Output 无字体错误行"契约）；
+        // 位图回退模式必有回退行（优雅降级可观察）。
+        assert!(has("font: "), "font probe log missing: {lines:?}");
+        assert_eq!(
+            ttf_active,
+            !has("font: bitmap fallback"),
+            "ttf state vs fallback log mismatch: {lines:?}"
+        );
+        if ttf_active {
+            assert!(
+                !lines.iter().any(|l| l.contains("ttf parse failed")),
+                "font parse error leaked: {lines:?}"
+            );
+        }
         {
             let tree = rt.tree_mut();
             let spin = tree.find_by_name("spin").expect("spin 节点存活（uid/NodeId 不动）");
