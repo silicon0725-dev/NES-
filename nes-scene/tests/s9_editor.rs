@@ -280,3 +280,73 @@ fn t_timer_01_per_entity_countdown() {
     assert_eq!(t.timer(a), Some(0), "停在 0（不循环）");
 }
 
+
+/// T-INS-03（F-4）：**脚本挂载事务** —— 挂载 = 同一事务内两笔记录
+///（Created：Script 子节点；Modified：registry_key 属性），
+/// undo 一步整次回滚（子树消失、属性回空缺省），redo 完整恢复
+///（uid 身份不变）；卸载 = registry_key 写空串（同一 Modified 通道，
+/// undo 可回）。editor_shell 的挂载/卸载 UI 走的正是这条通路。
+#[test]
+fn t_ins_03_script_mount_roundtrip() {
+    let (mut t, a, uid_a) = tree_with_a();
+    let mut log = TransactionLog::new();
+
+    // 挂载：建 Script 子节点 + 写 registry_key，一笔事务（begin/commit
+    // 直接落在 log 上 —— Hierarchy 与 Inspector 先后借树，不共存）。
+    log.begin().unwrap();
+    let child_uid = {
+        let mut h = Hierarchy::new(&mut t, &mut log);
+        h.create_child(&uid_a, "blink", NodeKind::Script).unwrap()
+    };
+    {
+        let mut ins = Inspector::new(&mut t, &mut log);
+        ins.modify_prop(
+            &child_uid,
+            "registry_key",
+            Value::Str("Scripts/blink.nes".into()),
+        )
+        .unwrap();
+    }
+    log.commit().unwrap();
+    // 属性就位（Script 节点才有 registry_key 键 —— schema 校验通过即落表）。
+    let child = t.find_by_uid(&child_uid).unwrap();
+    assert_eq!(
+        t.prop(child, "registry_key"),
+        Some(&Value::Str("Scripts/blink.nes".into()))
+    );
+    assert_eq!(t.children(a).len(), 1, "Script 子节点已建");
+    assert!(!log.can_redo(), "挂载后无 redo");
+
+    // undo 一步：Created + Modified 一起回 —— 子树消失、挂载清零。
+    assert!(log.undo(&mut t).unwrap());
+    assert_eq!(t.children(a).len(), 0, "undo 撤销整次挂载");
+    assert!(t.find_by_uid(&child_uid).is_none());
+
+    // redo：子树与属性完整恢复（uid 身份连续）。
+    assert!(log.redo(&mut t).unwrap());
+    let child2 = t.find_by_uid(&child_uid).expect("redo 复活挂载节点");
+    assert_eq!(
+        t.prop(child2, "registry_key"),
+        Some(&Value::Str("Scripts/blink.nes".into()))
+    );
+
+    // 卸载：registry_key 写空串（缺省值 = 未挂载），undo 可回。
+    {
+        let mut ins = Inspector::new(&mut t, &mut log);
+        ins.begin().unwrap();
+        ins.modify_prop(&child_uid, "registry_key", Value::Str(String::new()))
+            .unwrap();
+        ins.commit().unwrap();
+    }
+    assert_eq!(
+        t.prop(child2, "registry_key"),
+        Some(&Value::Str(String::new())),
+        "卸载 = 回空串"
+    );
+    assert!(log.undo(&mut t).unwrap());
+    assert_eq!(
+        t.prop(child2, "registry_key"),
+        Some(&Value::Str("Scripts/blink.nes".into())),
+        "undo 恢复挂载"
+    );
+}
