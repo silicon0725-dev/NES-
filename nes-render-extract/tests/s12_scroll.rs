@@ -9,10 +9,11 @@
 //! |---|---|
 //! | T-SCL-01 | ListView 摊平三件套 SetList + SetRect + SetClip（同句柄，输出序冻结 SetList → SetRect → SetClip）；载荷 = rows/row_h/axis/selected/scroll（UiStates 当帧值）+ 双主题槽 |
 //! | T-SCL-02 | 滚动烘焙：ScrollView 后代的 ControlState 四边 offset 烘焙量 = −scroll（scrolls 预置值经 attach_ui 注入）；ScrollView 自身不烘自己的滚动 |
-//! | T-SCL-03 | scroll_bar 算式：extent = 自身高 + scroll_max，frac = 自身高/extent，pos = scroll/(extent−身高)；除零防 extent<=身高 = (1, 0)；色 = border 槽 |
+//! | T-SCL-03 | scroll_bar 算式：extent = 自身高 + scroll_max，frac = 自身高/extent，pos = scroll/(extent−身高)；色 = border 槽 |
 //! | T-SCL-04 | 嵌套 ScrollView：后代 clip = 自身矩形 ∩ 两层滚动矩形交集（结构性判定，与当前偏移值无关）；交空 = 零矩形仍推（全裁）；内层 ScrollView 自身 clip = 内 ∩ 外 |
 //! | T-SCL-05 | 基线不变：无滚动祖先的 Button 恒推 SetClip（= 自身矩形，D6 —— 像素路径与任务 1 基线一致：scissor 覆盖全控件矩形时不可见）；裸 Control / 纯 Label 不推 SetClip |
 //! | T-SCL-06 | Tabs 摊平：axis=Horizontal、tabs/tab_w/active 属性名、忽略自身 scroll、clip = 自身矩形 |
+//! | T-SCL-08 | 装得下不发滚动条（S12-4）：extent <= 自身高（含恰好装下的边界）→ scroll_bar 为 None；溢出哪怕 1px → Some（滑块才可画） |
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -179,15 +180,57 @@ fn t_scl_03_scroll_bar_frac_pos_formula() {
         "滑块色 = border 槽解析色"
     );
 
-    // 除零防：内容装得下（无后代溢出）→ extent == 身高 → frac=1, pos=0。
+    // 装得下（无后代溢出，scroll_max == 0）→ 不发滚动条（S12-4：满长
+    // 滑块没有行程可言，画出来纯属视觉噪声 —— 与滚轮路由的 scroll_max=0
+    // 预期不滚同一条设计判据）。
     let mut t2 = SceneTree::new("root");
     let sv2 = t2.add_node(t2.root(), "scroll", NodeKind::ScrollView);
     t2.set_prop(sv2, "size", Value::Vec2(SVec2::new(200.0, 100.0))).unwrap();
     t2.apply_pending();
     let (srv2, ex2, _out2) = extract(&mut t2, None);
     let sh2 = ex2.handle_of(sv2).unwrap();
-    let bar2 = srv2.rect_of(sh2).unwrap().scroll_bar.expect("仍发滚动条状态");
-    assert!(approx(bar2.frac, 1.0) && approx(bar2.pos, 0.0), "装得下 = 满长滑块、归零位");
+    assert!(
+        srv2.rect_of(sh2).unwrap().scroll_bar.is_none(),
+        "装得下 = scroll_bar 为 None（不画滑块）"
+    );
+}
+
+/// T-SCL-08（S12-4）：装得下不发滚动条的边界 —— 溢出哪怕 1px 才 Some，
+/// 恰好装下（后代底缘 == 自身底缘）为 None；与 T-SCL-03 的算式分支同一
+/// 判据（extent > 自身高）。
+#[test]
+fn t_scl_08_scroll_bar_only_when_overflowing() {
+    let build = |child_h: f32| -> (SceneTree, nes_scene::NodeId) {
+        let mut t = SceneTree::new("root");
+        let sv = t.add_node(t.root(), "scroll", NodeKind::ScrollView);
+        t.set_prop(sv, "size", Value::Vec2(SVec2::new(200.0, 100.0))).unwrap();
+        let btn = t.add_node(sv, "btn", NodeKind::Button);
+        t.set_prop(btn, "offset", Value::Vec2(SVec2::new(0.0, 0.0))).unwrap();
+        t.set_prop(btn, "size", Value::Vec2(SVec2::new(100.0, child_h))).unwrap();
+        t.apply_pending();
+        (t, sv)
+    };
+
+    // 恰好装下：后代底缘 100 == 自身底缘 100 → scroll_max = 0 → None。
+    let (mut fits, sv) = build(100.0);
+    let (srv, ex, _out) = extract(&mut fits, None);
+    let h = ex.handle_of(sv).expect("ScrollView 渲染物");
+    assert!(
+        srv.rect_of(h).unwrap().scroll_bar.is_none(),
+        "恰好装下（边界）= scroll_bar 为 None"
+    );
+
+    // 溢出 1px：后代底缘 101 → scroll_max = 1 → Some（滑块才有意义）。
+    let (mut over, sv2) = build(101.0);
+    let (srv2, ex2, _out2) = extract(&mut over, None);
+    let h2 = ex2.handle_of(sv2).expect("ScrollView 渲染物");
+    let bar = srv2
+        .rect_of(h2)
+        .unwrap()
+        .scroll_bar
+        .expect("溢出 1px 也发滚动条状态");
+    assert!(approx(bar.frac, 100.0 / 101.0), "frac = 100/101：{}", bar.frac);
+    assert!(approx(bar.pos, 0.0), "未滚动 = pos 0");
 }
 
 /// T-SCL-04：嵌套 ScrollView —— 后代 clip = 自身 ∩ 内层 ∩ 外层；交空 = 零矩形。

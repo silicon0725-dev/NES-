@@ -6,12 +6,14 @@
 //! | T-Surf-02 | 命令流经 `consume_to_surface` 呈现：计数与离屏路径同账、`frame_index` 透传、零 driver errors |
 //! | T-Surf-03 | 同一表面连续多帧 acquire/present 复用：每帧独立、计数不串帧 |
 //! | T-Surf-04 | 析构序：表面先于消费器与窗口释放，进程干净存活（drop 即断言） |
+//! | T-Surf-05 | 表面重配（S12-4）：`SetWindowPos` 改客户区后 `reconfigure(client_size)` 表面尺寸追上并照常呈现；同参重复重配幂等；0 尺寸如实拒绝 |
 //!
 //! 注意：这些用例会**短暂弹出真实窗口**（每条约 1 秒）——窗口是表面契约的
 //! 物理组成部分，无法离屏替身。GPU 用例沿用跳过纪律：无库跳过，有库失败即失败。
 //! surface 像素不读回（呈现目标是交换链），断言止于 FrameStats 与无错误，
 //! 画面正确性由示例 + 程序化截屏像素校验承担（S6 文档 §验证）。
 
+use std::ptr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use nes_render_api::{Affine2, Camera2DState, FrameInfo, RenderAssetKey, RenderServer, Vec2};
@@ -155,4 +157,58 @@ fn t_surf_04_clean_teardown_order() {
     drop(consumer);
     drop(window);
     // 走到这里没有崩溃/挂起：析构序契约由测试进程干净存活到收尾证明。
+}
+
+/// T-Surf-05（S12-4）：表面重配 —— 窗口客户区变化后
+/// [`SurfaceTarget::reconfigure`] 把交换链追到新尺寸并照常呈现。
+/// 程序化改窗用 `SetWindowPos`（与 T-In 系列的手写 user32 FFI 同纪律；
+/// 最小钳制只约束用户拖拽，SetWindowPos 不受扰）。
+#[test]
+fn t_surf_05_reconfigure_tracks_client_resize() {
+    let (_guard, canvas) = open_surface("t-surf-05");
+    let Some((mut consumer, mut surface, window)) = canvas else {
+        return;
+    };
+    consumer
+        .register_texture(RenderAssetKey::from_parts(16, 1), 16, 16, &[90, 160, 220, 255].repeat(16 * 16))
+        .expect("注册纹理");
+    assert_eq!(surface.size(), (W, H), "开窗时按客户区配置");
+
+    // 拉大整窗（outer 480x320；客户区随之变大 —— 与 256x128 不同即够）。
+    assert!(unsafe { SetWindowPos(window.hwnd(), ptr::null_mut(), 0, 0, 480, 320, SWP_FLAGS) } != 0);
+    let (cw, ch) = window.client_size();
+    assert!((cw, ch) != (W, H), "客户区已变：{cw}x{ch}");
+
+    // 重配到新客户区：表面尺寸追上，且新交换链上照常呈现一帧。
+    surface.reconfigure(cw, ch).expect("重配成功");
+    assert_eq!(surface.size(), (cw, ch), "表面尺寸 = 新客户区");
+    let stats = present_sprite(&mut consumer, &surface, 11);
+    assert_eq!(stats.drawn, 1, "重配后的交换链可正常呈现");
+    assert_eq!(stats.frame_index, 11);
+    assert_eq!(stats.driver_errors, 0, "重配不引入驱动错误");
+
+    // 同参重复重配幂等（wgpuSurfaceConfigure 可重复调用，替换式语义）。
+    surface.reconfigure(cw, ch).expect("同参重配成功");
+    assert_eq!(surface.size(), (cw, ch));
+
+    // 0 尺寸（最小化帧的客户区）如实拒绝且表面尺寸不变。
+    assert!(surface.reconfigure(0, ch).is_err(), "宽 0 拒绝");
+    assert!(surface.reconfigure(cw, 0).is_err(), "高 0 拒绝");
+    assert_eq!(surface.size(), (cw, ch), "拒绝后尺寸保持");
+}
+
+/// `SetWindowPos`（T-Surf-05 的程序化改窗；SWP_NOMOVE | SWP_NOZORDER）。
+const SWP_FLAGS: u32 = 0x0002 | 0x0004;
+
+#[link(name = "user32")]
+extern "system" {
+    fn SetWindowPos(
+        hwnd: *mut core::ffi::c_void,
+        after: *mut core::ffi::c_void,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
 }

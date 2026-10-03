@@ -15,7 +15,11 @@
 //!   点击 TextInput 夺焦、Tab 在可焦点控件（Button/TextInput）间按
 //!   场景序轮转、点击空白 = 失焦 + 提交。输入框的**草稿与光标是
 //!   UiVm 瞬态**（[`TextState`]），回车提交 / Esc 回滚 / 失焦提交；
-//!   提交不直写属性表，只发 [`UiVm::on_commit`] 钩子。
+//!   提交不直写属性表，只发 [`UiVm::on_commit`] 钩子。草稿生命周期的
+//!   两个端点（S12-4）：**获焦沿**（无论点击或 Tab，单点
+//!   [`UiVm::focus_node`])一律 `draft = text 属性值, caret = len`；
+//!   **文档侧换绑**（宿主检测到选中变化 / undo-redo 落账）走
+//!   [`UiVm::reset_text`]（置草稿、不动焦点、不触发提交）。
 //! - **滚动与行点击（S12-3）**：ScrollView/ListView/Tabs 的垂直滚动
 //!   偏移是 UiVm 瞬态（[`UiStates::scrolls`]，与悬停/按下同款生灭
 //!   纪律）；滚轮（[`InputView::wheel`]，一次性）路由给前序序最后
@@ -269,6 +273,26 @@ impl UiVm {
     /// 当前焦点节点（无焦点 = `None`）。
     pub fn focus(&self) -> Option<NodeId> {
         self.focus
+    }
+
+    /// 宿主换绑专用（S12-4）：把节点的编辑草稿整体替换为 `value`，
+    /// 光标移到末尾。**不动焦点槽、不触发 [`UiVm::on_commit`]** ——
+    /// 与获焦初始化（[`Self::focus_node`]）是同一份赋值，但方向相反：
+    /// 获焦是"草稿 := 文档"，这里是文档侧变化（换选中 / undo/redo 落账）
+    /// 之后宿主主动把草稿拉回文档真相 —— 持焦中的旧草稿即刻作废，
+    /// 输入框显示跟手刷新（提取层有会话即显示草稿）。
+    ///
+    /// 无条件 upsert（含未聚焦节点）：reset 后草稿与宿主刚写入的
+    /// `text` 属性同值，即便之后失焦提交也是同值回写 —— 落账面的
+    /// unchanged 检查自然跳过，零副作用。
+    pub fn reset_text(&mut self, node: NodeId, value: &str) {
+        self.states.borrow_mut().texts.insert(
+            node,
+            TextState {
+                draft: value.to_string(),
+                caret: value.chars().count(),
+            },
+        );
     }
 
     /// 每帧更新：命中测算 + 悬停/按下状态机 + 激活回调 + 焦点/文本输入。

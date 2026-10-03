@@ -228,6 +228,11 @@ impl NesRuntime {
 
     /// 窗口模式推进一帧（宿主行为经 [`SceneObserver`] 挂入），阶段序同
     /// [`Self::frame_with`]，仅消费端换成窗口表面。
+    ///
+    /// 帧首（泵后、模拟前）自动做一次 [`Self::sync_surface_to_window`]：
+    /// 客户区变化（拖拽/最大化）当帧把表面重配到新尺寸 —— 交换链像素
+    /// 与客户区 1:1，不再经合成器把旧尺寸的画面拉伸铺满窗口（S12-4
+    /// "最大化横向拉长"的根修）。视图/相机的重绑属宿主（壳层）职责。
     pub fn frame_windowed_with(
         &mut self,
         frame: &FrameInfo,
@@ -244,6 +249,7 @@ impl NesRuntime {
         if self.surface.is_none() {
             return Err(BackendError::ConfigMismatch("窗口模式缺少表面".to_string()));
         }
+        self.sync_surface_to_window()?;
         let _steps = self.simulate(frame.delta, obs);
         // S12.1：UI 状态机在 simulate 后、提取前更新（看到当帧终值；
         // 提取层随即读状态表做四态着色）。鼠标按 视图/客户区 折算
@@ -640,6 +646,47 @@ impl NesRuntime {
             return (1.0, 1.0);
         }
         (viewport.0 / cw as f32, viewport.1 / ch as f32)
+    }
+
+    /// 把窗口呈现表面同步到当前客户区尺寸（S12-4）。
+    ///
+    /// 窗口模式：实测 [`Window::client_size`]，与表面当前配置不同则
+    /// [`SurfaceTarget::reconfigure`] 并返回 `Ok(true)`（同步过）；相同
+    /// （含客户区为 0 的最小化帧 —— 0 尺寸不可配置，保持旧配置）返回
+    /// `Ok(false)`。无窗口（离屏/headless 装配）恒 `Ok(false)`。
+    ///
+    /// [`Self::frame_windowed_with`] 每帧帧首已自动调用；本方法公开给
+    /// 需要在帧外显式对账的宿主（返回值即"本帧表面是否换了尺寸"，
+    /// 可用作重绑相机视口/布局的信号）。离屏路径（[`Self::frame_with`]
+    /// 的像素读回）不经表面，不受影响。
+    pub fn sync_surface_to_window(&mut self) -> Result<bool, BackendError> {
+        let Some(window) = &self.window else {
+            return Ok(false);
+        };
+        let (cw, ch) = window.client_size();
+        let Some(surface) = &mut self.surface else {
+            return Ok(false);
+        };
+        if cw == 0 || ch == 0 || (cw, ch) == surface.size() {
+            return Ok(false);
+        }
+        surface.reconfigure(cw, ch)?;
+        Ok(true)
+    }
+
+    /// 窗口客户区尺寸（像素；宿主布局/相机重绑的基准）。
+    ///
+    /// 窗口模式 = 当前客户区实测值（随拖拽/最大化实时变化）；离屏/headless
+    /// 装配没有窗口 —— 返回**装配时配置的离屏目标尺寸**（[`Self::open`]
+    /// 的 width/height；headless 装配为 (0,0)）。
+    pub fn window_client_size(&self) -> (u32, u32) {
+        if let Some(w) = &self.window {
+            return w.client_size();
+        }
+        self.consumer
+            .as_ref()
+            .map(|c| c.target().size())
+            .unwrap_or((0, 0))
     }
 
     /// 轮询文件变化（内容戳判定）。变化后调用 [`Self::upload_pending_textures`] 重传。

@@ -12,6 +12,8 @@
 //! | T-UI-07 | 草稿语义：Enter 提交整体值（经回调、不直写属性）、Esc 回滚、失焦提交、空/非法处理 |
 //! | T-UI-08 | 文本瞬态（草稿/光标）不入语义指纹 |
 //! | T-UI-09 | 鼠标点击 TextInput 获焦回归：FakeInput 点击输入框矩形 -> focus()+focused 态 -> focused/草稿/光标经 states_rc 共享面换档进提取层（下游 T-WID-06 消费） |
+//! | T-UI-10 | 获焦初始化（S12-4）：点击与 Tab 两路径草稿一律 = text 属性值、光标 = 末尾（focus_node 单点实现；宿主换绑后的新值也跟） |
+//! | T-UI-11 | reset_text（S12-4）：置草稿=值、光标=尾、不动焦点、不触发 on_commit；持焦会话中原地替换，后续编辑落在新草稿上 |
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -481,4 +483,114 @@ fn t_ui_09_click_focus_feeds_extraction_shared_states() {
         !shared.borrow().widgets.get(&in1).is_some_and(|s| s.focused),
         "失焦清共享面 focused 旗标"
     );
+}
+
+/// T-UI-10：获焦初始化（S12-4 ②——草稿生命周期的一个端点）——
+/// **无论点击还是 Tab**，获焦沿一律 `draft = text 属性值、caret = 末尾`
+///（focus_node 单点实现）。宿主换绑（text 属性被投影成新选中节点名）
+/// 后的获焦也跟新值 —— 草稿永远从当前文档真相出发。
+#[test]
+fn t_ui_10_focus_initializes_draft_from_text_prop() {
+    let (mut t, _btn, in1, _in2) = widgets_scene();
+    t.set_prop(in1, "text", Value::Str("hello".into())).unwrap();
+    let input = FakeInput::default();
+    let mut vm = UiVm::new();
+    vm.set_input_view(Rc::new(input.clone()));
+
+    // 路径 A：点击获焦 —— 草稿 = text 属性值，光标 = 末尾。
+    input.set((240.0, 130.0), true);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set((240.0, 130.0), false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    assert_eq!(vm.focus(), Some(in1), "前置：点击夺焦");
+    assert_eq!(
+        vm.text_state(in1),
+        Some(TextState { draft: "hello".into(), caret: 5 }),
+        "点击获焦：草稿从 text 属性初始化"
+    );
+
+    // 点空白失焦（失焦提交零钩子 —— 未注册 on_commit）。
+    input.set((400.0, 40.0), true);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set((400.0, 40.0), false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    assert_eq!(vm.focus(), None, "前置：点空白失焦");
+
+    // 宿主换绑投影：text 属性换成新值（编辑器换选中 / undo 落账口径）。
+    t.set_prop(in1, "text", Value::Str("world".into())).unwrap();
+
+    // 路径 B：Tab 获焦（可焦点序 btn -> in1，按两次）—— 草稿跟**换绑
+    // 后的新值**，不是旧会话残值。
+    for _ in 0..2 {
+        input.set_key("tab", true);
+        vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+        input.set_key("tab", false);
+        vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    }
+    assert_eq!(vm.focus(), Some(in1), "Tab 轮转到 in1");
+    assert_eq!(
+        vm.text_state(in1),
+        Some(TextState { draft: "world".into(), caret: 5 }),
+        "Tab 获焦：草稿从当前 text 属性初始化"
+    );
+}
+
+/// T-UI-11：reset_text（S12-4 宿主换绑专用）—— 置草稿 = 值、光标 = 末
+/// 尾、**不动焦点槽、不触发 on_commit**。未聚焦节点也可 reset（宿主在
+/// 文档侧变化后统一调用）；持焦会话中原地替换，后续编辑落在新草稿上。
+#[test]
+fn t_ui_11_reset_text_rebinds_draft_without_commit() {
+    let (t, _btn, in1, _in2) = widgets_scene();
+    let input = FakeInput::default();
+    let mut vm = UiVm::new();
+    vm.set_input_view(Rc::new(input.clone()));
+    let commits: Rc<RefCell<Vec<(NodeId, Value)>>> = Rc::new(RefCell::new(Vec::new()));
+    let csink = commits.clone();
+    vm.on_commit(move |n, v| csink.borrow_mut().push((n, v)));
+
+    // 未聚焦 reset：置草稿/光标；焦点不动（None）、零提交。
+    vm.reset_text(in1, "renamed");
+    assert_eq!(vm.focus(), None, "不动焦点（本就无焦点）");
+    assert_eq!(
+        vm.text_state(in1),
+        Some(TextState { draft: "renamed".into(), caret: 7 }),
+        "置草稿 = 值、光标 = 末尾"
+    );
+    assert!(commits.borrow().is_empty(), "reset_text 不触发 on_commit");
+
+    // 点击获焦并打字：会话草稿 "x"。
+    input.set((240.0, 130.0), true);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set((240.0, 130.0), false);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.set_text(vec!['x' as u32]);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.clear_text();
+    assert_eq!(
+        vm.text_state(in1),
+        Some(TextState { draft: "x".into(), caret: 1 }),
+        "前置：持焦编辑中草稿 = x"
+    );
+
+    // 持焦 reset（宿主换绑 / undo 落账口径）：草稿整体替换为文档真相，
+    // 焦点保留、零提交 —— Tab 循环选中 / 撤销后输入框跟手的机制点。
+    vm.reset_text(in1, "doc-truth");
+    assert_eq!(vm.focus(), Some(in1), "不动焦点（持焦保持）");
+    assert_eq!(
+        vm.text_state(in1),
+        Some(TextState { draft: "doc-truth".into(), caret: 9 }),
+        "持焦中：草稿原地替换、光标到尾"
+    );
+    assert!(commits.borrow().is_empty(), "换绑不是提交：零 on_commit");
+
+    // reset 后继续编辑：落在新草稿上（会话延续，不是重建）。
+    input.set_text(vec!['!' as u32]);
+    vm.update(&t, (512.0, 288.0), (1.0, 1.0));
+    input.clear_text();
+    assert_eq!(
+        vm.text_state(in1),
+        Some(TextState { draft: "doc-truth!".into(), caret: 10 }),
+        "后续编辑落在新草稿上"
+    );
+    assert!(commits.borrow().is_empty(), "全程零提交");
 }

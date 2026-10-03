@@ -379,27 +379,23 @@ impl RenderExtractor {
                         layout.offset_bottom -= scroll_sum;
                     }
                     // ② 滚动条视觉状态（仅 ScrollView 自身；ListView/Tabs
-                    //    的行进滚动不配条 —— 任务冻结口径）。
+                    //    的行进滚动不配条 —— 任务冻结口径）。**装得下不发**
+                    //（S12-4）：extent <= 自身高（scroll_max == 0，含除零
+                    //    防分支）时保持 None —— 满长滑块没有行程可言，纯属
+                    //    视觉噪声；渲染层只认 Some（None = 不画）。
                     if tree.kind_tag(node) == Some(NodeKindTag::ScrollView) {
                         let own_h = layout.resolve(frame.viewport).h;
                         let scroll_max = scroll_max_of(tree, ui_states, node, viewport);
                         let extent = own_h + scroll_max;
-                        let scroll = ui_states.scrolls.get(&node).copied().unwrap_or(0.0);
-                        let (frac, pos) = if extent <= own_h {
-                            // 除零防：内容装得下 = 满长滑块、归零位。
-                            (1.0_f32, 0.0_f32)
-                        } else {
-                            (
-                                (own_h / extent).clamp(0.0, 1.0),
-                                (scroll / (extent - own_h)).clamp(0.0, 1.0),
-                            )
-                        };
-                        // 滑块色用边框槽解析色（与容器同色系，不另开色源）。
-                        layout.scroll_bar = Some(ScrollBar {
-                            frac,
-                            pos,
-                            color: layout.border,
-                        });
+                        if extent > own_h {
+                            // 滑块色用边框槽解析色（与容器同色系，不另开色源）。
+                            let scroll = ui_states.scrolls.get(&node).copied().unwrap_or(0.0);
+                            layout.scroll_bar = Some(ScrollBar {
+                                frac: (own_h / extent).clamp(0.0, 1.0),
+                                pos: (scroll / (extent - own_h)).clamp(0.0, 1.0),
+                                color: layout.border,
+                            });
+                        }
                     }
                     // ③ 自动裁剪（D6）：
                     //   - 有滚动祖先（结构性判定，与当前偏移值无关）：

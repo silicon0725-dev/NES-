@@ -1753,9 +1753,11 @@ impl Drop for TextureRegistry {
 
 // ------------------------------------------------------------ 表面目标（S6.1）
 
-/// 释放表面句柄所需的函数指针（理由同 `TargetOps`：让 `Drop` 独立成立）。
+/// 表面所需的函数指针（理由同 `TargetOps`：让 `Drop` 与 [`SurfaceTarget::
+/// reconfigure`] 独立成立 —— 重配不要求调用方再递 `GpuContext`）。
 #[derive(Clone, Copy)]
 struct SurfaceOps {
+    surface_configure: unsafe extern "system" fn(*mut c_void, *const ffi::SurfaceConfiguration),
     surface_unconfigure: unsafe extern "system" fn(*mut c_void),
     surface_release: unsafe extern "system" fn(*mut c_void),
 }
@@ -1796,6 +1798,8 @@ pub fn surface_status_name(status: i32) -> &'static str {
 /// 无需第二份）；caps 里没有则指名报错。
 pub struct SurfaceTarget {
     surface: *mut c_void,
+    /// 配置用的设备句柄（`new` 时自 ctx 记下；重配沿同一设备）。
+    device: *mut c_void,
     width: u32,
     height: u32,
     format: i32,
@@ -1884,10 +1888,12 @@ impl SurfaceTarget {
 
         Ok(Self {
             surface,
+            device: ctx.device(),
             width,
             height,
             format,
             ops: SurfaceOps {
+                surface_configure: api.surface_configure,
                 surface_unconfigure: api.surface_unconfigure,
                 surface_release: api.surface_release,
             },
@@ -1897,6 +1903,42 @@ impl SurfaceTarget {
     /// 配置尺寸（客户区像素）。
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// 重配表面尺寸（S12-4：窗口客户区变化后的根修 —— 开窗时只配置一次
+    /// 的旧口径会把小交换链经合成器拉伸铺满大窗口）。
+    ///
+    /// 其余配置字段（设备/格式/用法/alpha/呈现模式 = Fifo）与 [`Self::new`]
+    /// 逐项同源不变。FFI 口径：`wgpuSurfaceConfigure` 可**重复调用**
+    ///（webgpu.h 语义：再次配置即整体替换旧配置，`Unconfigure` 只用于
+    /// 销毁前解除）—— 同一 surface 句柄原地换尺寸，无需重建。
+    ///
+    /// 尺寸为 0（窗口最小化时 `GetClientRect` 归零）拒绝重配：wgpu 校验
+    /// 不接受 0 尺寸表面，如实报错；调用方（运行时同步）应跳过该帧。
+    pub fn reconfigure(&mut self, width: u32, height: u32) -> Result<(), BackendError> {
+        if width == 0 || height == 0 {
+            return Err(BackendError::ConfigMismatch(format!(
+                "表面重配尺寸为 0（请求 {width}x{height}；窗口最小化？）"
+            )));
+        }
+        let config = ffi::SurfaceConfiguration {
+            next_in_chain: ptr::null_mut(),
+            device: self.device,
+            format: self.format,
+            usage: ffi::WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+            width,
+            height,
+            view_format_count: 0,
+            view_formats: ptr::null(),
+            alpha_mode: ffi::WGPU_COMPOSITE_ALPHA_MODE_AUTO,
+            present_mode: ffi::WGPU_PRESENT_MODE_FIFO,
+        };
+        // SAFETY: config 在本次调用期间存活；device 与 surface 均存活
+        //（device 生命周期覆盖整个 GpuContext，surface 由本对象持有）。
+        unsafe { (self.ops.surface_configure)(self.surface, &config) };
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
 
     /// 表面格式（恒为 `RGBA8Unorm`，见 [`Self::new`] 口径）。

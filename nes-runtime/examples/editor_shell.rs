@@ -6,10 +6,11 @@
 //! 是 Selection 的投影。一切修改经 Inspector/Hierarchy 适配器 →
 //! TransactionLog。ui 零自有状态（除面板滚动等会话态）。
 //!
-//! 布局（768x432）：
-//! - 左侧 180px：Hierarchy 面板（树投影）
-//! - 右侧 160px：Inspector 面板（选中节点属性）
-//! - 中间：Viewport（场景 + 选中高亮 z_index=5）
+//! 布局（S12-4 自适应口径）：**宿主每帧投影** —— 视口 = 窗口真实
+//! 客户区（最大化/拖拽当帧跟上），面板**恒定宽**不随窗口拉伸：
+//! - 左侧 180px：Hierarchy 面板（树投影，ListView 自带 panel 填充）
+//! - 右侧 190px：Inspector 面板（panel 槽铺底 + 标题/信息/改名输入框）
+//! - 中间：Viewport（世界吃剩余区域，相机置中 = (cw/2, ch/2)）
 //! - 底部：状态栏（undo/redo 可用性、操作提示）
 //!
 //! 操作：Tab 循环选择；方向键移动选中；Delete 删除子树；
@@ -20,7 +21,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::Instant;
 
 use nes_render_api::{FrameInfo, Vec2};
 use nes_render_extract::{PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE};
@@ -34,8 +35,19 @@ fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
 }
 
-/// 视口尺寸（与帧 `FrameInfo::viewport` 同源 —— 控件锚定该视口解析）。
-const VIEWPORT: (f32, f32) = (768.0, 432.0);
+/// 布局常量（S12-4 冻结）：面板**恒定宽** —— 最大化只扩中间世界
+/// 视口，侧面板不跟着拉伸（消除"整个画面被拉长"观感的关键）。
+/// - 左层级面板：x = 8..188（宽 180），y = 40..ch-24；
+/// - 右检查器面板：x = cw-198..cw-8（宽 190），y = 8..ch-24；
+/// - 状态栏文本：y = ch-20（底部 16 文本 + 8 边距）。
+const MARGIN: f32 = 8.0;
+const LEFT_PANEL_W: f32 = 180.0;
+const INSPECTOR_W: f32 = 190.0;
+const TOP_BAND: f32 = 40.0;
+const STATUS_BAND: f32 = 24.0;
+
+/// 装配时开窗尺寸（客户区 (0,0) 的最小化帧沿用的"上次有效值"初值）。
+const OPEN_CLIENT: (u32, u32) = (768, 432);
 
 /// 按压点（**视图空间**）是否落在控件矩形内 —— 与 UiVm 命中同一口径
 ///（`anchor * viewport + offset` + `size`，不可见即不参与命中）。宿主
@@ -45,6 +57,7 @@ const VIEWPORT: (f32, f32) = (768.0, 432.0);
 fn press_in_control(
     tree: &nes_scene::SceneTree,
     node: nes_scene::NodeId,
+    viewport: (f32, f32),
     view_pos: (f32, f32),
 ) -> bool {
     let visible = tree
@@ -62,8 +75,8 @@ fn press_in_control(
     let offset = vec2(PROP_CONTROL_OFFSET);
     let size = vec2(PROP_CONTROL_SIZE);
     let (x, y) = (
-        anchor.x * VIEWPORT.0 + offset.x,
-        anchor.y * VIEWPORT.1 + offset.y,
+        anchor.x * viewport.0 + offset.x,
+        anchor.y * viewport.1 + offset.y,
     );
     view_pos.0 >= x && view_pos.0 < x + size.x && view_pos.1 >= y && view_pos.1 < y + size.y
 }
@@ -137,7 +150,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box, name_input) = {
+    let (cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
@@ -154,16 +167,28 @@ fn main() {
         // Hierarchy 面板（S12-3 ListView 真消费者）：视口锚定控件，
         // 行文本 `rows` 与选中下标 `selected` 由宿主每帧投影（树是
         // 投影不是语义来源），行点击与滚轮滚动由 UiVm 驱动（宿主零
-        // 滚动接线 —— scrolls 是 UiVm 瞬态）。
+        // 滚动接线 —— scrolls 是 UiVm 瞬态）。size 每帧按客户区重写
+        //（S12-4 自适应：高度 = ch-64，宽恒 180）。
         let hud_tree = tree.add_node(root, "hud_tree", NodeKind::ListView);
         tree.set_prop(hud_tree, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
-        tree.set_prop(hud_tree, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(8.0, 40.0))).unwrap();
-        tree.set_prop(hud_tree, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(164.0, 360.0))).unwrap();
+        tree.set_prop(hud_tree, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, TOP_BAND))).unwrap();
+        tree.set_prop(hud_tree, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, 360.0))).unwrap();
         tree.set_prop(hud_tree, "rows", Value::Str(String::new())).unwrap();
         tree.set_prop(hud_tree, "row_h", Value::I64(18)).unwrap();
-        // Inspector 面板背景。
+        // Inspector 面板底（S12-4 工作区分离）：panel 槽铺底的裸
+        // Control —— 与左面板（ListView 自带 panel 填充）同槽位区分
+        // 中间视口。offset/size 每帧按客户区重写；裸 Control 不参与
+        // 自动裁剪（S12-3 D6），铺底矩形不裁任何东西。
+        let hud_ins_bg = tree.add_node(root, "hud_ins_bg", NodeKind::Control);
+        tree.set_prop(hud_ins_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
+        tree.set_prop(hud_ins_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(570.0, 8.0))).unwrap();
+        tree.set_prop(hud_ins_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, 400.0))).unwrap();
+        tree.set_prop(hud_ins_bg, "fill_slot", Value::Str("panel".into())).unwrap();
+        // Inspector 标题 + 选中信息（短文本：标题一行 + 信息另起，
+        // "(none)" = 无选中）。位置每帧投影（x = cw-190, y = 12，跟随
+        // 右面板）—— 修 S12-4 ⑤"标题被表面边缘裁剪"。
         let hud_ins = tree.add_node(root, "hud_ins", NodeKind::Label);
-        tree.set_local(hud_ins, Transform2D::from_pos(612.0, 40.0));
+        tree.set_local(hud_ins, Transform2D::from_pos(578.0, 12.0));
         tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
         // 状态栏。
         // Selection indicator (Control border following primary selection).
@@ -177,14 +202,15 @@ fn main() {
         tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(String::new())).unwrap();
         // Inspector 的节点重命名输入框（S12-2 TextInput —— 视口锚定，
         // 与 UiVm 命中/焦点路由同一口径）。选中节点时显示并绑定其名字。
+        // offset.x 每帧跟随右面板（x = cw-192，面板内 6px 内衬）。
         let name_input = tree.add_node(root, "name_input", NodeKind::TextInput);
         tree.set_prop(name_input, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
-        tree.set_prop(name_input, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(616.0, 76.0))).unwrap();
-        tree.set_prop(name_input, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(148.0, 20.0))).unwrap();
+        tree.set_prop(name_input, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(576.0, 76.0))).unwrap();
+        tree.set_prop(name_input, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W - 12.0, 20.0))).unwrap();
         tree.set_prop(name_input, "text", Value::Str(String::new())).unwrap();
         tree.set_prop(name_input, "visible", Value::Bool(false)).unwrap();
         tree.apply_pending();
-        (cam, obj1, obj2, obj3, hud_tree, hud_ins, hud_st, sel_box, name_input)
+        (cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -251,7 +277,34 @@ fn main() {
     let mut transient = 0u64;
     const TRANSIENT_LIMIT: u64 = 120;
 
+    // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
+    // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
+    // 布局与命中保持上一帧口径，窗口恢复后下一帧自动跟上。帧首
+    // sync_surface_to_window（frame_windowed_with 内）与本读数同源：
+    // 当帧表面尺寸 == 当帧视口 == 当帧布局基准。
+    let mut last_client = OPEN_CLIENT;
+    // 帧节拍（S12-4 ⑥）：实测帧差进 FrameInfo（旧代码固定
+    // sleep(16ms) + FIFO present 双重等待 —— 延迟不跟手的根因之一）。
+    // clamp ≤0.1s：切后台回来的一步大步长不进模拟。NES_GAME_FRAMES
+    // 冒烟语义不变（帧数口径，非墙钟口径）。
+    let mut last_frame = Instant::now();
+    let mut elapsed = 0.0f64;
+
     for index in 0..total {
+        let (raw_w, raw_h) = rt.window_client_size();
+        let (cw_u, ch_u) = if raw_w == 0 || raw_h == 0 {
+            last_client
+        } else {
+            (raw_w, raw_h)
+        };
+        last_client = (cw_u, ch_u);
+        let viewport = (cw_u as f32, ch_u as f32);
+
+        let now = Instant::now();
+        let delta = (now - last_frame).as_secs_f32().min(0.1);
+        last_frame = now;
+        elapsed += delta as f64;
+
         let snap = rt.collect_input();
 
         // ---- 编辑器命令（消费输入快照 —— 与游戏脚本同一读面）----
@@ -290,21 +343,24 @@ fn main() {
         // 注意读**鼠标按钮表**（button_down）而非 is_down —— 键探针的
         // 名字空间里没有 "left"，is_down("left") 恒 false（曾让护住
         // 输入框的盾与整段点击路径变死代码，S12-2 记注）。
+        // 鼠标坐标统一折算到**视图空间**（客户区→视图；viewport ==
+        // 客户区时 1:1，resize 当帧 ≤1 帧的 skew 也被同一折算吸收）。
+        // 视图空间 == 世界空间（相机每帧置中 (cw/2, ch/2)，恒等映射）
+        // —— 精灵命中、Gizmo 拖拽、框选矩形全用同一坐标（S12-4 ①：
+        // 旧口径对精灵/Gizmo 用生客户区像素，缩放窗口后命中错位）。
+        let (msx, msy) = rt.mouse_view_scale(viewport);
+        let (mx, my) = (snap.mouse.x * msx, snap.mouse.y * msy);
         let mouse_left_held = snap.button_down("left");
         let mouse_shift = snap.is_down("LShift");
         if mouse_left_held && !prev_click {
             // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。
-            let (mx, my) = (snap.mouse.x, snap.mouse.y);
             // 压在检查器输入框 / 层级树列表上 = 面板的 UI 交互：护住
             // 选中（不清空、不框选），点击让给 UiVm 的夺焦/行点击路径。
-            // 鼠标按 视图/客户区 折算到视图空间 —— 与 UiVm 命中同口径，
-            // 窗口缩放后仍准。
             let (over_name_input, over_hud_list) = {
-                let (sx, sy) = rt.mouse_view_scale(VIEWPORT);
-                let view = (mx * sx, my * sy);
+                let tree = rt.tree_mut();
                 (
-                    press_in_control(rt.tree_mut(), name_input, view),
-                    press_in_control(rt.tree_mut(), hud_tree, view),
+                    press_in_control(tree, name_input, viewport, (mx, my)),
+                    press_in_control(tree, hud_tree, viewport, (mx, my)),
                 )
             };
             let hit_uid: Option<Uid> = {
@@ -363,7 +419,7 @@ fn main() {
                 let tree = rt.tree_mut();
                 if let Some(id) = tree.find_by_uid(uid) {
                     let cur = tree.local(id).unwrap_or_default();
-                    tree.set_local(id, Transform2D::from_pos(snap.mouse.x - ox, snap.mouse.y - oy));
+                    tree.set_local(id, Transform2D::from_pos(mx - ox, my - oy));
                     let _ = cur;
                 }
             } else {
@@ -389,7 +445,7 @@ fn main() {
         if let Some((sx, sy)) = drag_start {
             if !mouse_left_held {
                 // 松开：框选完成。
-                let (ex, ey) = (snap.mouse.x, snap.mouse.y);
+                let (ex, ey) = (mx, my);
                 let (rx0, ry0) = (sx.min(ex), sy.min(ey));
                 let (rx1, ry1) = (sx.max(ex), sy.max(ey));
                 let in_rect: Vec<Uid> = {
@@ -454,26 +510,58 @@ fn main() {
                 }
             }
         }
-        // Ctrl+Z / Ctrl+Y：undo / redo（直接消费事务历史）。
-        if z_now && !prev_z {
-            let _ = log.undo(rt.tree_mut());
+        // Ctrl+Z / Ctrl+Y：undo / redo（直接消费事务历史）。落账后
+        // 文档真相可能已变（改名被回滚/重放）—— 输入框投影与草稿
+        // 跟随（S12-4 ④）：reset_text 置草稿 = 当前名、不触发
+        // on_commit（回滚值不会再记账），持焦中的旧草稿即刻作废。
+        let mut doc_changed = false;
+        if z_now && !prev_z && log.undo(rt.tree_mut()).unwrap_or(false) {
+            doc_changed = true;
         }
-        if y_now && !prev_y {
-            let _ = log.redo(rt.tree_mut());
+        if y_now && !prev_y && log.redo(rt.tree_mut()).unwrap_or(false) {
+            doc_changed = true;
         }
         prev_z = z_now;
         prev_y = y_now;
         prev_del = del_now;
         prev_tab = tab_now;
+        if doc_changed {
+            if let Some(uid) = bound_sel.clone() {
+                let name = {
+                    let tree = rt.tree_mut();
+                    tree.find_by_uid(&uid)
+                        .and_then(|id| tree.name(id).map(str::to_string))
+                };
+                if let Some(name) = name {
+                    let _ = rt
+                        .tree_mut()
+                        .set_prop(name_input, "text", Value::Str(name.clone()));
+                    rt.ui_vm_mut().reset_text(name_input, &name);
+                }
+            }
+        }
 
         // ---- UI 投影（每帧从状态模型重算，零自有状态）----
-        // 输入框是否在编辑会话中（持焦点）：会话期间不换绑定 ——
-        // 换选中触发的失焦提交要落到**开会话时**绑定的节点头上
-        //（提交回调读 rename_bound，此刻换绑会把旧草稿安到新选中
-        // 节点头上），失焦落账后下一帧再重绑新选中。
-        let editing = rt.ui_vm_mut().focus() == Some(name_input);
+        // 宿主每帧布局投影（S12-4 ①，与 sel_box 同款投影纪律）：面板
+        // 恒定宽、状态栏贴底、相机置中 —— 世界坐标 == 视图坐标恒等
+        // 映射，HUD/sel_box/命中全部免换算。换绑草稿在 tree 借用外做
+        //（ui_vm_mut 与 tree_mut 不共存），见块后的 rebind_name。
+        let mut rebind_name: Option<String> = None;
         {
             let tree = rt.tree_mut();
+            // 相机置中 = (cw/2, ch/2)：最大化/拖拽后世界视口吃中间
+            // 剩余区域（面板不随窗口拉伸）。
+            tree.set_local(cam, Transform2D::from_pos(viewport.0 / 2.0, viewport.1 / 2.0));
+            // 左层级面板：宽恒 180，高度 = ch-64（上 40 下 24 边距）。
+            let _ = tree.set_prop(hud_tree, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, viewport.1 - TOP_BAND - STATUS_BAND)));
+            // 右检查器面板底：x = cw-198（宽 190 + 右缘 8），y = 8..ch-24。
+            let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(viewport.0 - INSPECTOR_W - 2.0 * MARGIN, MARGIN)));
+            let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, viewport.1 - MARGIN - STATUS_BAND)));
+            // 状态栏贴底：y = ch-20。
+            tree.set_local(hud_st, Transform2D::from_pos(MARGIN, viewport.1 - 20.0));
             // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
             // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
             // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与
@@ -522,21 +610,22 @@ fn main() {
                 .unwrap_or(-1);
             let _ = tree.set_prop(hud_tree, "selected", Value::I64(sel_row));
 
-            // Inspector View：选中节点数据投影。
+            // Inspector View：选中节点数据投影（S12-4 ⑤：短文本 ——
+            // 标题一行 + 选中信息另起，"(none)" = 无选中；不再整段
+            // 倾倒 props —— 长行溢出表面右缘正是标题被裁的旧观感）。
             let mut ins_text = String::from("INSPECTOR\n");
             match sel.primary(tree) {
                 Some(p) => {
-                    let name = tree.name(p).unwrap_or("?");
+                    let name: String = tree.name(p).unwrap_or("?").chars().take(12).collect();
                     let local = tree.local(p).unwrap_or_default();
-                    let uid_hex = tree.uid_of(p).map(|u| u.to_hex()).unwrap_or_default();
-                    ins_text.push_str(&format!("name: {}\npos: ({:.0}, {:.0})\nuid: {}...\n", name, local.pos.x, local.pos.y, &uid_hex[..8]));
-                    for (k, v) in tree.props(p).unwrap().iter().take(4) {
-                        ins_text.push_str(&format!("{}: {:?}\n", k, v));
-                    }
+                    ins_text.push_str(&format!("name: {}\npos: ({:.0}, {:.0})", name, local.pos.x, local.pos.y));
                 }
-                None => ins_text.push_str("(no selection)"),
+                None => ins_text.push_str("(none)"),
             }
             let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
+            // 标题/信息 Label 每帧投影到右面板顶（x = cw-190, y = 12，
+            // 随面板走 —— 修"标题被表面边缘裁剪"）。
+            tree.set_local(hud_ins, Transform2D::from_pos(viewport.0 - INSPECTOR_W, 12.0));
 
             // 状态栏。
             let st = format!(
@@ -560,17 +649,28 @@ fn main() {
                 }
             }
 
-            // 重命名输入框投影：有选中 → 可见且 text 绑定选中节点名
-            //（换选中才重绑 —— 编辑会话中（editing）不换绑：会话的
-            // 失焦提交归旧绑定，失焦后下一帧再绑新选中）。
+            // 重命名输入框投影：有选中 → 可见且 text 绑定选中节点名。
+            // 换绑**不再等失焦**（S12-4 ②③ —— 旧口径"编辑会话中不换
+            // 绑"让 Tab 循环选中后输入框永远停在旧节点名上）：选中一变
+            // 即重绑，草稿经 reset_text 拉到新名（持焦中同样刷新）。
+            // 顺序即防污染：
+            // 1) 排干滞留提交（正常帧此处必空 —— 提交只在帧内 UiVm
+            //    产生、帧后即落账；防御性清空，防未来时序改动把旧绑定
+            //    残值安到新选中头上）；
+            // 2) rename_bound 先行换新 —— 同帧稍后 UiVm 的失焦/回车
+            //    提交带着新草稿（= 新名）落到新绑定头上，值相等被落账
+            //    面 unchanged 检查自然跳过；
+            // 3) text 属性 + 草稿双写（reset_text 在 tree 借用外做）。
             let primary_uid = sel.primary(tree).and_then(|p| tree.uid_of(p));
             let _ = tree.set_prop(name_input, "visible", Value::Bool(primary_uid.is_some()));
-            if primary_uid != bound_sel && !editing {
+            if primary_uid != bound_sel {
+                rename_sink.borrow_mut().clear();
                 bound_sel = primary_uid.clone();
                 *rename_bound.borrow_mut() = primary_uid.clone();
                 if let Some(p) = sel.primary(tree) {
                     let name = tree.name(p).unwrap_or("").to_string();
-                    let _ = tree.set_prop(name_input, "text", Value::Str(name));
+                    let _ = tree.set_prop(name_input, "text", Value::Str(name.clone()));
+                    rebind_name = Some(name);
                 }
             }
 
@@ -584,8 +684,15 @@ fn main() {
             }
         }
 
+        // 换绑草稿（tree 借用外 —— ui_vm_mut 与 tree_mut 不共存）：
+        // 持焦中的旧草稿即刻作废，输入框显示跟手刷新（提取层有会话
+        // 即显示草稿）。不触发 on_commit —— 换绑不是提交。
+        if let Some(name) = rebind_name {
+            rt.ui_vm_mut().reset_text(name_input, &name);
+        }
+
         let _ = rt.emit_input_signals(&snap);
-        let frame = FrameInfo::new(index, 1.0 / 60.0, index as f64 / 60.0, Vec2::new(VIEWPORT.0, VIEWPORT.1));
+        let frame = FrameInfo::new(index, delta, elapsed, Vec2::new(viewport.0, viewport.1));
         match rt.frame_windowed_with(&frame, &mut vm) {
             Ok(Some(stats)) => {
                 if stats.driver_errors > 0 {
@@ -630,8 +737,9 @@ fn main() {
             sel.select(uid);
         }
 
-        std::thread::sleep(Duration::from_millis(16));
+        // 帧节拍：无固定 sleep —— present 的 FIFO 队列自节流（vsync），
+        // 帧差以 Instant 实测进 FrameInfo（见循环头的 delta/elapsed）。
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (cam, hud_tree, hud_ins, hud_st, sel_box, name_input);
+    let _ = (cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input);
 }
