@@ -1729,7 +1729,9 @@ fn main() {
             })
             .map(|(_, _, gi)| *gi);
         if mouse_left_held && !prev_click && title_click.is_none() && tool_sel_on && !play.playing {
-            // hit 在脚本中做；宿主侧直接查树（与 hit 同逻辑的 Rust 版）。
+            // hit 在脚本中做；宿主侧直接查树（与 hit 同一几何：盒原点
+            // 经 SceneTree::sprite_hit_origin 单点助手 —— S16.5 收敛，
+            // pivot 平移后的锚点角，脚本/宿主不再各持一份）。
             // 压在编辑器 UI（改名输入框 / 层级树 / Output dock / 标尺
             // 条带）上 = 面板交互：护住选中（不清空、不框选）。输入框
             // 与层级树的点击让给 UiVm 的夺焦/行点击路径；标尺与 dock
@@ -1761,8 +1763,10 @@ fn main() {
                 cands.sort_by_key(|(z, _)| std::cmp::Reverse(*z));
                 let mut found: Option<Uid> = None;
                 for (_, n) in cands {
-                    let w = tree.world(n).unwrap_or_default();
-                    if mx >= w.tx && mx < w.tx + 16.0 && my >= w.ty && my < w.ty + 16.0 {
+                    // 盒原点走 nes-scene 单点助手（S16.5）：pivot 联动 +
+                    // 与脚本 hit(..) 同一几何；16px 边长为既有命中口径。
+                    let o = tree.sprite_hit_origin(n);
+                    if mx >= o.x && mx < o.x + 16.0 && my >= o.y && my < o.y + 16.0 {
                         found = tree.uid_of(n);
                         break;
                     }
@@ -1888,8 +1892,12 @@ fn main() {
                         .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
                         .filter(|&n| !matches!(tree.prop(n, "visible"), Some(Value::Bool(false))))
                         .filter(|&n| {
-                            let w = tree.world(n).unwrap_or_default();
-                            let (cx, cy) = (w.tx + 8.0, w.ty + 8.0); // 中心
+                            // 框选探针 = 命中盒中心：与点击命中同一盒几何
+                            //（S16.5 收敛 —— sprite_hit_origin + 半格 8px；
+                            // pivot 平移后点击选得中、框选也得罩得住同一
+                            // 只精灵）。无 pivot 时 == (tx+8, ty+8) 旧口径。
+                            let o = tree.sprite_hit_origin(n);
+                            let (cx, cy) = (o.x + 8.0, o.y + 8.0); // 中心
                             cx >= rx0 && cx <= rx1 && cy >= ry0 && cy <= ry1
                         })
                         .filter_map(|n| tree.uid_of(n))

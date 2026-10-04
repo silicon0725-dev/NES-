@@ -1790,6 +1790,36 @@ impl SceneTree {
         })
     }
 
+    /// Sprite2D 的 16x16 命中盒原点（S16.5 命中测算 pivot 联动；几何单点）。
+    ///
+    /// `origin = world.apply((-pivot.x * 16, -pivot.y * 16))` —— 与渲染侧
+    /// `world ∘ translate(-pivot * 16px)`（S16.3 精灵锚点，局部内层平移）
+    /// 取**同一锚点角**，命中盒跟随渲染走。世界仿射含父链/旋转/缩放；
+    /// 旋转/缩放下继续按轴对齐盒判定是**既有契约的近似**（固定轴对齐
+    /// 16 盒本就忽略旋转，S10 命中口径），此处不变 —— 只把锚点角从裸
+    /// `(tx, ty)` 换成映射后的真实角点。
+    ///
+    /// pivot 属性缺失/类型错/含非有限分量一律按缺省 `(0,0)`（与 schema
+    /// 缺省、提取层 `sprite_pivot` 同口径）；此时 `apply((0,0)) ==
+    /// (world.tx, world.ty)`，无 pivot 精灵与旧口径逐位相同（基线哈希
+    /// 不动的前提）。
+    ///
+    /// 脚本 `hit(..)`（`Op::Hit`）与编辑器宿主点击选择（editor_shell）
+    /// 都经本入口取盒原点 —— 全库唯一一份命中几何。
+    pub fn sprite_hit_origin(&self, id: NodeId) -> Vec2 {
+        /// 精灵基准格边长（渲染侧 16px 基准格；命中盒同源同值）。
+        const SPRITE_BASE_PX: f32 = 16.0;
+        let pivot = self
+            .prop(id, "pivot")
+            .and_then(|v| match v {
+                Value::Vec2(p) if p.x.is_finite() && p.y.is_finite() => Some(*p),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let w = self.world(id).unwrap_or_default();
+        w.apply(Vec2::new(-pivot.x * SPRITE_BASE_PX, -pivot.y * SPRITE_BASE_PX))
+    }
+
     /// 是否已挂树。
     pub fn is_in_tree(&self, id: NodeId) -> bool {
         self.nodes.get(id).map(|n| n.is_in_tree()).unwrap_or(false)

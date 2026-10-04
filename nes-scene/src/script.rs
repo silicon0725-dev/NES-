@@ -954,9 +954,13 @@ fn run<'a, 'b>(
                 cands.sort_by_key(|(z, _)| std::cmp::Reverse(*z));
                 let mut hit_node: Option<NodeId> = None;
                 for (_, n) in cands {
-                    let w = ctx.tree().world(n).unwrap_or_default();
-                    let (wx, wy) = (w.tx, w.ty);
-                    if x >= wx && x < wx + 16.0 && y >= wy && y < wy + 16.0 {
+                    // 命中盒原点 = 世界矩阵映射 pivot 平移后的锚点角（S16.5
+                    // 几何单点 [`SceneTree::sprite_hit_origin`]）：与渲染侧
+                    // `world ∘ translate(-pivot * 16px)` 同一角点，命中跟随
+                    // 渲染。pivot (0,0)（缺省）时该点 == (tx, ty)，旧口径
+                    // 逐位不变；旋转下轴对齐盒是既有契约的近似（口径不变）。
+                    let o = ctx.tree().sprite_hit_origin(n);
+                    if x >= o.x && x < o.x + 16.0 && y >= o.y && y < o.y + 16.0 {
                         hit_node = Some(n);
                         break;
                     }
