@@ -16,7 +16,7 @@ use crate::handle::{ItemHandle, RenderAssetKey};
 use crate::item::RenderItem;
 use crate::math::{Affine2, Rect};
 use crate::server::RenderServer;
-use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
+use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState, NineSliceState};
 
 /// 服务端行为计数器（把静默行为显式化）。
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -60,8 +60,9 @@ pub struct NullRenderServer {
     /// 九宫格簿记（S16.6）：`set_nine_slice` 存（同键覆写，NIL 键 = 恒等
     /// 记录照存照发 —— 照 pivot 零向量先例）、销毁移除。有九宫格条目的
     /// （含恒等记录）在 `submit_into` 输出序里于 `SetPivot` 之后追加
-    /// `SetNineSlice`。载荷 = `(源纹理键, [l, t, r, b])`。
-    nines: BTreeMap<ItemHandle, (RenderAssetKey, [f32; 4])>,
+    /// `SetNineSlice`。载荷 = [`NineSliceState`]（纹理键 + 边距四元组 +
+    /// S16.7 模态染色 / 平铺两开关）。
+    nines: BTreeMap<ItemHandle, NineSliceState>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
     counters: ServerCounters,
@@ -130,7 +131,7 @@ impl NullRenderServer {
 
     /// 取渲染物的九宫格配置（S16.6；未设置返回 `None` —— 无记录 =
     /// fill/border 照旧）。
-    pub fn nine_slice_of(&self, handle: ItemHandle) -> Option<&(RenderAssetKey, [f32; 4])> {
+    pub fn nine_slice_of(&self, handle: ItemHandle) -> Option<&NineSliceState> {
         self.nines.get(&handle)
     }
 
@@ -295,6 +296,8 @@ impl RenderServer for NullRenderServer {
         t: f32,
         r: f32,
         b: f32,
+        modulate: bool,
+        tiling: bool,
     ) {
         if !self.items.contains_key(&handle) {
             // 空句柄 / 未知句柄：静默忽略（契约 I1），计数器使其可观测。
@@ -305,7 +308,15 @@ impl RenderServer for NullRenderServer {
         // 记录 = fill/border 照旧，随每帧快照重发，消费端据此清除跨帧
         // 簿记（照 pivot `[0,0]` 零向量先例：清除必须可在命令流里承载，
         // 否则跨帧簿记的后端永远收不到"清掉"这件事）。
-        self.nines.insert(handle, (texture, [l, t, r, b]));
+        self.nines.insert(
+            handle,
+            NineSliceState {
+                texture,
+                margins: [l, t, r, b],
+                modulate,
+                tiling,
+            },
+        );
     }
 
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
@@ -397,14 +408,16 @@ impl RenderServer for NullRenderServer {
             // 九宫格（S16.6）：恒在 SetPivot 之后（契约 I5 顺序冻结；与
             // wgpu 后端严格同序）。仅当该条目存在九宫格簿记时追加 ——
             // 无记录 = fill/border 照旧，命令流与既有路径逐条相同。
-            if let Some((texture, margins)) = self.nines.get(&item.handle) {
+            if let Some(state) = self.nines.get(&item.handle) {
                 out.push(RenderCommand::SetNineSlice {
                     handle: item.handle,
-                    texture: *texture,
-                    l: margins[0],
-                    t: margins[1],
-                    r: margins[2],
-                    b: margins[3],
+                    texture: state.texture,
+                    l: state.margins[0],
+                    t: state.margins[1],
+                    r: state.margins[2],
+                    b: state.margins[3],
+                    modulate: state.modulate,
+                    tiling: state.tiling,
                 });
             }
         }

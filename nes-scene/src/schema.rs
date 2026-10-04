@@ -440,6 +440,28 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 H::None,
                 "九宫格源纹理下边距（S16.6；语义同 ns_l）。",
             ),
+            PropDesc::new(
+                "ns_modulate",
+                ValueType::Bool,
+                Value::Bool(false),
+                H::None,
+                "九宫格模态染色（S16.7）。true = 九个实例的 tint 改取 \
+                 fill_slot 的解析色 —— 纹理配灰阶/白图，同一纹理即可多套\
+                 面板配色（经典 StyleBoxTexture modulate 手法）。需与 \
+                 fill_slot 成对配置：fill_slot 缺省空名 = 解析色透明 = \
+                 面板整体不可见。false = 中性白 tint（纹理原色，既有行为\
+                 逐位不变）。",
+            ),
+            PropDesc::new(
+                "ns_tiling",
+                ValueType::Bool,
+                Value::Bool(false),
+                H::None,
+                "九宫格中间条平铺（S16.7）。true = 四边条与中心按源边距\
+                 像素的原生尺寸平铺而非拉伸（非整数缩放防糊；角永远 1:1 \
+                 不变）。平铺片总数上限 256，超限截断（大面板 x 小平铺\
+                 单元触发）。false = 拉伸（既有行为逐位不变）。",
+            ),
         ],
         NodeKindTag::Button => vec![
             PropDesc::new(

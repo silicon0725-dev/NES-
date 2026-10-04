@@ -65,7 +65,9 @@ use nes_render_api::handle::{ItemHandle, RenderAssetKey};
 use nes_render_api::item::RenderItem;
 use nes_render_api::math::{Affine2, Rect};
 use nes_render_api::server::RenderServer;
-use nes_render_api::state::{Camera2DState, ControlState, Flip, LabelState, ListAxis, ListState};
+use nes_render_api::state::{
+    Camera2DState, ControlState, Flip, LabelState, ListAxis, ListState, NineSliceState,
+};
 
 use crate::error::BackendError;
 use crate::ffi;
@@ -243,9 +245,9 @@ pub struct WgpuRenderServer {
     /// 九宫格簿记（S16.6，与 `NullRenderServer` 同构）：同键覆写（NIL 键
     /// = 恒等记录照存照发）、销毁移除；`submit_into` 在对应条目的
     /// `SetPivot` 之后追加 `SetNineSlice`。无记录 = fill/border 照旧
-    ///（既有行为逐位不变）。载荷 = `(源纹理键, [l, t, r, b])`（源纹理
-    /// 像素边距）。
-    nines: BTreeMap<ItemHandle, (RenderAssetKey, [f32; 4])>,
+    ///（既有行为逐位不变）。载荷 = [`NineSliceState`]（纹理键 + 边距
+    /// 四元组 + S16.7 模态染色 / 平铺两开关）。
+    nines: BTreeMap<ItemHandle, NineSliceState>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
 }
@@ -411,6 +413,8 @@ impl RenderServer for WgpuRenderServer {
         t: f32,
         r: f32,
         b: f32,
+        modulate: bool,
+        tiling: bool,
     ) {
         if !self.items.contains_key(&handle) {
             // 空句柄 / 未知句柄：静默忽略（契约 I1 口径）。
@@ -420,7 +424,15 @@ impl RenderServer for WgpuRenderServer {
         // 记录 = fill/border 照旧，随每帧快照重发）—— 与 `NullRenderServer`
         // 同构：清除必须可在命令流里承载，跨帧簿记的消费端才收得到"清掉"
         // （照 pivot `[0,0]` 零向量先例）。
-        self.nines.insert(handle, (texture, [l, t, r, b]));
+        self.nines.insert(
+            handle,
+            NineSliceState {
+                texture,
+                margins: [l, t, r, b],
+                modulate,
+                tiling,
+            },
+        );
     }
 
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
@@ -515,14 +527,16 @@ impl RenderServer for WgpuRenderServer {
             // `NullRenderServer` 严格同序）。仅当该条目存在九宫格簿记时
             // 追加 —— 无记录 = fill/border 照旧，命令流与既有路径逐条
             // 相同。
-            if let Some((texture, margins)) = self.nines.get(&item.handle) {
+            if let Some(state) = self.nines.get(&item.handle) {
                 out.push(RenderCommand::SetNineSlice {
                     handle: item.handle,
-                    texture: *texture,
-                    l: margins[0],
-                    t: margins[1],
-                    r: margins[2],
-                    b: margins[3],
+                    texture: state.texture,
+                    l: state.margins[0],
+                    t: state.margins[1],
+                    r: state.margins[2],
+                    b: state.margins[3],
+                    modulate: state.modulate,
+                    tiling: state.tiling,
                 });
             }
         }
@@ -558,6 +572,11 @@ pub struct FrameStats {
     pub controls: u64,
     /// 其中从纹理注册表采样真实纹理的精灵数（不含字形；字形单列）。
     pub from_registry: u64,
+    /// 九宫格平铺片超限截断数（S16.7）：`ns_tiling` 模式下平铺片总数超过
+    /// [`NINE_SLICE_TILE_CAP`]（256）时，超出部分不再发实例，本计数逐片
+    /// 累加（非平铺帧恒 0）。> 0 时画面仍合法（先到先画），但面板边缘
+    /// 可能露底 —— 大面板 x 小平铺单元的配置预警。
+    pub nines_truncated: u64,
     /// 其中字形四边形数（`SetText` / `SetList` 展开的文本像素）。
     pub glyphs: u64,
     /// 是否应用了相机（相机存在、启用且视口合法）。
@@ -730,8 +749,16 @@ fn push_list_row(
     }
 }
 
+/// 九宫格平铺片总数上限（S16.7）：`ns_tiling` 模式下每个九宫格条目
+/// 单次展开的四边条与中心平铺片合计不得超过 256 片（四角 1:1 不占
+/// 预算）。超限按视觉序（上 → 左 → 中 → 右 → 下）先到先画、其余
+/// 截断，截断片数进 [`FrameStats::nines_truncated`]。触发条件 =
+/// 大面板 x 小平铺单元（如 4096px 面板配 4px 单元，单条带就要 1024 片）。
+pub const NINE_SLICE_TILE_CAP: usize = 256;
+
 /// 九宫格展开（S16.6）：把源纹理按 3x3 切割铺进控件矩形 —— 每片一个
-/// 实例（照 Label"一字形一实例"的展开先例）。
+/// 实例（照 Label"一字形一实例"的展开先例）。S16.7 起支持**模态染色**
+/// （tint 由调用方折好传入）与**中间条平铺**（[`NineSliceState::tiling`]）。
 ///
 /// # 几何算式（冻结，单处实现）
 ///
@@ -742,16 +769,32 @@ fn push_list_row(
 /// - 四角 1:1：目标尺寸 = 钳制后源边距（`l' x t'` 等）—— 任意缩放角
 ///   不变形；源子矩形**锚在纹理角上**（右/下角从纹理右/下缘回退 `r'/b'`
 ///   切割）：未钳制时与"左上顺序切"逐位同值，钳制退化（控件小于边距和）
-///   时四角仍采到纹理真角（标准九宫格"角永远属于纹理角"口径）；
-/// - 四边单向拉伸：上/下条 = 中段宽 x `t'/b'`（水平拉伸、垂直 1:1）；
-///   左/右条 = `l'/r'` x 中段高（垂直拉伸、水平 1:1）；
-/// - 中心双向拉伸：中段宽 x 中段高；
+///   时四角仍采到纹理真角（标准九宫格"角永远属于纹理角"口径）；平铺
+///   模式下四角同样 1:1、不占平铺预算、恒发射；
+/// - 四边单向拉伸（`tiling = false`，既有行为）：上/下条 = 中段宽 x
+///   `t'/b'`（水平拉伸、垂直 1:1）；左/右条 = `l'/r'` x 中段高（垂直
+///   拉伸、水平 1:1）；
+/// - 中心双向拉伸（同上）：中段宽 x 中段高；
+/// - **中间条平铺（S16.7 `tiling = true`）**：四边条与中心改按源边距
+///   像素的**原生尺寸**重复而非拉伸（非整数缩放防糊）——
+///   平铺单元 = `tw - dl - dr` / `th - dt - db`（`dl` 等为**声明**边距、
+///   只钳负不钳半边：平铺单元是纹理事实，不受控件尺寸钳制影响；显示
+///   条长仍受钳制后 rect 约束）。条方向重复 `ceil(条长 / 单元长)` 次、
+///   世界片长 = `min(单元, 剩余)`、每片 uv 取源条全长按 `片长/单元`
+///   比例截断（未钳制的常规情形片长 = 单元长 = 源条长，逐像素 1:1）；
+///   声明边距和 >= 纹理边长（单元 <= 0）的退化轴回落该轴单片拉伸；
+/// - **平铺上限**：平铺片合计 > [`NINE_SLICE_TILE_CAP`] 时按视觉序
+///   先到先画、其余截断，返回截断数（诊断计数，非平铺帧恒 0）；
 /// - 源子矩形 = `sample_info` 全瓦片 uv 的**分数内插**
 ///   `uv = 全瓦片.xy + 源px / 注册尺寸 x 全瓦片.wh`（注册尺寸经
 ///   [`gpu::TextureRegistry::texture_px_size`] 另取 —— sample_info 的
 ///   返回面只有分数，像素口径的分母在此单处折算）；
 /// - `fill` / `border` 条带在九宫格模式**不画**（纹理自带边）—— 由调用
-///   方分臂，本函数只发九片；tint 恒中性（面板色即纹理色，不经着色通道）。
+///   方分臂，本函数只发片；tint 由调用方折好传入（S16.7 modulate：
+///   中性白 = 既有行为，或 `ControlState::fill` 的归一化色 = 模态染色，
+///   九片/平铺片共享同一 tint）。
+///
+/// 返回本帧被上限截断的平铺片数（0 = 未触发上限）。
 #[allow(clippy::too_many_arguments)]
 fn push_nine_slice(
     sprites: &mut Vec<SpriteInstance>,
@@ -762,9 +805,11 @@ fn push_nine_slice(
     tile: u32,
     sheet: [f32; 4],
     tex_px: (f32, f32),
-    margins: [f32; 4],
-) {
+    state: &NineSliceState,
+    tint: [f32; 4],
+) -> u64 {
     // 边距钳制：负值按 0、超过半边按半边（角不重叠、中段非负恒成立）。
+    let margins = state.margins;
     let l = margins[0].max(0.0).min(rect.w * 0.5);
     let t = margins[1].max(0.0).min(rect.h * 0.5);
     let r = margins[2].max(0.0).min(rect.w * 0.5);
@@ -784,25 +829,11 @@ fn push_nine_slice(
     let (sx_mid, sy_mid) = (tw - r, th - b);
     let sw_edge = sx_mid - l; // 源上/下边条宽（未钳制时 = 中段宽）
     let sh_edge = sy_mid - t; // 源左/右边条高（未钳制时 = 中段高）
-    // 九片 = (目标 x, y, w, h；源 x, y, w, h)（相对矩形左上角 / 纹理左上
-    // 角）。宽或高 <= 0 的片跳过 —— 零中段的合法退化，半开区间无像素可画。
-    let pieces = [
-        // 上带：左角（1:1）/ 上边（水平拉伸）/ 右角（1:1，锚纹理右缘）。
-        (0.0, 0.0, l, t, 0.0, 0.0, l, t),
-        (l, 0.0, cx, t, l, 0.0, sw_edge, t),
-        (l + cx, 0.0, r, t, sx_mid, 0.0, r, t),
-        // 中带：左边（垂直拉伸）/ 中心（双向拉伸）/ 右边（垂直拉伸）。
-        (0.0, t, l, cy, 0.0, t, l, sh_edge),
-        (l, t, cx, cy, l, t, sw_edge, sh_edge),
-        (l + cx, t, r, cy, sx_mid, t, r, sh_edge),
-        // 下带：左角（1:1，锚纹理下缘）/ 下边（水平拉伸）/ 右角（锚双缘）。
-        (0.0, t + cy, l, b, 0.0, sy_mid, l, b),
-        (l, t + cy, cx, b, l, sy_mid, sw_edge, b),
-        (l + cx, t + cy, r, b, sx_mid, sy_mid, r, b),
-    ];
-    for (dx, dy, dw, dh, sx, sy, sw, sh) in pieces {
+    // 单片发射（拉伸九片与平铺片共用）：宽或高 <= 0 的片跳过 —— 零中段
+    // 的合法退化，半开区间无像素可画。
+    let mut emit = |dx: f32, dy: f32, dw: f32, dh: f32, sx: f32, sy: f32, sw: f32, sh: f32| {
         if dw <= 0.0 || dh <= 0.0 {
-            continue;
+            return;
         }
         let quad = Affine2::translation(rect.x + dx, rect.y + dy).mul(&Affine2::scale(
             dw / gpu::CELL_PX as f32,
@@ -813,10 +844,154 @@ fn push_nine_slice(
             world: inv.mul(&quad).to_array(),
             uv_rect: [ux(sx), uy(sy), uw(sw), uh(sh)],
             source: [tile as f32, 1.0],
-            tint: [1.0, 1.0, 1.0, 1.0],
+            tint,
             clip: item_clip,
         });
+    };
+
+    if !state.tiling {
+        // 拉伸模式（既有行为，逐位不变）：九片 = (目标 x, y, w, h；源
+        // x, y, w, h)（相对矩形左上角 / 纹理左上角），顺序 = 视觉带序。
+        // 上带：左角（1:1）/ 上边（水平拉伸）/ 右角（1:1，锚纹理右缘）。
+        emit(0.0, 0.0, l, t, 0.0, 0.0, l, t);
+        emit(l, 0.0, cx, t, l, 0.0, sw_edge, t);
+        emit(l + cx, 0.0, r, t, sx_mid, 0.0, r, t);
+        // 中带：左边（垂直拉伸）/ 中心（双向拉伸）/ 右边（垂直拉伸）。
+        emit(0.0, t, l, cy, 0.0, t, l, sh_edge);
+        emit(l, t, cx, cy, l, t, sw_edge, sh_edge);
+        emit(l + cx, t, r, cy, sx_mid, t, r, sh_edge);
+        // 下带：左角（1:1，锚纹理下缘）/ 下边（水平拉伸）/ 右角（锚双缘）。
+        emit(0.0, t + cy, l, b, 0.0, sy_mid, l, b);
+        emit(l, t + cy, cx, b, l, sy_mid, sw_edge, b);
+        emit(l + cx, t + cy, r, b, sx_mid, sy_mid, r, b);
+        return 0;
     }
+
+    // —— 平铺模式（S16.7）——
+    // 声明边距（只钳负、**不钳半边** —— 平铺单元是纹理事实，不受控件
+    // 尺寸钳制影响）与两条平铺单元（源像素）。
+    let dl = margins[0].max(0.0);
+    let dt = margins[1].max(0.0);
+    let dr = margins[2].max(0.0);
+    let db = margins[3].max(0.0);
+    let unit_h = tw - dl - dr; // 上/下条与中心列的平铺单元
+    let unit_v = th - dt - db; // 左/右条与中心行的平铺单元
+    // 轴向片数：span > 0 且单元 > 0 才平铺（ceil(span/unit)）；单元退化
+    //（声明边距和 >= 纹理边长）该轴回落单片拉伸；零中段无片可画（不占
+    // 预算，emit 对零尺寸片本就跳过）。
+    let count = |span: f32, unit: f32| -> u64 {
+        if span > 0.0 && unit > 0.0 {
+            (span / unit).ceil() as u64
+        } else if span > 0.0 {
+            1
+        } else {
+            0
+        }
+    };
+    // 平铺片预算（角不占预算、恒发射）：按视觉序（上 → 左 → 中 → 右 →
+    // 下）先到先画，超限截断计数。
+    let mut budget = NINE_SLICE_TILE_CAP as u64;
+    let mut truncated: u64 = 0;
+
+    // 角（1:1，与拉伸模式同款）。
+    emit(0.0, 0.0, l, t, 0.0, 0.0, l, t); // 左上
+    // 上条（水平平铺）。
+    let n = count(cx, unit_h).min(budget);
+    for i in 0..n {
+        let pw = if unit_h > 0.0 {
+            unit_h.min(cx - i as f32 * unit_h)
+        } else {
+            cx
+        };
+        let sw_i = if unit_h > 0.0 { sw_edge * pw / unit_h } else { sw_edge };
+        emit(l + i as f32 * unit_h, 0.0, pw, t, l, 0.0, sw_i, t);
+    }
+    truncated += count(cx, unit_h) - n;
+    budget -= n;
+    emit(l + cx, 0.0, r, t, sx_mid, 0.0, r, t); // 右上
+    // 左条（垂直平铺）。
+    let n = count(cy, unit_v).min(budget);
+    for j in 0..n {
+        let ph = if unit_v > 0.0 {
+            unit_v.min(cy - j as f32 * unit_v)
+        } else {
+            cy
+        };
+        let sh_j = if unit_v > 0.0 { sh_edge * ph / unit_v } else { sh_edge };
+        emit(0.0, t + j as f32 * unit_v, l, ph, 0.0, t, l, sh_j);
+    }
+    truncated += count(cy, unit_v) - n;
+    budget -= n;
+    // 中心（双向平铺，行主序）。
+    let cols = count(cx, unit_h);
+    let rows = count(cy, unit_v);
+    let n = (cols * rows).min(budget);
+    for k in 0..n {
+        let (i, j) = (k % cols, k / cols);
+        let pw = if unit_h > 0.0 {
+            unit_h.min(cx - i as f32 * unit_h)
+        } else {
+            cx
+        };
+        let ph = if unit_v > 0.0 {
+            unit_v.min(cy - j as f32 * unit_v)
+        } else {
+            cy
+        };
+        let sw_i = if unit_h > 0.0 { sw_edge * pw / unit_h } else { sw_edge };
+        let sh_j = if unit_v > 0.0 { sh_edge * ph / unit_v } else { sh_edge };
+        emit(
+            l + i as f32 * unit_h,
+            t + j as f32 * unit_v,
+            pw,
+            ph,
+            l,
+            t,
+            sw_i,
+            sh_j,
+        );
+    }
+    truncated += cols * rows - n;
+    budget -= n;
+    // 右条（垂直平铺）。
+    let n = count(cy, unit_v).min(budget);
+    for j in 0..n {
+        let ph = if unit_v > 0.0 {
+            unit_v.min(cy - j as f32 * unit_v)
+        } else {
+            cy
+        };
+        let sh_j = if unit_v > 0.0 { sh_edge * ph / unit_v } else { sh_edge };
+        emit(
+            l + cx,
+            t + j as f32 * unit_v,
+            r,
+            ph,
+            sx_mid,
+            t,
+            r,
+            sh_j,
+        );
+    }
+    truncated += count(cy, unit_v) - n;
+    budget -= n;
+    emit(0.0, t + cy, l, b, 0.0, sy_mid, l, b); // 左下角
+    // 下条（水平平铺）。
+    let n = count(cx, unit_h).min(budget);
+    for i in 0..n {
+        let pw = if unit_h > 0.0 {
+            unit_h.min(cx - i as f32 * unit_h)
+        } else {
+            cx
+        };
+        let sw_i = if unit_h > 0.0 { sw_edge * pw / unit_h } else { sw_edge };
+        emit(l + i as f32 * unit_h, t + cy, pw, b, l, sy_mid, sw_i, b);
+    }
+    truncated += count(cx, unit_h) - n;
+    budget -= n;
+    emit(l + cx, t + cy, r, b, sx_mid, sy_mid, r, b); // 右下角
+    debug_assert!(budget == 0 || truncated == 0, "预算与截断互斥");
+    truncated
 }
 
 /// 视口空间裁剪矩形 -> 帧缓冲像素 scissor（E-2 裁剪契约，S12-3）。
@@ -1360,9 +1535,9 @@ pub struct CommandConsumer {
     /// 跨帧九宫格登记表（`SetNineSlice` 建/覆写、NIL 清除、`DestroyItem`
     /// 删；S16.6）。Control 分支查此表决定走九宫格展开还是 fill/border
     /// 条带 —— 无记录 = fill/border 照旧（与既有路径逐位相同）。载荷 =
-    /// `(源纹理键, [l, t, r, b])`（源纹理像素边距），消费点单处折算
-    /// （见 draw_into Control 分支的九宫展开）。
-    nines: BTreeMap<ItemHandle, (RenderAssetKey, [f32; 4])>,
+    /// [`NineSliceState`]（纹理键 + 边距四元组 + S16.7 模态染色 / 平铺
+    /// 两开关），消费点单处折算（见 draw_into Control 分支的九宫展开）。
+    nines: BTreeMap<ItemHandle, NineSliceState>,
     /// 字体登记表：资源键 -> 排版参数（字形表本体作为纹理住在注册表里）。
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
@@ -2025,7 +2200,7 @@ impl CommandConsumer {
                 // SetNineSlice：登记九宫格配置（S16.6）。Control 分支按此
                 // 改走九宫格展开（无记录 = fill/border 照旧，逐位不变）；
                 // NIL 键 = 清除；已知句柄同键覆写，未知句柄静默忽略（契约
-                // I1 口径）。
+                // I1 口径）。S16.7：modulate / tiling 两开关随载荷同行。
                 RenderCommand::SetNineSlice {
                     handle,
                     texture,
@@ -2033,12 +2208,22 @@ impl CommandConsumer {
                     t,
                     r,
                     b,
+                    modulate,
+                    tiling,
                 } => {
                     if self.items.contains_key(handle) {
                         if texture.is_nil() {
                             self.nines.remove(handle);
                         } else {
-                            self.nines.insert(*handle, (*texture, [*l, *t, *r, *b]));
+                            self.nines.insert(
+                                *handle,
+                                NineSliceState {
+                                    texture: *texture,
+                                    margins: [*l, *t, *r, *b],
+                                    modulate: *modulate,
+                                    tiling: *tiling,
+                                },
+                            );
                         }
                         stats.updates += 1;
                     } else {
@@ -2128,20 +2313,32 @@ impl CommandConsumer {
                 // 回退 fill/border，防"有纹理画九宫、没纹理画边框"的模式
                 // 间闪烁；滚动条两种模式共用（面板内容 chrome，非面板本体）。
                 let nine = match self.nines.get(&item.handle) {
-                    Some((texture, margins)) if !texture.is_nil() => Some((*texture, *margins)),
+                    Some(state) if !state.texture.is_nil() => Some(*state),
                     _ => None,
                 };
-                if let Some((ns_tex, ns_margins)) = nine {
+                if let Some(state) = nine {
                     if rect.w > 0.0 && rect.h > 0.0 {
                         // sample_info（全瓦片 uv）与注册尺寸（像素分母）
                         // 同查一表；任一缺席 = 纹理未注册，本帧不画
                         //（不回退 fill/border —— 见上方分臂注释）。
                         if let Some(((tile, sheet), tex_px)) = self
                             .registry
-                            .sample_info(ns_tex)
-                            .zip(self.registry.texture_px_size(ns_tex))
+                            .sample_info(state.texture)
+                            .zip(self.registry.texture_px_size(state.texture))
                         {
-                            push_nine_slice(
+                            // S16.7 模态染色：modulate = true 时九实例 tint
+                            // 改取同条目 ControlState.fill（fill_slot 的既有
+                            // 解析载体，随 SetRect 到达 —— 灰阶纹理 x 面板色
+                            // = 同一纹理多套配色）；false = 中性白（既有行为
+                            // 逐位不变）。注意 fill 缺省透明（fill_slot 空
+                            // 名）会把面板整体乘没 —— ns_modulate 需与
+                            // fill_slot 成对配置（schema 文档同口径）。
+                            let tint = if state.modulate {
+                                SpriteInstance::tint_of(rect_state.fill)
+                            } else {
+                                [1.0, 1.0, 1.0, 1.0]
+                            };
+                            stats.nines_truncated += push_nine_slice(
                                 &mut sprites,
                                 item.handle,
                                 item_clip,
@@ -2150,7 +2347,8 @@ impl CommandConsumer {
                                 tile,
                                 sheet,
                                 tex_px,
-                                ns_margins,
+                                &state,
+                                tint,
                             );
                         }
                     }

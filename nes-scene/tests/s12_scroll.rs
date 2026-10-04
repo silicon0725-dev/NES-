@@ -311,8 +311,10 @@ fn t_sc_04_kinds_schema_and_ron_roundtrip() {
     assert_eq!(lv.default_value("selected"), Some(&Value::I64(-1)));
     assert_eq!(lv.default_value("text_slot"), Some(&Value::Str("text".into())));
     assert_eq!(lv.default_value("sel_fill_slot"), Some(&Value::Str("selected".into())));
-    // 链上聚合：Node + Control + ListView 自身 = 2 + 5 + 5。
-    assert_eq!(lv.len(), 12);
+    // 链上聚合：Node + Control + ListView 自身 = 2 + 12 + 5（Control 含
+    // S16.6 九宫格五键 + S16.7 modulate/tiling 两开关；S16.6 漏改的
+    // 计数断言在 S16.7 补齐 —— 该断言在 fea4083 即红）。
+    assert_eq!(lv.len(), 19);
 
     let tabs = NodeSchema::of(NodeKindTag::Tabs);
     let names: Vec<&str> = tabs.own_props().iter().map(|p| p.name()).collect();

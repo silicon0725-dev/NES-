@@ -67,7 +67,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use nes_render_api::{
     Affine2, Camera2DState, ControlState, Flip, FrameInfo, ItemHandle, LabelState, ListAxis,
-    ListState, Rect, RenderAssetKey, RenderCommand, RenderServer, ScrollBar, Vec2,
+    ListState, NineSliceState, Rect, RenderAssetKey, RenderCommand, RenderServer, ScrollBar, Vec2,
 };
 use nes_scene::ui::{ThemeColors, UiStates, WidgetState, scroll_context_of, scroll_max_of};
 use nes_scene::{Affine, NodeId, NodeKindTag, ResId, SceneTree, Value};
@@ -120,6 +120,10 @@ pub const PROP_NS_T: &str = "ns_t";
 pub const PROP_NS_R: &str = "ns_r";
 /// `Control` 的九宫格源纹理下边距属性名（S16.6）。
 pub const PROP_NS_B: &str = "ns_b";
+/// `Control` 的九宫格模态染色属性名（S16.7；缺省 false = 中性 tint）。
+pub const PROP_NS_MODULATE: &str = "ns_modulate";
+/// `Control` 的九宫格中间条平铺属性名（S16.7；缺省 false = 拉伸）。
+pub const PROP_NS_TILING: &str = "ns_tiling";
 
 /// `Label` 字号缺省值（与场景层 schema 的 `font_size` 缺省一致）。
 pub const DEFAULT_LABEL_FONT_SIZE: f32 = 16.0;
@@ -490,16 +494,36 @@ impl RenderExtractor {
             //    fill/border 路径逐位同基线。仅裸 Control 生效（Button /
             //    TextInput / List 等摊平类与 Label 不读 ns 属性 —— 面板
             //    纹理化暂不扩大到派生控件，遗留项见 S16.6 文档 §4）。
+            //    S16.7：ns_modulate / ns_tiling 两开关随载荷同行（false
+            //    缺省 = 命令流与既有路径逐条相同；开关翻转即改像素，全量
+            //    快照口径下逐帧重发无迁移帧问题）。
             if matches!(admission, Admission::Control(_, _)) {
                 let nine = nine_slice_of(tree, node, source);
                 let wants_nines = nine.is_some();
-                if let Some((key, margins)) = nine {
+                if let Some(state) = nine {
                     server.set_nine_slice(
-                        handle, key, margins[0], margins[1], margins[2], margins[3],
+                        handle,
+                        state.texture,
+                        state.margins[0],
+                        state.margins[1],
+                        state.margins[2],
+                        state.margins[3],
+                        state.modulate,
+                        state.tiling,
                     );
                 }
                 if self.map.take_nines_active(node, wants_nines) == Some(true) && !wants_nines {
-                    server.set_nine_slice(handle, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0);
+                    let identity = NineSliceState::IDENTITY;
+                    server.set_nine_slice(
+                        handle,
+                        identity.texture,
+                        identity.margins[0],
+                        identity.margins[1],
+                        identity.margins[2],
+                        identity.margins[3],
+                        identity.modulate,
+                        identity.tiling,
+                    );
                 }
             }
             // —— S16.2 图集帧动画：Sprite 的子矩形采样（同帧只对 Sprite 生效
@@ -1045,7 +1069,7 @@ fn sprite_tint_rgba(tree: &SceneTree, node: NodeId) -> [u8; 4] {
 }
 
 /// `Control` 的九宫格配置（S16.6）：`ns_tex` 绑定到可渲染纹理键、且四条
-/// 边距**至少一条 > 0** 时返回 `(键, [l, t, r, b])`；否则 `None` —— 不推
+/// 边距**至少一条 > 0** 时返回完整 [`NineSliceState`]；否则 `None` —— 不推
 /// `SetNineSlice`（关闭 = fill/border 照旧，缺省路径逐位不变）。
 ///
 /// - 边距读 `ns_l` / `ns_t` / `ns_r` / `ns_b`（I64 属性，缺失/类型错 → 0；
@@ -1053,12 +1077,16 @@ fn sprite_tint_rgba(tree: &SceneTree, node: NodeId) -> [u8; 4] {
 /// - "至少一条 > 0" 是关闭判据：全 0 边距的九宫格没有切割线可言，视同
 ///   未启用（与 `sheet_cols == 0` 关闭图集的同一口径）；
 /// - 纹理走 [`ResId::from_value`] + `renderable_key`（与 Sprite 的 texture
-///   同一条准入链）：未绑定 `Resource(0)` / 资源被回收都算 `None`。
+///   同一条准入链）：未绑定 `Resource(0)` / 资源被回收都算 `None`；
+/// - S16.7：`ns_modulate` / `ns_tiling`（Bool 属性，缺失/类型错 → false
+///   = 既有行为）随载荷同行 —— 染色的**填色解析**不在此处：tint 的色源
+///   是 `fill_slot` 的既有解析载体 `ControlState.fill`（随 `SetRect`
+///   下发），本层零重复解析。
 fn nine_slice_of(
     tree: &SceneTree,
     node: NodeId,
     source: &dyn RenderKeySource,
-) -> Option<(RenderAssetKey, [f32; 4])> {
+) -> Option<NineSliceState> {
     let id = tree.prop(node, PROP_NS_TEX).and_then(ResId::from_value)?;
     let key = source.renderable_key(id)?;
     let l = i64_prop(tree, node, PROP_NS_L, 0) as f32;
@@ -1068,7 +1096,12 @@ fn nine_slice_of(
     if l <= 0.0 && t <= 0.0 && r <= 0.0 && b <= 0.0 {
         return None;
     }
-    Some((key, [l, t, r, b]))
+    Some(NineSliceState {
+        texture: key,
+        margins: [l, t, r, b],
+        modulate: bool_prop(tree, node, PROP_NS_MODULATE, false),
+        tiling: bool_prop(tree, node, PROP_NS_TILING, false),
+    })
 }
 
 /// Sprite2D 的图集子矩形（S16.2 图集帧动画）：`sheet_cols > 0` 时按/// `frame` 算出该帧的**归一化 UV 矩形** `[u0, v0, us, vs]`；整图模式

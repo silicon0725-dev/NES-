@@ -1,4 +1,5 @@
 //! S16.6（Control 九宫格纹理渲染）契约：`SetNineSlice` 的像素事实。
+//! S16.7 增模态染色（ns_modulate）与中间条平铺（ns_tiling）两开关。
 //!
 //! | 编号 | 契约 |
 //! |---|---|
@@ -6,6 +7,9 @@
 //! | T-9S-02 | Control 30x30 < 源边距和（32）：边距钳制（min 公式）生效 —— 无 panic、四角完整（锚纹理真角）、零中段合法退化 |
 //! | T-9S-03 | 无 ns 记录的 Control → 输出与既有路径逐位同（fill/border 照旧） |
 //! | T-9S-04 | 同键覆写 / NIL 清除：改边距即改像素；NIL 清除后整帧回基线**逐位**；输出序 SetNineSlice 恒在 SetPivot 之后 |
+//! | T-NS-M-01 | S16.7 modulate：灰阶纹理 + 两开关 true + fill 红 → 面板 = 灰 x 红（通道手算）；开关 false 对照 = 纯灰 |
+//! | T-NS-T-01 | S16.7 tiling：上条源列非均匀灰阶 → 平铺下多点采样与源列一一对应（每 16px 从源条头重启）；实例 36 片；4128px 面板 x 16px 单元触发 256 片上限，截断 66304 片进诊断计数 |
+//! | T-NS-T-02 | S16.7 组合：modulate + tiling 同开 —— 平铺片与角同受 fill 染色 |
 //!
 //! 手法与 `criterion_control_contract` / `criterion_alpha_contract` 同源：
 //! 直接驱动契约层（WgpuRenderServer -> 命令流 -> CommandConsumer），离屏
@@ -39,6 +43,16 @@ const CENTER: [u8; 4] = [40, 40, 60, 255]; // 中心纯色
 /// 纹理注册键（测试内约定）。
 fn tex_key() -> RenderAssetKey {
     RenderAssetKey::from_parts(7, 1)
+}
+
+/// 灰阶纹理键（T-NS-M-01 modulate 配方用）。
+fn gray_key() -> RenderAssetKey {
+    RenderAssetKey::from_parts(8, 1)
+}
+
+/// 灰阶列纹纹理键（T-NS-T-01/T-02 平铺用）。
+fn ramp_key() -> RenderAssetKey {
+    RenderAssetKey::from_parts(6, 1)
 }
 
 /// 生成 48x48 九宫测试纹理（RGBA 行主序；边距 16，中带 16）。
@@ -107,6 +121,65 @@ fn gpu_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 生成 48x48 全灰灰阶纹理（RGBA；modulate 配方：灰阶/白图配彩色 fill_slot，
+/// 面板观感 = 灰阶明暗 x 槽位色）。
+fn flat_gray_rgba() -> Vec<u8> {
+    const W: u32 = 48;
+    const H: u32 = 48;
+    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    for _ in 0..W * H {
+        rgba.extend_from_slice(&[200, 200, 200, 255]);
+    }
+    rgba
+}
+
+/// 生成 48x48 平铺测试纹理（RGBA 行主序；边距 16，中带 16）。
+///
+/// 布局与 [`nine_patch_rgba`] 同族，唯一差别：上边条 16 列**非均匀灰阶**
+///（源 x = 16+c -> 灰阶 c*16）—— 拉伸模式整条缩放后列色失真，平铺模式
+/// 逐列点对点、每个 16px 单元从源条头重启，多点采样可与源列一一对应。
+fn ramp_nine_patch_rgba() -> Vec<u8> {
+    const W: u32 = 48;
+    const H: u32 = 48;
+    const M: u32 = 16;
+    let orange = [255, 128, 0, 255];
+    let cyan = [0, 255, 255, 255];
+    let color_at = |x: u32, y: u32| -> [u8; 4] {
+        if x < M && y < M {
+            RED
+        } else if x >= W - M && y < M {
+            GREEN
+        } else if x < M && y >= H - M {
+            BLUE
+        } else if x >= W - M && y >= H - M {
+            YELLOW
+        } else if y < M {
+            let c = (x - M) as u8; // 0..16
+            let v = c * 16; // 0..240，灰阶列纹（c < 16 不溢出）
+            [v, v, v, 255]
+        } else if y >= H - M {
+            if x < M + (W - 2 * M) / 2 {
+                orange
+            } else {
+                cyan
+            }
+        } else if x < M {
+            DGRAY
+        } else if x >= W - M {
+            LGRAY
+        } else {
+            CENTER
+        }
+    };
+    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            rgba.extend_from_slice(&color_at(x, y));
+        }
+    }
+    rgba
+}
+
 fn frame(index: u64) -> FrameInfo {
     FrameInfo::new(index, 0.0, 0.0, Vec2::new(256.0, 128.0))
 }
@@ -144,24 +217,39 @@ fn flush(consumer: &mut CommandConsumer, server: &mut WgpuRenderServer) -> Frame
     consumer.consume(&commands).expect("消费一帧")
 }
 
-/// 一块九宫格 Control：矩形 (16,16) 起的 `size` 方块 + 16px 边距记录。
+/// 一块九宫格 Control：矩形 (16,16) 起的 `size` 方块 + 16px 边距记录
+///（S16.7 两开关缺省 false —— 既有行为）。
 fn nine_control(server: &mut WgpuRenderServer, size: f32, margins: [f32; 4]) -> ItemHandle {
+    nine_control_on(server, tex_key(), size, margins, [0; 4], false, false)
+}
+
+/// 全参版：指定纹理键、fill（modulate 的 tint 色源 = fill_slot 解析载体）
+/// 与 S16.7 两开关。
+#[allow(clippy::too_many_arguments)]
+fn nine_control_on(
+    server: &mut WgpuRenderServer,
+    key: RenderAssetKey,
+    size: f32,
+    margins: [f32; 4],
+    fill: [u8; 4],
+    modulate: bool,
+    tiling: bool,
+) -> ItemHandle {
     let h = server.create_item(RenderAssetKey::NIL);
     server.set_z(h, 0, 0);
-    let half = size * 0.5;
-    server.set_rect(
-        h,
-        &ControlState::new([0.0; 4], [16.0, 16.0, 16.0 + size, 16.0 + size]),
-    );
+    let mut state = ControlState::new([0.0; 4], [16.0, 16.0, 16.0 + size, 16.0 + size]);
+    state.fill = fill;
+    server.set_rect(h, &state);
     server.set_nine_slice(
         h,
-        tex_key(),
+        key,
         margins[0],
         margins[1],
         margins[2],
         margins[3],
+        modulate,
+        tiling,
     );
-    let _ = half;
     h
 }
 
@@ -282,7 +370,7 @@ fn t_9s_04_overwrite_and_clear_semantics() {
     let baseline = flush(&mut consumer, &mut server);
 
     // 设九宫格：像素离开基线（哨兵：模式切换必须可见）。
-    server.set_nine_slice(h, tex_key(), 16.0, 16.0, 16.0, 16.0);
+    server.set_nine_slice(h, tex_key(), 16.0, 16.0, 16.0, 16.0, false, false);
     let sliced = flush(&mut consumer, &mut server);
     assert_ne!(sliced.image.rgba, baseline.image.rgba, "九宫格切换可见");
     assert_eq!(sliced.image.pixel(20, 20), Some(RED), "左上角出现纹理角色");
@@ -290,7 +378,7 @@ fn t_9s_04_overwrite_and_clear_semantics() {
     // 同键覆写（左边距 16 -> 8）：后写者生效 —— 左角块缩到 8px，上边条
     // 左端改采源角块右侧的红色 texel，品红/白分界从目标 x=64 右移到
     // x=72：探针 (68,20) 由白（l=16）变品红（l=8）。
-    server.set_nine_slice(h, tex_key(), 8.0, 16.0, 16.0, 16.0);
+    server.set_nine_slice(h, tex_key(), 8.0, 16.0, 16.0, 16.0, false, false);
     let overwritten = flush(&mut consumer, &mut server);
     assert_ne!(overwritten.image.rgba, sliced.image.rgba, "覆写改变像素");
     assert_eq!(
@@ -318,7 +406,7 @@ fn t_9s_04_overwrite_and_clear_semantics() {
     assert!(nine_at > pivot_at, "SetNineSlice 恒在 SetPivot 之后");
 
     // NIL 清除：整帧逐位回基线（无记录 = fill/border 照旧）。
-    server.set_nine_slice(h, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0);
+    server.set_nine_slice(h, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0, false, false);
     let cleared = flush(&mut consumer, &mut server);
     assert_eq!(
         cleared.image.rgba, baseline.image.rgba,
@@ -326,7 +414,7 @@ fn t_9s_04_overwrite_and_clear_semantics() {
     );
 
     // 销毁：九宫格随条目消亡 —— 命令流不再出现 SetNineSlice、像素消失。
-    server.set_nine_slice(h, tex_key(), 16.0, 16.0, 16.0, 16.0);
+    server.set_nine_slice(h, tex_key(), 16.0, 16.0, 16.0, 16.0, false, false);
     server.destroy_item(h);
     let mut commands = Vec::new();
     server.submit_into(&frame(2), &mut commands);
@@ -338,4 +426,141 @@ fn t_9s_04_overwrite_and_clear_semantics() {
     );
     let dead = consumer.consume(&commands).expect("消费销毁帧");
     assert_eq!(dead.image.pixel(20, 20), Some(CLEAR_RGBA), "条目已消失");
+}
+
+/// T-NS-M-01（S16.7 模态染色）：灰阶纹理 + modulate + fill 红 → 面板
+/// 逐通道 = 灰 x 红（手算：200/255 x [1,0,0,1] -> [200,0,0,255]，unorm
+/// 逐通道舍入）；modulate=false 对照 = 纯灰（中性 tint 恒等）。
+#[test]
+fn t_ns_m_01_modulate_tints_panel_by_fill() {
+    let (_guard, consumer) = open_canvas();
+    let Some(mut consumer) = consumer else { return };
+    consumer
+        .register_texture(gray_key(), 48, 48, &flat_gray_rgba())
+        .expect("register gray texture");
+
+    // modulate = true：九实例 tint = fill（fill_slot 解析色的既有载体）。
+    // 像素证据：中心 / 角 / 上条三类片同受染色 —— tint 是九片共享的。
+    let mut server = WgpuRenderServer::new();
+    nine_control_on(&mut server, gray_key(), 96.0, [16.0; 4], RED, true, false);
+    let outcome = flush(&mut consumer, &mut server);
+    assert_eq!(outcome.stats.controls, 1);
+    assert_eq!(outcome.stats.drawn, 9, "modulate does not change piece count");
+    let modulated: [u8; 4] = [200, 0, 0, 255];
+    assert_eq!(
+        outcome.image.pixel(64, 64),
+        Some(modulated),
+        "center = gray x red (200/255 x [1,0,0,1])"
+    );
+    assert_eq!(outcome.image.pixel(20, 20), Some(modulated), "corner tinted too");
+    assert_eq!(outcome.image.pixel(64, 20), Some(modulated), "top edge tinted too");
+
+    // modulate = false 对照：中性白 tint = 纹理原色（纯灰），fill 不参与。
+    let mut server = WgpuRenderServer::new();
+    nine_control_on(&mut server, gray_key(), 96.0, [16.0; 4], RED, false, false);
+    let outcome = flush(&mut consumer, &mut server);
+    assert_eq!(
+        outcome.image.pixel(64, 64),
+        Some([200, 200, 200, 255]),
+        "switch off = neutral tint, plain gray"
+    );
+}
+
+/// T-NS-T-01（S16.7 中间条平铺）：上条源列非均匀灰阶 → 平铺模式多点
+/// 采样与源列一一对应（每 16px 单元从源条头重启、角不参与平铺）；
+/// 拉伸对照同点失真；实例计数 36；4128px 面板 x 16px 单元触发 256 片
+/// 上限，截断片数进 `stats.nines_truncated` 诊断。
+#[test]
+fn t_ns_t_01_tiling_keeps_native_columns() {
+    let (_guard, consumer) = open_canvas();
+    let Some(mut consumer) = consumer else { return };
+    consumer
+        .register_texture(ramp_key(), 48, 48, &ramp_nine_patch_rgba())
+        .expect("register ramp texture");
+
+    // tiling = true：上条目标区长 64px = 4 个原生 16px 单元；条从
+    // rect.x + l = 32 起，像素 (32+k, 20) 的中心映射源列 16 + k%16，
+    // 灰阶 = (k%16)*16（平铺单元 = 声明边距推导的源条原生长度
+    // 48-16-16 = 16px）。
+    let mut server = WgpuRenderServer::new();
+    nine_control_on(&mut server, ramp_key(), 96.0, [16.0; 4], [0; 4], false, true);
+    let outcome = flush(&mut consumer, &mut server);
+    assert_eq!(outcome.stats.controls, 1);
+    // 实例计数：角 4 + 上/下/左/右条各 4 + 中心 4x4 = 36（拉伸恒 9）。
+    assert_eq!(outcome.stats.drawn, 36, "tiling unfolds at native source size");
+    assert_eq!(outcome.stats.nines_truncated, 0, "cap not reached");
+    let image = &outcome.image;
+    assert_eq!(image.pixel(32, 20), Some([0, 0, 0, 255]), "tile 1 col 0 -> ramp 0");
+    assert_eq!(image.pixel(33, 20), Some([16, 16, 16, 255]), "tile 1 col 1");
+    assert_eq!(image.pixel(47, 20), Some([240, 240, 240, 255]), "tile 1 col 15");
+    assert_eq!(
+        image.pixel(48, 20),
+        Some([0, 0, 0, 255]),
+        "tile 2 restarts from strip head"
+    );
+    assert_eq!(image.pixel(56, 20), Some([128, 128, 128, 255]), "tile 2 col 8");
+    assert_eq!(image.pixel(64, 20), Some([0, 0, 0, 255]), "tile 3 restarts");
+    assert_eq!(image.pixel(95, 20), Some([240, 240, 240, 255]), "tile 4 last col");
+    assert_eq!(image.pixel(96, 20), Some(GREEN), "corner stays 1:1 (not tiled)");
+    assert_eq!(image.pixel(64, 64), Some(CENTER), "center tiles keep source color");
+
+    // 拉伸对照：同点整条缩放后采样失真（源 16..32 被拉到 64px 长条里），
+    // 平铺的原生列色不可复现 —— 这就是平铺开关存在的像素理由。
+    let mut server = WgpuRenderServer::new();
+    nine_control_on(&mut server, ramp_key(), 96.0, [16.0; 4], [0; 4], false, false);
+    let stretched = flush(&mut consumer, &mut server);
+    assert_eq!(stretched.stats.drawn, 9, "stretch mode stays nine pieces");
+    assert_ne!(
+        stretched.image.pixel(47, 20),
+        image.pixel(47, 20),
+        "stretch distorts the column color that tiling keeps native"
+    );
+
+    // 上限：4128px 方块面板 x 16px 单元 -> 上条恰 256 片吃满预算，其余按
+    // 视觉序截断（左条 256 + 中心 256x256 = 65536 + 右条 256 + 下条 256）
+    // —— 诊断计数逐片累加（大面板 x 小平铺单元的触发形态）。
+    let mut server = WgpuRenderServer::new();
+    nine_control_on(&mut server, ramp_key(), 4128.0, [16.0; 4], [0; 4], false, true);
+    let outcome = flush(&mut consumer, &mut server);
+    assert_eq!(outcome.stats.controls, 1, "off-target panel still a control entry");
+    assert_eq!(
+        outcome.stats.drawn,
+        4 + 256,
+        "corners 4 + budgeted top-strip tiles 256"
+    );
+    assert_eq!(
+        outcome.stats.nines_truncated,
+        256 + 65536 + 256 + 256,
+        "left/center/right/bottom truncated piece by piece"
+    );
+}
+
+/// T-NS-T-02（S16.7 组合）：modulate + tiling 同开 —— 平铺片与角同受
+/// fill 染色（tint 与平铺几何正交：染色只换 tint，平铺只换片几何）。
+#[test]
+fn t_ns_t_02_modulate_and_tiling_combined() {
+    let (_guard, consumer) = open_canvas();
+    let Some(mut consumer) = consumer else { return };
+    consumer
+        .register_texture(ramp_key(), 48, 48, &ramp_nine_patch_rgba())
+        .expect("register ramp texture");
+
+    let mut server = WgpuRenderServer::new();
+    nine_control_on(&mut server, ramp_key(), 96.0, [16.0; 4], RED, true, true);
+    let outcome = flush(&mut consumer, &mut server);
+    assert_eq!(outcome.stats.controls, 1);
+    assert_eq!(outcome.stats.drawn, 36, "piece count unchanged when combined");
+    assert_eq!(outcome.stats.nines_truncated, 0);
+    let image = &outcome.image;
+    // 平铺片灰阶 128 x 红：R = 128x1 = 128、G/B = 128x0 = 0。
+    assert_eq!(
+        image.pixel(40, 20),
+        Some([128, 0, 0, 255]),
+        "tiled piece carries the modulate tint"
+    );
+    // 中心片（源中心 [40,40,60]）x 红。
+    assert_eq!(image.pixel(64, 64), Some([40, 0, 0, 255]), "center tile tinted");
+    // 角同受染色：红角 x 红 fill = 原样；绿角 x 红 fill -> R 通道归零。
+    assert_eq!(image.pixel(20, 20), Some(RED), "red corner x red fill unchanged");
+    assert_eq!(image.pixel(100, 20), Some([0, 0, 0, 255]), "green corner x red fill");
 }

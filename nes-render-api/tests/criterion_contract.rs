@@ -765,7 +765,8 @@ fn criterion_contract_set_pivot_bookkeeping_and_order() {
 
 /// S16.6（九宫格）：`set_nine_slice` 的 null 簿记 —— 同键覆写、NIL 恒等
 /// 记录照存照发、未知句柄静默忽略、销毁随条目清理；输出序 SetNineSlice
-/// 恒在 SetPivot 之后（与 wgpu 后端严格同构的命令流面抽查）。
+/// 恒在 SetPivot 之后（与 wgpu 后端严格同构的命令流面抽查）。S16.7：
+/// modulate / tiling 两开关随载荷同行（覆写后写者生效，快照逐帧重发）。
 #[test]
 fn criterion_contract_set_nine_slice_bookkeeping_and_order() {
     let mut server = NullRenderServer::new();
@@ -773,13 +774,18 @@ fn criterion_contract_set_nine_slice_bookkeeping_and_order() {
     let tex = RenderAssetKey::from_parts(9, 1);
 
     // 同键覆写：后写者生效；未知句柄静默忽略（计数器可观测）。
-    server.set_nine_slice(handle, tex, 16.0, 16.0, 16.0, 16.0);
-    server.set_nine_slice(handle, tex, 8.0, 0.0, 12.0, 0.0);
-    server.set_nine_slice(ItemHandle::from_raw(999), tex, 1.0, 1.0, 1.0, 1.0);
+    server.set_nine_slice(handle, tex, 16.0, 16.0, 16.0, 16.0, false, false);
+    server.set_nine_slice(handle, tex, 8.0, 0.0, 12.0, 0.0, true, true);
+    server.set_nine_slice(ItemHandle::from_raw(999), tex, 1.0, 1.0, 1.0, 1.0, true, false);
     assert_eq!(
         server.nine_slice_of(handle),
-        Some(&(tex, [8.0, 0.0, 12.0, 0.0])),
-        "覆写后写者生效（边距四元组逐位）"
+        Some(&NineSliceState {
+            texture: tex,
+            margins: [8.0, 0.0, 12.0, 0.0],
+            modulate: true,
+            tiling: true,
+        }),
+        "覆写后写者生效（边距四元组 + 两开关逐位）"
     );
     assert!(server.nine_slice_of(ItemHandle::from_raw(999)).is_none());
     assert_eq!(server.counters().ignored_ops, 1, "未知句柄恰好被计一次忽略");
@@ -801,13 +807,24 @@ fn criterion_contract_set_nine_slice_bookkeeping_and_order() {
             .all(|c| c.handle() != Some(ItemHandle::from_raw(999))),
         "未知句柄不产生命令"
     );
+    // 载荷面：两开关随全量快照重发（逐帧义务）。
+    assert!(matches!(
+        commands
+            .iter()
+            .find(|c| matches!(c, RenderCommand::SetNineSlice { .. })),
+        Some(RenderCommand::SetNineSlice {
+            modulate: true,
+            tiling: true,
+            ..
+        })
+    ));
 
     // NIL 键 = 恒等记录（照 set_pivot([0,0]) 零向量先例）：照存照发 ——
     // 消费端据此清除跨帧簿记，fill/border 照旧。
-    server.set_nine_slice(handle, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0);
+    server.set_nine_slice(handle, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0, false, false);
     assert_eq!(
         server.nine_slice_of(handle),
-        Some(&(RenderAssetKey::NIL, [0.0, 0.0, 0.0, 0.0])),
+        Some(&NineSliceState::IDENTITY),
         "NIL 恒等记录照存（清除必须可在命令流里承载）"
     );
     let commands = server.submit(&FrameInfo::default());
@@ -818,7 +835,7 @@ fn criterion_contract_set_nine_slice_bookkeeping_and_order() {
     assert_eq!(nil_clears, 1, "恒等记录随快照重发（消费端的清除载体）");
 
     // 销毁：九宫格随条目消亡（恒等记录一并消失）。
-    server.set_nine_slice(handle, tex, 16.0, 16.0, 16.0, 16.0);
+    server.set_nine_slice(handle, tex, 16.0, 16.0, 16.0, 16.0, false, false);
     server.destroy_item(handle);
     assert!(server.nine_slice_of(handle).is_none(), "销毁随条目清理");
     let commands = server.submit(&FrameInfo::default());

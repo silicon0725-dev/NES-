@@ -1,5 +1,6 @@
 //! S16.6 提取层契约：`Control` 的九宫格属性（`ns_tex` + `ns_l/t/r/b`）
-//! → `SetNineSlice` 的准入 / 覆写 / 清除语义。
+//! → `SetNineSlice` 的准入 / 覆写 / 清除语义；S16.7 增 `ns_modulate` /
+//! `ns_tiling` 两开关的随载荷同行。
 //!
 //! | 编号 | 契约 |
 //! |---|---|
@@ -7,6 +8,7 @@
 //! | T-NSX-02 | 缺省 Control / 未绑定纹理 / 全零边距 → 不推 SetNineSlice（缺省路径命令流与既有逐条相同） |
 //! | T-NSX-03 | 有效 → 清空迁移帧补推一次 NIL 恒等记录（照 `set_pivot([0,0])` 零向量先例：照存照发，消费端据此摘跨帧簿记）；稳态帧随快照重发 |
 //! | T-NSX-04 | 仅裸 Control 生效：Button 即使带 ns 属性也不推（派生控件不面板纹理化，S16.6 冻结口径） |
+//! | T-NSX-05 | S16.7：ns_modulate / ns_tiling 缺省 false（命令流两开关逐位 false）；置 true 随载荷同行；ns_tex 失效时开关 inert |
 //!
 //! 簿记面（同键覆写 / 销毁清理 / 输出序）由 nes-render-api 的
 //! criterion_contract 与 nes-render-wgpu 的 criterion_nineslice 两侧钉住。
@@ -14,7 +16,9 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use nes_render_api::{FrameInfo, NullRenderServer, RenderAssetKey, RenderCommand, Vec2};
+use nes_render_api::{
+    FrameInfo, NineSliceState, NullRenderServer, RenderAssetKey, RenderCommand, Vec2,
+};
 use nes_render_extract::RenderExtractor;
 use nes_render_extract::RenderKeySource;
 use nes_scene::{NodeKind, ResId, SceneTree, Value};
@@ -63,7 +67,7 @@ fn extract_control(fns: &[(&str, Value)]) -> (NullRenderServer, Vec<RenderComman
     (srv, out, handle, ex)
 }
 
-fn nine_of(out: &[RenderCommand]) -> Option<(RenderAssetKey, [f32; 4])> {
+fn nine_of(out: &[RenderCommand]) -> Option<NineSliceState> {
     out.iter().find_map(|c| match c {
         RenderCommand::SetNineSlice {
             handle: _,
@@ -72,7 +76,14 @@ fn nine_of(out: &[RenderCommand]) -> Option<(RenderAssetKey, [f32; 4])> {
             t,
             r,
             b,
-        } => Some((*texture, [*l, *t, *r, *b])),
+            modulate,
+            tiling,
+        } => Some(NineSliceState {
+            texture: *texture,
+            margins: [*l, *t, *r, *b],
+            modulate: *modulate,
+            tiling: *tiling,
+        }),
         _ => None,
     })
 }
@@ -91,12 +102,22 @@ fn t_nsx_01_valid_props_push_nine_slice() {
     let h = handle.expect("Control 恒准入");
     assert_eq!(
         srv.nine_slice_of(h),
-        Some(&(RenderAssetKey::from_parts(9, 1), [16.0, 16.0, 16.0, 16.0])),
-        "服务端簿记收到键 + 边距"
+        Some(&NineSliceState {
+            texture: RenderAssetKey::from_parts(9, 1),
+            margins: [16.0, 16.0, 16.0, 16.0],
+            modulate: false,
+            tiling: false,
+        }),
+        "服务端簿记收到键 + 边距（S16.7 两开关缺省 false）"
     );
     assert_eq!(
         nine_of(&out),
-        Some((RenderAssetKey::from_parts(9, 1), [16.0, 16.0, 16.0, 16.0])),
+        Some(NineSliceState {
+            texture: RenderAssetKey::from_parts(9, 1),
+            margins: [16.0, 16.0, 16.0, 16.0],
+            modulate: false,
+            tiling: false,
+        }),
         "命令流携带 SetNineSlice"
     );
 
@@ -108,7 +129,12 @@ fn t_nsx_01_valid_props_push_nine_slice() {
     ]);
     assert_eq!(
         nine_of(&out),
-        Some((RenderAssetKey::from_parts(9, 1), [-4.0, 8.0, 0.0, 0.0])),
+        Some(NineSliceState {
+            texture: RenderAssetKey::from_parts(9, 1),
+            margins: [-4.0, 8.0, 0.0, 0.0],
+            modulate: false,
+            tiling: false,
+        }),
     );
     assert!(srv.nine_slice_of(*srv.items().keys().next().unwrap()).is_some());
 }
@@ -162,7 +188,12 @@ fn t_nsx_03_migration_frame_pushes_nil_identity_once() {
     let h = ex.handle_of(node).expect("Control 恒准入");
     assert_eq!(
         srv.nine_slice_of(h),
-        Some(&(RenderAssetKey::from_parts(9, 1), [16.0, 0.0, 0.0, 0.0])),
+        Some(&NineSliceState {
+            texture: RenderAssetKey::from_parts(9, 1),
+            margins: [16.0, 0.0, 0.0, 0.0],
+            modulate: false,
+            tiling: false,
+        }),
         "有效帧簿记在案"
     );
 
@@ -173,7 +204,7 @@ fn t_nsx_03_migration_frame_pushes_nil_identity_once() {
     ex.extract_into(&mut tree, &assets, &mut srv, &frame(), &mut out);
     assert_eq!(
         nine_of(&out),
-        Some((RenderAssetKey::NIL, [0.0, 0.0, 0.0, 0.0])),
+        Some(NineSliceState::IDENTITY),
         "迁移帧恰好一条 NIL 恒等记录（消费端的清除载体）"
     );
 
@@ -182,7 +213,7 @@ fn t_nsx_03_migration_frame_pushes_nil_identity_once() {
     ex.extract_into(&mut tree, &assets, &mut srv, &frame(), &mut out);
     assert_eq!(
         nine_of(&out),
-        Some((RenderAssetKey::NIL, [0.0, 0.0, 0.0, 0.0])),
+        Some(NineSliceState::IDENTITY),
         "恒等记录随快照重发"
     );
 }
@@ -207,4 +238,62 @@ fn t_nsx_04_button_does_not_read_ns_props() {
     assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetNineSlice { .. })));
     // 按钮自身照常摊平（SetRect + SetText 同句柄），ns 属性对它 inert。
     assert!(srv.rect_of(ex.handle_of(node).expect("按钮恒准入")).is_some());
+}
+
+/// T-NSX-05（S16.7）：`ns_modulate` / `ns_tiling` 两开关随载荷同行 ——
+/// 缺省 false（命令流与既有逐位同）；置 true 原样透传；染色的**色源**
+/// 是 `fill_slot` 的既有解析载体 `ControlState.fill`（随 SetRect 下发，
+/// 本层零重复解析）；九宫格整体失效（ns_tex 清空）时开关 inert（不推）。
+#[test]
+fn t_nsx_05_modulate_tiling_flags_travel_with_payload() {
+    // 开关齐开：载荷两开关逐位 true；fill_slot="danger" 解析进
+    // ControlState.fill（modulate 的 tint 色源 —— 渲染侧只读不重算）。
+    let (srv, out, _, _) = extract_control(&[
+        ("ns_tex", Value::Resource(1)),
+        ("ns_l", Value::I64(16)),
+        ("ns_t", Value::I64(16)),
+        ("ns_r", Value::I64(16)),
+        ("ns_b", Value::I64(16)),
+        ("fill_slot", Value::Str("danger".into())),
+        ("ns_modulate", Value::Bool(true)),
+        ("ns_tiling", Value::Bool(true)),
+    ]);
+    assert_eq!(
+        nine_of(&out),
+        Some(NineSliceState {
+            texture: RenderAssetKey::from_parts(9, 1),
+            margins: [16.0, 16.0, 16.0, 16.0],
+            modulate: true,
+            tiling: true,
+        }),
+        "两开关随载荷同行"
+    );
+    // 色源 = fill_slot 的主题解析（THEME_SLOTS 序 danger = [0xD2,0x4B,0x4B]）。
+    let h = *srv.items().keys().next().unwrap();
+    assert_eq!(
+        srv.rect_of(h).map(|r| r.fill),
+        Some([0xD2, 0x4B, 0x4B, 0xFF]),
+        "fill_slot 解析色在 ControlState.fill（modulate 的既有色源）"
+    );
+
+    // 单开 modulate / 单开 tiling：互不牵连。
+    let (_, out, _, _) = extract_control(&[
+        ("ns_tex", Value::Resource(1)),
+        ("ns_l", Value::I64(16)),
+        ("ns_modulate", Value::Bool(true)),
+    ]);
+    let nine = nine_of(&out).expect("有效九宫格在流");
+    assert!(nine.modulate && !nine.tiling, "单开 modulate");
+
+    // 九宫格失效（ns_tex 未绑定）时开关 inert：不推 SetNineSlice。
+    let (_, out, _, _) = extract_control(&[
+        ("ns_tex", Value::Resource(0)),
+        ("ns_l", Value::I64(16)),
+        ("ns_modulate", Value::Bool(true)),
+        ("ns_tiling", Value::Bool(true)),
+    ]);
+    assert!(
+        out.iter().all(|c| !matches!(c, RenderCommand::SetNineSlice { .. })),
+        "开关不是独立的准入判据（关闭判据仍是纹理 + 边距）"
+    );
 }

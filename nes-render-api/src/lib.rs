@@ -75,5 +75,6 @@ pub use math::{Affine2, Rect, Vec2};
 pub use null::{NullRenderServer, ServerCounters};
 pub use server::RenderServer;
 pub use state::{
-    Camera2DState, ControlState, Flip, HAlign, LabelState, ListAxis, ListState, ScrollBar, VAlign,
+    Camera2DState, ControlState, Flip, HAlign, LabelState, ListAxis, ListState, NineSliceState,
+    ScrollBar, VAlign,
 };

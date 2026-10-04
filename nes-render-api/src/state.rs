@@ -486,3 +486,34 @@ impl ControlState {
         Rect::new(left, top, w, h)
     }
 }
+
+/// Control 的九宫格配置状态（S16.6；S16.7 增模态染色 / 平铺两个开关）。
+///
+/// 是 [`RenderCommand::SetNineSlice`](crate::command::RenderCommand::SetNineSlice)
+/// 的簿记载体（null 后端与 wgpu 后端同构持有），也是
+/// `set_nine_slice` 的语义合集 —— 四个字段随每帧全量快照照存照发。
+#[derive(Copy, Clone, PartialEq, Debug, Default)]
+pub struct NineSliceState {
+    /// 源纹理键；[`RenderAssetKey::NIL`] = 恒等记录（清除载体）。
+    pub texture: RenderAssetKey,
+    /// 源纹理切割边距 `[l, t, r, b]`（像素；负值照收 —— 钳制权威在
+    /// 渲染侧单处）。
+    pub margins: [f32; 4],
+    /// 模态染色（S16.7）：`true` = 九个实例的 tint 改取同条目
+    /// [`ControlState::fill`]（`fill_slot` 的既有解析载体）—— 灰阶/白图
+    /// 纹理 x 面板色 = 同一纹理多套配色；`false` = 中性白（纹理原色）。
+    pub modulate: bool,
+    /// 中间条平铺（S16.7）：`true` = 四边条与中心按源边距像素的原生
+    /// 尺寸平铺而非拉伸（角永远 1:1 不变）；`false` = 拉伸（既有行为）。
+    pub tiling: bool,
+}
+
+impl NineSliceState {
+    /// 恒等记录（清除载体）：NIL 键 + 零边距 + 两开关关闭。
+    pub const IDENTITY: Self = Self {
+        texture: RenderAssetKey::NIL,
+        margins: [0.0; 4],
+        modulate: false,
+        tiling: false,
+    };
+}
