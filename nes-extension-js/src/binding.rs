@@ -11,10 +11,19 @@
 //! nes.node.getName(ref)                   -> string | null           （需 "scene.read"）
 //! nes.input.isPressed(name)               -> bool                    （需 "input"）
 //! nes.audio.play(key, volume)             -> undefined               （需 "audio"）
-//! nes.registerExtension(id[, perms])      -> undefined   （扩展自报身份 + S17.3 权限声明；
-//!                                             缺省 perms = 全授予，声明期静态）
+//! nes.registerExtension(id[, perms[, opts]]) -> undefined（扩展自报身份 + S17.3 权限
+//!                                             声明；缺省 perms = 全授予，声明期静态；
+//!                                             S17.5 第三参 { strict: true } = 缺省
+//!                                             perms 改为全拒——default-deny 选入）
 //! nes.onUpdate(fn)                        -> undefined   （P0 单回调槽；fn 可为生成器函数
 //!                                             —— S17.3 C4 帧驱动协程）
+//! nes.util.{clamp,lerp,sign,dist,rand,randInt}  -> S17.5 C6 工具函数集（纯 JS；
+//!                                             rand/randInt 为**非确定性分区**——
+//!                                             扩展自行选入，引擎确定性承诺不覆盖）
+//! nes.storage.{get,set,has,remove,keys}   -> S17.5 C7 扩展级存储（本扩展 id 命名
+//!                                             空间；声明期自动创建；值域 = JSON 面；
+//!                                             生命周期 = 运行时会话）
+//! nes.storage.at(id)                      -> 显式跨扩展访问（同上下文互信模型）
 //! nes.onSignal(name, fn)                  -> undefined   （S17.2 注册 hat，需 "signal"；
 //!                                            同名多个 handler = 都调，注册序；fn 可为
 //!                                            生成器函数 —— 每次触发新建实例）
@@ -92,17 +101,44 @@ pub const COROUTINE_CAP: u32 = 32;
 ///   同一份 ExecBudget 预算。
 ///
 /// S17.3 B3 权限模型（声明期静态；裁决点 = 能力注入处的方法包装）：
-/// * `nes.registerExtension(id[, perms])`：第二参为权限名数组（如
+/// * `nes.registerExtension(id[, perms[, opts]])`：第二参为权限名数组（如
 ///   `["scene.read", "scene.write", "input", "audio", "signal"]`）——
-///   **缺省 = 全授予**（hello.js 兼容；Beta 后可切 default-deny）；
+///   **缺省 = 全授予**（hello.js 兼容）；S17.5 起第三参可选
+///   `{ strict: true }` = **default-deny 选入**：strict 模式下 perms 缺省
+///   从"全授予"变为"全拒"（声明了什么才有什么；显式数组两侧模式同义）；
 ///   空数组 = 全拒绝；未知名忽略（前向兼容）；注册期定死，运行期无提权；
 /// * `__nes_guard(cap, fn)`：逐调用裁决 —— 未授予抛
 ///   `Error("permission denied: <cap>")` → 既有 fault 隔离路径（不炸不静默）。
+///
+/// S17.5 C6 工具函数集（`nes.util.*`，bootstrap 内纯 JS —— 零 Rust 句柄）：
+/// * `clamp(v, min, max)` / `lerp(a, b, t)` / `sign(v)`：数学三件套
+///   （clamp 对 min > max 做交换 = 全函数；sign 返回 -1/0/1，NaN → 0）；
+/// * `dist(x1, y1, x2, y2)`：欧氏距离（shake.js 手搓 sqrt 的收编点）；
+/// * `rand(min, max)` / `randInt(min, max)`：均匀随机（randInt 含两端整数，
+///   两者对 min > max 均做交换）——**非确定性分区**：扩展自行选入，引擎
+///   核心确定性承诺（headless 基线/regression）不覆盖扩展内部随机。
+///
+/// S17.5 C7 扩展级存储（`nes.storage`，纯 JS —— 值留 JS 堆，Rust 零句柄）：
+/// * 声明期自动命名空间：`registerExtension(id, ...)` 即建
+///   `__nes_storage[String(id)]`（隔离单元 = 扩展 id；根表与各命名空间都用
+///   `Object.create(null)` —— `__proto__`/`constructor` 等键按普通属性处理，
+///   无原型链走私）；重复注册同 id 不清库（会话内幂等）；
+/// * 每 id 的 store 面：`get(key, defaultValue)`（缺省缺省值 = null）、
+///   `set(key, value)`、`has(key)`、`remove(key)`、`keys()`；
+/// * 值域 = JSON 可序列化面（NesValue 同族）：set 经 `JSON.stringify`
+///   试编码（函数/undefined/环 → 抛 TypeError，嵌套函数由 replacer 抓），
+///   入库值 = `JSON.parse` 重建的纯 JSON 面；get 返回深拷贝（改返回值不落
+///   库，也无法把活对象/函数走私进存储）；
+/// * `nes.storage.at(id)`：显式跨扩展访问（返回同款 store 面）——信任模型
+///   = 同上下文互信（隐私隔离归权限后续期）；
+/// * 生命周期 = **运行时会话**：上下文在即存续；扩展停用不清、运行时重建
+///   即清（落盘持久化归后续期）。
 pub const NES_BOOTSTRAP_JS: &str = r#"
 globalThis.__nes_signal_handlers = {};
 globalThis.__nes_coros = [];
 globalThis.__nes_coro_cap = 32;
 globalThis.__nes_grants = null;
+globalThis.__nes_storage = Object.create(null);
 globalThis.__nes_is_generator = function (v) {
   return v !== null && typeof v === "object" && typeof v.next === "function";
 };
@@ -155,6 +191,58 @@ globalThis.__nes_coro_drive = function () {
   globalThis.__nes_coros = keep;
   if (firstError !== null) { throw firstError; }
 };
+globalThis.__nes_store_methods = function (idOf) {
+  var slot = function () {
+    var s = globalThis.__nes_storage[idOf()];
+    return s === undefined ? null : s;
+  };
+  var ensure = function () {
+    var root = globalThis.__nes_storage;
+    var id = idOf();
+    if (root[id] === undefined) { root[id] = Object.create(null); }
+    return root[id];
+  };
+  return {
+    get: function (key, defaultValue) {
+      var s = slot();
+      if (s === null || !Object.prototype.hasOwnProperty.call(s, key)) {
+        return defaultValue === undefined ? null : defaultValue;
+      }
+      return JSON.parse(JSON.stringify(s[key]));
+    },
+    set: function (key, value) {
+      var text = JSON.stringify(value, function (k, v) {
+        if (typeof v === "function") {
+          throw new TypeError("storage: values must be JSON-serializable");
+        }
+        return v;
+      });
+      if (text === undefined) {
+        throw new TypeError("storage: values must be JSON-serializable");
+      }
+      ensure()[key] = JSON.parse(text);
+    },
+    has: function (key) {
+      var s = slot();
+      return s !== null && Object.prototype.hasOwnProperty.call(s, key);
+    },
+    remove: function (key) {
+      var s = slot();
+      if (s !== null) { delete s[key]; }
+    },
+    keys: function () {
+      var s = slot();
+      return s === null ? [] : Object.keys(s);
+    }
+  };
+};
+globalThis.__nes_own_store_id = function () {
+  var id = globalThis.__nes_extension_id;
+  if (id === undefined || id === null || id === "") {
+    throw new Error("storage: register the extension before using its own store");
+  }
+  return String(id);
+};
 globalThis.nes = {
   scene: { find: globalThis.__nes_guard("scene.read", globalThis.__nes_scene_find) },
   node: {
@@ -165,11 +253,44 @@ globalThis.nes = {
   },
   input: { isPressed: globalThis.__nes_guard("input", globalThis.__nes_input_is_pressed) },
   audio: { play: globalThis.__nes_guard("audio", globalThis.__nes_audio_play) },
-  registerExtension: function (id, perms) {
+  util: {
+    clamp: function (v, min, max) {
+      v = +v; min = +min; max = +max;
+      if (min > max) { var t = min; min = max; max = t; }
+      if (v < min) { return min; }
+      if (v > max) { return max; }
+      return v;
+    },
+    lerp: function (a, b, t) { return +a + (+b - +a) * +t; },
+    sign: function (v) { v = +v; return (v > 0) - (v < 0); },
+    dist: function (x1, y1, x2, y2) {
+      var dx = +x2 - +x1;
+      var dy = +y2 - +y1;
+      return Math.sqrt(dx * dx + dy * dy);
+    },
+    rand: function (min, max) {
+      min = +min; max = +max;
+      if (min > max) { var t = min; min = max; max = t; }
+      return min + Math.random() * (max - min);
+    },
+    randInt: function (min, max) {
+      min = +min; max = +max;
+      if (min > max) { var t = min; min = max; max = t; }
+      return Math.floor(min + Math.random() * (max - min + 1));
+    }
+  },
+  storage: globalThis.__nes_store_methods(globalThis.__nes_own_store_id),
+  registerExtension: function (id, perms, opts) {
     globalThis.__nes_extension_id = id;
-    globalThis.__nes_grants = (perms === undefined || perms === null)
-      ? null
-      : Array.from(perms, function (p) { return String(p); });
+    var strict = opts !== undefined && opts !== null && opts.strict === true;
+    if (perms === undefined || perms === null) {
+      globalThis.__nes_grants = strict ? [] : null;
+    } else {
+      globalThis.__nes_grants = Array.from(perms, function (p) { return String(p); });
+    }
+    var root = globalThis.__nes_storage;
+    var sid = String(id);
+    if (root[sid] === undefined) { root[sid] = Object.create(null); }
   },
   onUpdate: function (fn) { globalThis.__nes_update_hook = fn; },
   onSignal: globalThis.__nes_guard("signal", function (name, fn) {
@@ -186,6 +307,12 @@ globalThis.nes = {
 globalThis.__nes_set_extension_id = function (id) { globalThis.__nes_extension_id = id; };
 globalThis.__nes_get_extension_id = function () {
   return globalThis.__nes_extension_id === undefined ? null : globalThis.__nes_extension_id;
+};
+globalThis.nes.storage.at = function (id) {
+  if (id === undefined || id === null || id === "") {
+    throw new Error("storage.at: extension id required");
+  }
+  return globalThis.__nes_store_methods(function () { return String(id); });
 };
 globalThis.__nes_update = function () {
   globalThis.__nes_coro_drive();

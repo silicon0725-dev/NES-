@@ -20,6 +20,11 @@
 //!   （`onUpdate`/`onSignal` 处理器可为 `function*`，帧计数驱动，见
 //!   [`COROUTINE_CAP`]）与**权限守卫**（`registerExtension` 第二参
 //!   声明权限数组，能力调用逐调用裁决，未授予 = JS 异常走 fault 隔离）；
+//!   S17.5 再收三件纯 JS 小件：**工具函数集** `nes.util.*`（数学三件套 +
+//!   `dist` + 非确定性分区的 `rand`/`randInt`）、**扩展级存储**
+//!   `nes.storage`（声明期按 id 自动命名空间，值域 = JSON 面，生命周期 =
+//!   运行时会话）与 **default-deny 选入**（`registerExtension` 第三参
+//!   `{ strict: true }` —— strict 下 perms 缺省 = 全拒）；
 //! * [`JsExtension`] —— [`nes_extension_api::ExtensionLifecycle`] 的 JS
 //!   实现（update 钩子经全局蹦床转发到 JS 注册的回调）。
 //!

@@ -25,13 +25,16 @@
 //     a permission denial is caught and swallowed (games ship without
 //     audio assets -- sound is optional by design).
 //
-// Contract used (P0 frozen surface + S17.3 coroutine semantics):
+// Contract used (P0 frozen surface + S17.3 coroutine semantics + S17.5 C6):
 //   nes.registerExtension(id)       announce this extension
 //   nes.onUpdate(fn)                fn may be a generator function
 //   nes.scene.find(name)            -> node ref (opaque number) or null
 //   nes.node.getPos(ref)            -> [x, y] (tick-end snapshot)
 //   nes.node.setPos(ref, x, y)      queued write, lands same frame
 //   nes.audio.play(key, volume)     silent drop on unregistered key
+//   nes.util.dist(x1, y1, x2, y2)   Euclidean distance (S17.5 dogfooding:
+//                                   the hand-rolled Math.sqrt below was the
+//                                   motivating pain point for nes.util)
 nes.registerExtension("shake");
 
 var CONFIG = {
@@ -75,9 +78,7 @@ nes.onUpdate(function* () {
         if (ep === null) {
           continue;
         }
-        var dx = ep[0] - pp[0];
-        var dy = ep[1] - pp[1];
-        var d = Math.sqrt(dx * dx + dy * dy);
+        var d = nes.util.dist(pp[0], pp[1], ep[0], ep[1]);
         if (minD === null || d < minD) {
           minD = d;
         }
