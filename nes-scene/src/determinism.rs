@@ -4,8 +4,10 @@
 //!
 //! 进哈希的只有**语义状态**：树级（帧号/暂停/时间缩放）、按**前序**的
 //! 节点序列（名字/类型/父（前序下标）/本地变换（逐字段 f32 位形）/
-//! process_mode/生命周期位/属性表（BTreeMap 名序））、以及脚本局部
-//!（按节点前序、局部名 BTree 序）。
+//! process_mode/生命周期位/属性表（BTreeMap 名序））、脚本局部
+//!（按节点前序、局部名 BTree 序）、以及**位置补间登记表**（S16 起，
+//! 条件混入：登记表非空才摺进 —— 目标 uid + from/to/elapsed/duration
+//! 位形；无补间场景的指纹与旧口径逐位相同）。
 //!
 //! **绝不进**：GPU 句柄、指针、分配地址、HashMap 迭代布局、HWND、
 //! 时间戳 —— 那些是"机器一样才相同"的伪确定性。世界变换缓存不进
@@ -182,6 +184,33 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
             }
         }
         h = mix(h, b"|"); // 节点分隔
+    }
+
+    // 补间登记表（S16 第 1 期）—— **条件混入**：补间是游戏可见状态
+    //（每 tick 直写节点 local），登记表本身必须可复现、进指纹；但采样
+    // 面做成"有补间才摺进" —— 无补间的场景（登记表空）零混入，既有
+    // 基线指纹逐位不变（S16 冻结：基线漂移即为实现错误）。
+    // 字段口径：目标锚定 **uid**（与节点身份同源 —— 句柄位形/gen 是
+    // allocator 历史不进指纹；死目标按全 1 位形规范 Dead 态如实混入，
+    // 推进阶段理应已自动清，这里是防御口径）；from/to/elapsed/duration
+    // 取位形（f32/f64 逐位 —— 与本地变换同一口径）。
+    let tweens = tree.tweens();
+    if !tweens.is_empty() {
+        h = mix(h, b"tweens");
+        h = mix(h, &tweens.len().to_le_bytes());
+        for tw in tweens {
+            let target_uid: [u8; 16] = tree
+                .uid_of(tw.target.to_id())
+                .map(|u| u.bits())
+                .unwrap_or([0xFF; 16]);
+            h = mix(h, &target_uid);
+            h = mix(h, &tw.from.x.to_bits().to_le_bytes());
+            h = mix(h, &tw.from.y.to_bits().to_le_bytes());
+            h = mix(h, &tw.to.x.to_bits().to_le_bytes());
+            h = mix(h, &tw.to.y.to_bits().to_le_bytes());
+            h = mix(h, &tw.elapsed_ms.to_bits().to_le_bytes());
+            h = mix(h, &tw.duration_ms.to_bits().to_le_bytes());
+        }
     }
     h
 }

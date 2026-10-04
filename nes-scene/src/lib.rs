@@ -113,6 +113,6 @@ pub use transaction::{NodeData2, SceneTransaction, SubtreeSnapshot, TransactionL
 pub use tree::{Uid,
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, Observers, ProcessMode, SceneObserver,
     SceneTree, Signal, SignalConnection, SignalConnectionId, SignalCtx, SignalFilter,
-    SignalHandler, TickStats, TreeEvent, TreeOp, VideoCmd, SIGNAL_DELIVERY_CAP,
+    SignalHandler, TickStats, TreeEvent, TreeOp, Tween, VideoCmd, SIGNAL_DELIVERY_CAP,
 };
 pub use value::{Value, ValueType};

@@ -1,0 +1,54 @@
+// S16 动画补间第 1 期 harness：tween_demo。
+//
+// 左侧蓝色方块 = 引擎位置补间（tween_pos，脚本只在到站时换程）；
+// 红色标记 = 手写逐帧步进对照（on "tick" 里累加，真实项目旧写法）。
+// 方向键/WASD 移动红色标记。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/tween_box.bmp", kind: "Texture"),
+        Res(id: 2, path: "Textures/manual_tri.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "box",
+                kind: "Sprite2D",
+                local: (x: 8.0, y: 40.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
+                name: "tri",
+                kind: "Sprite2D",
+                local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(2), },
+                children: [],
+            ),
+            // 方块脑（process 入口）：到站才换程 —— 每帧重发会被 last-wins
+            // 替换成"从当前位置重走全程"，永不进站（语义见 S16 文档 §1）。
+            Node(
+                name: "box_brain",
+                kind: "Script",
+                props: { "source": "init { dir = 0 }\nevery { if dir < 1 { dir = 1; tween_pos \"box\" 360.0 40.0 1500 }; if dir == 1 { if node(\"box\").pos.x > 354.0 { dir = 2; tween_pos \"box\" 8.0 40.0 1500 } }; if dir == 2 { if node(\"box\").pos.x < 10.0 { dir = 1; tween_pos \"box\" 360.0 40.0 1500 } } }" },
+                children: [],
+            ),
+            // 标记脑（信号入口）：手写逐帧步进对照（真实项目旧写法）——
+            // 跨节点写在信号入口合法；两入口同权也顺带被这个 demo 覆盖。
+            Node(
+                name: "tri_brain",
+                kind: "Script",
+                props: { "source": "init { x = tri.pos.x; y = tri.pos.y }\non \"tick\" { if key(\"ArrowRight\") { x = x + 140.0 * arg }; if key(\"ArrowLeft\") { x = x - 140.0 * arg }; if key(\"ArrowDown\") { y = y + 140.0 * arg }; if key(\"ArrowUp\") { y = y - 140.0 * arg }; if x < 8.0 { x = 8.0 }; if x > 368.0 { x = 368.0 }; if y < 8.0 { y = 8.0 }; if y > 200.0 { y = 200.0 }; tri.pos = xy(x, y) }" },
+                children: [],
+            ),
+        ],
+    ),
+)

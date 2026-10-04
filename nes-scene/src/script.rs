@@ -177,6 +177,28 @@ pub enum Op {
         /// 视频键。
         key: String,
     },
+    /// 位置补间（S16 第 1 期）：`tween_pos "name" x y ms` 的编译产物。
+    ///
+    /// 栈交互：先压 x、y、ms 三个表达式（各自独立求值，编译序 = 源序），
+    /// 本指令按**弹序 ms、y、x** 消费（须全为数值）；目标 `name` 是编译期
+    /// 常量，运行时按 NodeByName 语义解析（找不到 = 停机记录，照既有纪律）。
+    /// 执行 = 经 [`VmCtx::tween_pos`] 发 [`crate::tree::Cmd::TweenPos`] 入
+    /// 既有 Cmd 流 —— 登记表是树状态，Cmd 直接落地（不走单帧取走缓冲）；
+    /// `from` 在 Cmd 落地时采样该节点当前 local pos（S16 §1 冻结）。
+    /// 字面量 `ms <= 0` 在**解析期**报错（T-TW-04）；运行时算出的非法值由
+    /// 树侧拒收（不落地、不停机 —— 与属性写错静默同家法）。
+    TweenPos {
+        /// 目标节点名（NodeByName 语义）。
+        name: String,
+    },
+    /// 停止位置补间（S16）：`tween_stop "name"` 的编译产物。**零栈交互**
+    ///（照 `play` 形态）；执行 = 经 [`VmCtx::tween_stop`] 发
+    /// [`crate::tree::Cmd::TweenStop`]，位置停在当前值。目标解析同上
+    ///（找不到 = 停机记录 —— 目标名写错应如实暴露，与 tween_pos 一致）。
+    TweenStop {
+        /// 目标节点名（NodeByName 语义）。
+        name: String,
+    },
 }
 
 /// 脚本入口。
@@ -290,6 +312,23 @@ impl VmCtx<'_, '_> {
         match self {
             VmCtx::Node(c) => c.video_stop(key),
             VmCtx::Signal(c) => c.video_stop(key),
+        }
+    }
+
+    /// 位置补间（S16 第 1 期）：两入口同权（照 `play_sound` 的口径 ——
+    /// 补间走树侧登记表，不碰"process 只写自身"纪律的形状面）。
+    fn tween_pos(&mut self, node: NodeId, to: Vec2, duration_ms: f64) {
+        match self {
+            VmCtx::Node(c) => c.tween_pos(node, to, duration_ms),
+            VmCtx::Signal(c) => c.tween_pos(node, to, duration_ms),
+        }
+    }
+
+    /// 停止位置补间（S16）：两入口同权。
+    fn tween_stop(&mut self, node: NodeId) {
+        match self {
+            VmCtx::Node(c) => c.tween_stop(node),
+            VmCtx::Signal(c) => c.tween_stop(node),
         }
     }
 }
@@ -839,6 +878,31 @@ fn run<'a, 'b>(
             Op::VideoStop { key } => {
                 ctx.video_stop(key);
             }
+            Op::TweenPos { name } => {
+                // tween_pos "name" x y ms（S16 第 1 期）：弹序 ms、y、x
+                //（压序 x、y、ms —— 编译序 = 源序）。三个分量都须数值
+                //（I64/F32 提升）；目标按 NodeByName 语义解析，找不到
+                // 停机记录（照既有纪律）。duration 的非法值（<= 0/非有限）
+                // 由树侧落地处拒收（不停机 —— 与属性写错静默同家法）。
+                let ms = pop_val!();
+                let yv = pop_val!();
+                let xv = pop_val!();
+                let (Some(x), Some(y), Some(ms)) = (num_of(&xv), num_of(&yv), num_of(&ms))
+                else {
+                    halt!("tween_pos 需要数值 x y ms");
+                };
+                let Some(node) = ctx.tree().find_by_name(name) else {
+                    halt!(format!("tween_pos(\"{name}\") 找不到该名节点"));
+                };
+                ctx.tween_pos(node, Vec2::new(x, y), ms as f64);
+            }
+            Op::TweenStop { name } => {
+                // tween_stop "name"（S16）：零栈交互，目标解析同 TweenPos。
+                let Some(node) = ctx.tree().find_by_name(name) else {
+                    halt!(format!("tween_stop(\"{name}\") 找不到该名节点"));
+                };
+                ctx.tween_stop(node);
+            }
         }
         pc += 1;
     }
@@ -1366,6 +1430,8 @@ impl SceneObserver for ScriptVm {
 //     if 2 < n { emit "done" n }     // 条件（无 else；比较单级）
 //     emit "tick" (1.0, 0.0)         // 发射（名 + 载荷；Vec2 字面量仅数字）
 //     play "boom"                    // 播放声音（S13 第 2 期；语句级，无载荷）
+//     tween_pos "box" 360 40 1500    // 位置补间（S16；x/y/ms 各一表达式）
+//     tween_stop "box"               // 停止补间（位置停在当前值）
 // }
 // ```
 //
@@ -1647,9 +1713,9 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 18] = [
+const RESERVED: [&str; 20] = [
     "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
-    "arg", "this", "true", "false", "play", "video_play", "video_stop",
+    "arg", "this", "true", "false", "play", "video_play", "video_stop", "tween_pos", "tween_stop",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -2189,6 +2255,46 @@ impl TextParser {
                 self.pos += 1;
                 let key = self.expect_str()?;
                 ops.push(Op::VideoStop { key });
+                Ok(())
+            }
+            // tween_pos 语句（S16 第 1 期）：`tween_pos "name" x y ms` ——
+            // 目标名是编译期常量（照 play 的解析样式）；x/y/ms 各是独立
+            // 表达式（运行时求值，arg/局部都可用），压序 = 源序。字面量
+            // ms <= 0（含一元负号形态）在**解析期**如实报错（T-TW-04）；
+            // 非字面量的非法值由树侧落地处拒收（运行时兜底）。
+            Tok::Ident(k) if k == "tween_pos" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                self.expr(ops)?; // x
+                self.expr(ops)?; // y
+                let ms_at = ops.len();
+                self.expr(ops)?; // ms
+                // 解析期字面量检查：单条 Const 或 `0 - n` 一元负号脱糖形态。
+                let lit_ms = match &ops[ms_at..] {
+                    [Op::Const(Value::I64(i))] => Some(*i as f64),
+                    [Op::Const(Value::F32(f))] => Some(*f as f64),
+                    [Op::Const(Value::I64(0)), Op::Const(Value::I64(n)), Op::Sub] => {
+                        Some(-(*n as f64))
+                    }
+                    [Op::Const(Value::I64(0)), Op::Const(Value::F32(f)), Op::Sub] => {
+                        Some(-(*f as f64))
+                    }
+                    _ => None,
+                };
+                if let Some(ms) = lit_ms {
+                    if ms <= 0.0 {
+                        return Err(self.err_here(format!("tween_pos 的 ms 必须 > 0（得到 {ms}）")));
+                    }
+                }
+                ops.push(Op::TweenPos { name });
+                Ok(())
+            }
+            // tween_stop 语句（S16）：`tween_stop "name"` —— 与 play 同一
+            // 解析样式（语句级关键字 + 字符串字面量；零栈交互）。
+            Tok::Ident(k) if k == "tween_stop" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                ops.push(Op::TweenStop { name });
                 Ok(())
             }
             // push/pop 语句（S8.2b-2）：读-改-写局部绑定（变异的是绑定，

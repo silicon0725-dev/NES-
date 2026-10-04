@@ -17,11 +17,13 @@
 //!
 //! ```text
 //! tick(delta)
-//!   ├─ 1. apply_pending     结构变更统一落地（上一帧累积的全部 TreeOp）
-//!   ├─ 2. enter_tree        自顶向下，仅新入树节点
-//!   ├─ 3. ready             自底向上（逆前序），仅新就绪节点
-//!   ├─ 4. process           自顶向下，全树
-//!   └─ 5. flush_transforms  脏传播 → 世界矩阵
+//!   ├─ 1.    apply_pending     结构变更统一落地（上一帧累积的全部 TreeOp）
+//!   ├─ 1.5  timer 递减        每节点倒计时（S10-1）
+//!   ├─ 1.75 tween 推进        位置补间直写 local（S16；先于一切脚本）
+//!   ├─ 2.    enter_tree        自顶向下，仅新入树节点
+//!   ├─ 3.    ready             自底向上（逆前序），仅新就绪节点
+//!   ├─ 4.    process           自顶向下，全树
+//!   └─ 5.    flush_transforms  脏传播 → 世界矩阵
 //! ```
 //!
 //! 回调里发起的结构变更一律进入**下一帧**的 `pending`，因此本帧的遍历序列
@@ -30,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use crate::identity::{Arena, NodeId};
+use crate::identity::{Arena, NodeHandle, NodeId};
 use crate::node::{NodeKind, NodeKindTag};
 use crate::path::{NodePath, PathSeg};
 use crate::props::{PropError, PropStore};
@@ -461,6 +463,30 @@ pub enum Cmd {
         /// 视频键。
         key: String,
     },
+    /// 请求对目标节点发起一次位置补间（S16 第 1 期；`tween_pos "name" x y ms`
+    /// 的编译产物）。
+    ///
+    /// 与 PlaySound/VideoPlay 的"树无法解释才外送"不同：补间登记表本来
+    /// 就是树状态 —— 本命令**直接操作登记表**（不走单帧取走缓冲）。
+    /// `from` 不随命令携带：落地时（apply 阶段）采样该节点**当前实际
+    /// local pos** 作起点 —— 同帧先推进后落命令时，起点含本帧推进，
+    /// last-wins 换程不跳变（S16 §1 冻结的采样时机）。
+    TweenPos {
+        /// 目标节点（命令发射时已按名解析；落地时查无即静默丢弃 ——
+        /// 与 `SetLocal` 对死节点同口径）。
+        node: NodeId,
+        /// 终点（local pos）。
+        to: Vec2,
+        /// 时长毫秒（<= 0 的请求落地处拒收：非法请求不落地，不编造
+        /// "瞬时移动"语义 —— 解析期字面量已报错，这里是运行时兜底）。
+        duration_ms: f64,
+    },
+    /// 请求移除目标节点的位置补间（S16；`tween_stop "name"` 的编译产物）。
+    /// 位置停在当前值（登记丢弃，local 不动）。
+    TweenStop {
+        /// 目标节点。
+        node: NodeId,
+    },
 }
 
 /// 行为代码看到的树句柄：**只读树 + 命令缓冲**。
@@ -614,6 +640,24 @@ impl<'a> NodeCtx<'a> {
     /// 请求停止播放一个视频（S15）：入既有 Cmd 流（[`Cmd::VideoStop`]）。
     pub fn video_stop(&mut self, key: &str) {
         self.cmds.push(Cmd::VideoStop { key: key.to_string() });
+    }
+
+    /// 对任意节点发起一次位置补间（S16 第 1 期）：入既有 Cmd 流
+    ///（[`Cmd::TweenPos`]）。补间不写树形状、只推 local —— 与"process
+    /// 入口只写自身"的 SetT 纪律不同权：本命令走登记表（树状态），
+    /// 两入口同权（照 play/emit 口径）。`from` 在 Cmd 落地时采样。
+    pub fn tween_pos(&mut self, node: NodeId, to: Vec2, duration_ms: f64) {
+        self.cmds.push(Cmd::TweenPos {
+            node,
+            to,
+            duration_ms,
+        });
+    }
+
+    /// 移除任意节点的位置补间（S16）：入既有 Cmd 流（[`Cmd::TweenStop`]），
+    /// 位置停在当前值。两入口同权。
+    pub fn tween_stop(&mut self, node: NodeId) {
+        self.cmds.push(Cmd::TweenStop { node });
     }
 }
 
@@ -830,6 +874,21 @@ impl<'a> SignalCtx<'a> {
     pub fn video_stop(&mut self, key: &str) {
         self.cmds.push(Cmd::VideoStop { key: key.to_string() });
     }
+
+    /// 对任意节点发起一次位置补间（S16 第 1 期；与 [`NodeCtx::tween_pos`]
+    /// 同一条 Cmd 通道 —— 信号入口照发不误）。
+    pub fn tween_pos(&mut self, node: NodeId, to: Vec2, duration_ms: f64) {
+        self.cmds.push(Cmd::TweenPos {
+            node,
+            to,
+            duration_ms,
+        });
+    }
+
+    /// 移除任意节点的位置补间（S16；与 [`NodeCtx::tween_stop`] 同通道）。
+    pub fn tween_stop(&mut self, node: NodeId) {
+        self.cmds.push(Cmd::TweenStop { node });
+    }
 }
 
 /// 空观察者：宿主没有行为代码时的缺省。
@@ -1008,6 +1067,14 @@ pub struct SceneTree {
     /// [`Self::take_video_cmds`] 取走转交渲染侧播放状态机。不进语义
     /// 指纹；无人取走即自然蒸发。
     video_cmds: Vec<VideoCmd>,
+    /// 位置补间登记表（S16 第 1 期）：按登记序的 [`Tween`] 列表。
+    ///
+    /// 与 `played_sounds`/`video_cmds` 的取走缓冲**不同家**：补间是
+    /// **游戏可见状态**（每 tick 直写节点 local），登记表本身是树状态
+    /// —— 进语义指纹（条件混入：有补间才摺进哈希）、不进序列化
+    ///（会话态：保存时进行中的补间丢弃，位置字段已是最新，无损）。
+    /// last-wins：同一目标的重复登记前者被替换；目标死亡自动清。
+    tweens: Vec<Tween>,
 }
 
 /// 视频控制命令（S15）：[`SceneTree::take_video_cmds`] 取走缓冲的元素。
@@ -1024,6 +1091,38 @@ pub enum VideoCmd {
         /// 视频键。
         key: String,
     },
+}
+
+/// 一次进行中的**位置补间**（S16 第 1 期）：把 `target` 的本地平移从
+/// `from` 线性推向 `to`，时长 `duration_ms`。
+///
+/// # 语义冻结（S16 §1）
+///
+/// - **游戏可见状态**：补间登记表是树状态（与音频/视频的"渲染侧、
+///   不进指纹"不同）—— 推进发生在 [`SceneTree::tick`] 的专属阶段
+///   （结构落地后、`enter` 前），每 tick 直写节点 local（经
+///   [`SceneTree::set_local`] 脏标记路径，世界矩阵照常冲洗），并
+///   **全程进语义指纹**（同 tick 同轨迹必同结果）；
+/// - **last-wins**：同一目标节点的已有位置补间被新补间替换，新起点
+///   = 落地时该节点的**当前实际位置**（不跳变）；
+/// - `target` 是 [`NodeHandle`]（临时句柄）：结构变更后每 tick resolve，
+///   失败即移除 —— 死节点的补间自动清，不悬挂；
+/// - 时满（`t >= 1`）落位 `to` 并移除登记 —— 同帧脚本可读到终值
+///   （推进阶段在 process 之前）；
+/// - **会话态**：不进 RON 往返（保存时进行中的补间丢弃；位置字段
+///   已是最新值，无损）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tween {
+    /// 目标节点（句柄形态：每 tick 经 arena resolve，失败自动清）。
+    pub target: NodeHandle,
+    /// 起点（登记落地时该节点的当前 local pos）。
+    pub from: Vec2,
+    /// 终点。
+    pub to: Vec2,
+    /// 已推进毫秒数。
+    pub elapsed_ms: f64,
+    /// 总时长毫秒数（<= 0 的请求在落地处拒收，不会出现在登记表里）。
+    pub duration_ms: f64,
 }
 
 impl SceneTree {
@@ -1068,6 +1167,7 @@ impl SceneTree {
             time_scale: 1.0,
             played_sounds: Vec::new(),
             video_cmds: Vec::new(),
+            tweens: Vec::new(),
         }
     }
 
@@ -1167,6 +1267,12 @@ impl SceneTree {
     /// 待落地的结构变更数。
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// 位置补间登记表（只读视图，登记序）。语义指纹按此采样；宿主/
+    /// 编辑器检视同入口。会话态：不进序列化（见 [`Tween`] 文档）。
+    pub fn tweens(&self) -> &[Tween] {
+        &self.tweens
     }
 
     // ---------- 遍历 ----------
@@ -1857,6 +1963,56 @@ impl SceneTree {
             }
         }
 
+        // 生效 delta（time_scale 只乘 delta，不改遍历次数 —— 与 process
+        // 同一口径；补间的"游戏时间"也走这条缩放，确定性与语义都一致）。
+        let scaled_delta = delta * self.time_scale;
+
+        // 1.75 位置补间推进（S16 第 1 期，专属阶段：结构落地后、enter/process
+        //     之前）。补间是游戏可见状态：每 tick 直写目标节点 local（经
+        //     [`Self::set_local`] 脏标记路径，世界矩阵照常在阶段 6 冲洗），
+        //     并全程进语义指纹 —— 同 tick 同轨迹必同结果。
+        //     - 死目标（arena 查无/代际失效）：resolve 失败即移除（自动清）；
+        //     - t >= 1：落位 `to` 并移除登记 —— 本帧 process/信号读到的
+        //       就是终值（推进先于脚本）；
+        //     - 时间口径：`elapsed += delta * time_scale * 1000`（毫秒）；
+        //       v1 冻结面不受暂停门控（补间不是 process 派发，是引擎推进
+        //       阶段；暂停交互归后续里程碑 —— S16 文档 §5）。
+        if !self.tweens.is_empty() {
+            let dt_ms = scaled_delta as f64 * 1000.0;
+            let mut i = 0usize;
+            while i < self.tweens.len() {
+                let (target, from, to, elapsed_ms, duration_ms) = {
+                    let tw = &self.tweens[i];
+                    (tw.target, tw.from, tw.to, tw.elapsed_ms, tw.duration_ms)
+                };
+                let id = target.to_id();
+                // 死节点补间自动清（NodeHandle resolve 失败）。
+                if self.nodes.get(id).is_none() {
+                    self.tweens.remove(i);
+                    continue;
+                }
+                let elapsed_ms = elapsed_ms + dt_ms;
+                let t = (elapsed_ms / duration_ms).clamp(0.0, 1.0);
+                let mut local = self.nodes.get(id).map(|n| n.local).unwrap_or_default();
+                if t >= 1.0 {
+                    // 时满落位终值并移除（同帧脚本可读终值）。
+                    local.pos = to;
+                    self.set_local(id, local);
+                    self.tweens.remove(i);
+                    continue;
+                }
+                // 位置 = lerp(from, to, t)（f32 域，与 local 同精度）。
+                let tf = t as f32;
+                local.pos = Vec2::new(
+                    from.x + (to.x - from.x) * tf,
+                    from.y + (to.y - from.y) * tf,
+                );
+                self.set_local(id, local);
+                self.tweens[i].elapsed_ms = elapsed_ms;
+                i += 1;
+            }
+        }
+
         // 2. enter_tree（自顶向下）
         for id in self.preorder() {
             let need = self
@@ -1928,7 +2084,6 @@ impl SceneTree {
         //      逻辑与结构变更仍可做）；Disabled 永不派发；
         //    - 生命周期（enter/ready）与结构变更不受暂停影响 —— 暂停期间 UI
         //      不能僵死，结构照常落地。
-        let scaled_delta = delta * self.time_scale;
         let paused = self.paused;
         for id in self.preorder() {
             let dispatch_delta = match self.effective_process_mode(id) {
@@ -2163,6 +2318,42 @@ impl SceneTree {
             }
             Cmd::VideoStop { key } => {
                 self.video_cmds.push(VideoCmd::Stop { key });
+            }
+            Cmd::TweenPos {
+                node,
+                to,
+                duration_ms,
+            } => {
+                // 补间登记（S16 第 1 期）：登记表是树状态，Cmd 直接操作 ——
+                // 不走单帧取走缓冲（与 PlaySound/VideoPlay 的"树无法解释才
+                // 外送"不同）。
+                // - `from` 在**落地时**采样（本命令的冻结选择）：apply 发生在
+                //   命令发射后的当下（回调 Cmd 即刻落地），此时该节点的 local
+                //   含本帧补间推进（推进阶段 1.75 先于 process/信号泵）——
+                //   last-wins 换程从当前实际位置起算，不跳变；
+                // - 死节点：静默丢弃（与 SetLocal 同口径）；
+                // - duration <= 0：拒收（解析期字面量已报错，这里兜底运行时
+                //   非法值 —— 非法请求不落地，不编造"瞬时移动"）。
+                if duration_ms <= 0.0 || !duration_ms.is_finite() {
+                    return;
+                }
+                let Some(nd) = self.nodes.get(node) else {
+                    return;
+                };
+                let from = Vec2::new(nd.local.pos.x, nd.local.pos.y);
+                // last-wins：同目标已有补间先移除，再按登记序追加。
+                self.tweens.retain(|tw| tw.target != NodeHandle::of(node));
+                self.tweens.push(Tween {
+                    target: NodeHandle::of(node),
+                    from,
+                    to,
+                    elapsed_ms: 0.0,
+                    duration_ms,
+                });
+            }
+            Cmd::TweenStop { node } => {
+                // 停补间：登记丢弃，位置停在当前值（local 不动）。
+                self.tweens.retain(|tw| tw.target != NodeHandle::of(node));
             }
         }
     }
