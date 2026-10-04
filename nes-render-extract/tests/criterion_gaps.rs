@@ -221,6 +221,9 @@ fn kind_of(cmd: &RenderCommand) -> &'static str {
         // S16.2（图集帧动画）新增的 SetUv：同上 —— 只补枚举臂恢复可编译，
         // 仅图集模式激活的精灵才推（criterion_extract 的 sheet 用例专钉）。
         RenderCommand::SetUv { .. } => "set_uv",
+        // S16.3（精灵锚点）新增的 SetPivot：同上 —— 只补枚举臂恢复可编译，
+        // 仅非 (0,0) 锚点的精灵才推（criterion_extract 的 pivot 用例专钉）。
+        RenderCommand::SetPivot { .. } => "set_pivot",
     }
 }
 

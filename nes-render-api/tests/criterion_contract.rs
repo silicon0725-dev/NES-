@@ -706,3 +706,59 @@ fn criterion_contract_set_uv_bookkeeping_and_order() {
     );
     assert!(server.uv_of(handle).is_none());
 }
+
+/// S16.3（精灵锚点）：`set_pivot` 的 null 簿记 —— 同键覆写、未知句柄静默
+/// 忽略、销毁随条目清理、输出序恒在 `SetUv` 之后（与 wgpu 后端严格同序；
+/// 照 SetTint/SetUv 先例三同构的契约侧锚点）。
+#[test]
+fn criterion_contract_set_pivot_bookkeeping_and_order() {
+    let mut server = NullRenderServer::new();
+    let handle = server.create_item(RenderAssetKey::from_parts(7, 1));
+
+    // 同键覆写：后写者生效；未知句柄静默忽略（计数器可观测）。
+    server.set_pivot(handle, [0.5, 0.5]);
+    server.set_pivot(handle, [0.0, 1.0]);
+    server.set_pivot(ItemHandle::from_raw(999), [1.0, 1.0]);
+    assert_eq!(server.pivot_of(handle), Some(&[0.0, 1.0]));
+    assert!(server.pivot_of(ItemHandle::from_raw(999)).is_none());
+    let ignored_before = server.counters().ignored_ops;
+    assert_eq!(ignored_before, 1, "未知句柄恰好被计一次忽略");
+
+    // 无簿记时不产生命令：先在另一条目上验证"无记录 = 无平移"的命令流面。
+    let commands = server.submit(&FrameInfo::default());
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::SetPivot { .. })),
+        "有 pivot 簿记的条目按快照重发 SetPivot"
+    );
+
+    // 输出序：SetPivot 恒在 SetUv 之后、SetUv 恒在 SetTint 之后、Submit 收尾
+    //（每渲染物属性流序的冻结口径）。
+    server.set_tint(handle, [255, 255, 255, 255]);
+    server.set_uv(handle, [0.0, 0.0, 1.0, 1.0]);
+    let commands = server.submit(&FrameInfo::default());
+    let tint_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetTint { .. }));
+    let uv_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetUv { .. }));
+    let pivot_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetPivot { .. }));
+    assert!(tint_at.is_some() && uv_at.is_some() && pivot_at.is_some());
+    assert!(uv_at > tint_at, "SetUv 恒在 SetTint 之后");
+    assert!(pivot_at > uv_at, "SetPivot 恒在 SetUv 之后");
+
+    // 销毁：pivot 随条目消亡（命令流里不再出现）。
+    server.destroy_item(handle);
+    let commands = server.submit(&FrameInfo::default());
+    assert!(
+        commands
+            .iter()
+            .all(|c| !matches!(c, RenderCommand::SetPivot { .. })),
+        "销毁后命令流不再出现 SetPivot"
+    );
+    assert!(server.pivot_of(handle).is_none());
+}

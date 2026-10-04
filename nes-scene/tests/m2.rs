@@ -106,7 +106,10 @@ fn criterion_1_properties_are_reflectable() {
             //（协议内枚举面扩展，同 S16.1 alpha 先例）。
             "sheet_cols",
             "sheet_rows",
-            "frame"
+            "frame",
+            // S16.3 加性 schema（精灵锚点）：缺省 (0,0) = 左上角锚定的
+            // 既有行为（同 alpha/sheet 先例的协议内枚举面扩展）。
+            "pivot"
         ]
     );
 

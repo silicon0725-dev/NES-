@@ -29,7 +29,8 @@ use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 ///    `SetText`）→（List 则追加 `SetList`）→（Control 则追加 `SetRect`，随后
 ///    **按需**追加 `SetClip` —— 裁剪恒在 `SetRect` 之后）→（有 tint 簿记则
 ///    追加 `SetTint`，S16.1 —— 恒在 `SetClip` 之后）→（有 uv 簿记则追加
-///    `SetUv`，S16.2 —— 恒在 `SetTint` 之后）→ `Submit`；
+///    `SetUv`，S16.2 —— 恒在 `SetTint` 之后）→（有 pivot 簿记则追加
+///    `SetPivot`，S16.3 —— 恒在 `SetUv` 之后）→ `Submit`；
 /// 6. **属性流是全量快照**：不做"仅变化时推送"的增量省略，后端无需维护跨帧 diff。
 ///
 /// # 对象安全
@@ -101,6 +102,18 @@ pub trait RenderServer {
     /// - 输出序恒在对应条目的 `set_tint` 之后；
     /// - 后端只在注册表精灵分支消费（图集格 / 字形 / 控件路径不受影响）。
     fn set_uv(&mut self, handle: ItemHandle, rect: [f32; 4]);
+
+    /// 设置精灵锚点（S16.3 精灵锚点；归一化锚点 `[px, py]`，0..1 相对
+    /// 精灵矩形）。
+    ///
+    /// - 语义 = 精灵四边形在**变换前的局部空间**平移 `-pivot × 16px 基准格`
+    ///   （`world ∘ translation`），旋转/缩放/位置因此以锚点为基准
+    ///   （`(0.5, 0.5)` = 中心锚定）；`[0, 0]` = 零平移 = 既有行为恒等；
+    /// - 同键覆写（全量快照/跨帧幂等）；条目销毁时随条目消亡；
+    /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
+    /// - 输出序恒在对应条目的 `set_uv` 之后；
+    /// - 后端只在注册表精灵分支消费（无记录 = 无平移，逐位同基线）。
+    fn set_pivot(&mut self, handle: ItemHandle, pivot: [f32; 2]);
 
     /// 生成本帧命令序列写入 `out`（**先清空** `out`）。
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>);

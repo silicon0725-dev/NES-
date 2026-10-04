@@ -236,6 +236,10 @@ pub struct WgpuRenderServer {
     /// 同键覆写、销毁移除；`submit_into` 在对应条目的 `SetTint` 之后追加
     /// `SetUv`。无记录 = 整瓦片采样（既有行为逐位不变）。
     uvs: BTreeMap<ItemHandle, [f32; 4]>,
+    /// 精灵锚点簿记（S16.3，与 `NullRenderServer` 同构）：同键覆写、
+    /// 销毁移除；`submit_into` 在对应条目的 `SetUv` 之后追加 `SetPivot`。
+    /// 无记录 = 无平移（既有行为逐位不变）。
+    pivots: BTreeMap<ItemHandle, [f32; 2]>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
 }
@@ -296,6 +300,7 @@ impl RenderServer for WgpuRenderServer {
         self.clips.remove(&handle);
         self.tints.remove(&handle);
         self.uvs.remove(&handle);
+        self.pivots.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
     }
 
@@ -380,6 +385,16 @@ impl RenderServer for WgpuRenderServer {
         self.uvs.insert(handle, rect);
     }
 
+    fn set_pivot(&mut self, handle: ItemHandle, pivot: [f32; 2]) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1 口径）。
+            return;
+        }
+        // 同键覆写（全量快照语义，S16.3 精灵锚点；`[0,0]` 也照存 ——
+        // 零平移 = 恒等，迁移帧"补推清除"走的就是它）。
+        self.pivots.insert(handle, pivot);
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空（契约 I3：缓冲跨帧复用，不留上一帧残留）。
         out.clear();
@@ -459,6 +474,15 @@ impl RenderServer for WgpuRenderServer {
                     rect: *rect,
                 });
             }
+            // 精灵锚点（S16.3）：恒在 SetUv 之后（契约 I5 顺序冻结；与
+            // `NullRenderServer` 严格同序）。仅当该条目存在 pivot 簿记时
+            // 追加 —— 无记录 = 无平移，命令流与既有路径逐条相同。
+            if let Some(pivot) = self.pivots.get(&item.handle) {
+                out.push(RenderCommand::SetPivot {
+                    handle: item.handle,
+                    pivot: *pivot,
+                });
+            }
         }
 
         // 5) 帧结束标记（契约 I3：末条必为 Submit）。
@@ -479,7 +503,7 @@ pub struct FrameStats {
     pub destroys: u64,
     /// 命中已知句柄的属性命令数（`SetTransform` / `SetFlip` / `SetZ` /
     /// `SetVisible` / `SetText` / `SetList` / `SetRect` / `SetClip` /
-    /// `SetTint` / `SetUv`）。
+    /// `SetTint` / `SetUv` / `SetPivot`）。
     pub updates: u64,
     /// 因空句柄 / 未知句柄被静默忽略的命令数（契约 I1 的可观测计数）。
     pub ignored: u64,
@@ -527,7 +551,8 @@ impl FrameOutcome {
 pub struct SpriteInstance {
     /// 渲染物句柄（不进 GPU，仅供帧对账与诊断）。
     pub handle: ItemHandle,
-    /// 世界矩阵（`transform ∘ flip`，契约 I8），展平为 `[a, b, c, d, tx, ty]`。
+    /// 世界矩阵（`transform ∘ flip`，契约 I8；有 SetPivot 簿记时再后乘
+    /// 局部平移 `-pivot × 16px`，S16.3），展平为 `[a, b, c, d, tx, ty]`。
     pub world: [f32; 6],
     /// UV 矩形 `[u0, v0, us, vs]`：内建图集 = 采样格子矩形；
     /// 注册表纹理 = 大纹理瓦片坐标系里的子矩形（瓦片左上角 + 实际尺寸裁剪）。
@@ -1187,6 +1212,11 @@ pub struct CommandConsumer {
     /// = 整瓦片采样（与既有路径逐位相同）。归一化矩形 `[u0, v0, us, vs]`
     /// （相对整张注册纹理），消费点单处折算（见 draw_into 精灵分支）。
     uvs: BTreeMap<ItemHandle, [f32; 4]>,
+    /// 跨帧精灵锚点登记表（`SetPivot` 建/覆写、`DestroyItem` 删；S16.3）。
+    /// 注册表精灵分支的 world 从 `transform ∘ flip` 改查此表多乘一截
+    /// **局部空间**平移 `-pivot × 16px 基准格` —— 无记录 = 无平移（与既有
+    /// 路径逐位相同）。归一化锚点 `[px, py]`，消费点单处折算。
+    pivots: BTreeMap<ItemHandle, [f32; 2]>,
     /// 字体登记表：资源键 -> 排版参数（字形表本体作为纹理住在注册表里）。
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
@@ -1285,6 +1315,7 @@ impl CommandConsumer {
             lists: BTreeMap::new(),
             tints: BTreeMap::new(),
             uvs: BTreeMap::new(),
+            pivots: BTreeMap::new(),
             fonts: BTreeMap::new(),
             ttf: None,
             glyph_atlas: GlyphAtlas::default(),
@@ -1720,6 +1751,7 @@ impl CommandConsumer {
                         self.lists.remove(handle);
                         self.tints.remove(handle);
                         self.uvs.remove(handle);
+                        self.pivots.remove(handle);
                         stats.destroys += 1;
                     } else {
                         stats.ignored += 1;
@@ -1824,6 +1856,17 @@ impl CommandConsumer {
                 RenderCommand::SetUv { handle, rect } => {
                     if self.items.contains_key(handle) {
                         self.uvs.insert(*handle, *rect);
+                        stats.updates += 1;
+                    } else {
+                        stats.ignored += 1;
+                    }
+                }
+                // SetPivot：登记精灵锚点（S16.3）。注册表精灵分支按此在
+                // world 之后多乘一截局部空间平移（无记录 = 无平移，逐位
+                // 不变）；已知句柄同键覆写，未知句柄静默忽略（契约 I1）。
+                RenderCommand::SetPivot { handle, pivot } => {
+                    if self.items.contains_key(handle) {
+                        self.pivots.insert(*handle, *pivot);
                         stats.updates += 1;
                     } else {
                         stats.ignored += 1;
@@ -2201,9 +2244,26 @@ impl CommandConsumer {
                     ],
                     None => uv_rect,
                 };
+                // S16.3 精灵锚点：有 SetPivot 簿记时在 world **之后**乘一截
+                // 平移 —— `Affine2::mul(self, rhs)` 的序是"先 rhs 后 self"
+                // （self ∘ rhs，见 nes-render-api::math 的乘法文档），因此
+                // `world ∘ translation(-pivot × 16px)` 把平移落在了**变换前
+                // 的局部空间**：世界变换的旋转/缩放先作用于平移过的四边形，
+                // 位置/旋转/缩放遂全部以锚点为基准（(0.5,0.5) = 中心锚定）。
+                // 反序（translation ∘ world）会把平移抬到世界空间，旋转轴
+                // 跟着错位 —— 序错则锚点语义整体作废，这里是唯一折算点。
+                // 无记录走原矩阵 —— 既有路径逐位不变（`[0,0]` 记录 = 零
+                // 平移，乘上去的 ±0.0 加法也逐位精确，见 T-P-01）。
+                let world = match self.pivots.get(&item.handle) {
+                    Some(p) => item.world_transform().mul(&Affine2::translation(
+                        -p[0] * gpu::CELL_PX as f32,
+                        -p[1] * gpu::CELL_PX as f32,
+                    )),
+                    None => item.world_transform(),
+                };
                 sprites.push(SpriteInstance {
                     handle: item.handle,
-                    world: item.world_transform().to_array(),
+                    world: world.to_array(),
                     uv_rect,
                     source: [layer as f32, 1.0],
                     // S16.1：tint 查跨帧簿记（无记录 = 中性恒等，逐位不变）。

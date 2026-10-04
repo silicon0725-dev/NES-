@@ -42,6 +42,11 @@ pub struct ItemSlot {
     /// 持久且"无记录 = 整瓦片"，停用图集后陈旧子矩形同样必须显式清除；
     /// 与 clipped 同一条"全量快照的生产者侧义务"）。
     pub uv_active: bool,
+    /// 上一提取帧是否对该条目推送过 `SetPivot`（S16.3：精灵锚点的
+    /// 非(0,0)→(0,0) 迁移帧据此补推一次零向量 `[0,0]` —— pivot 簿记
+    /// 跨帧持久且"无记录 = 无平移"，从设过非零锚点回调缺省后陈旧锚点
+    /// 同样必须显式清除；与 clipped / uv_active 同一条义务）。
+    pub pivot_active: bool,
 }
 
 impl ItemSlot {
@@ -120,6 +125,7 @@ impl NodeItemMap {
                 seen_frame: frame,
                 clipped: false,
                 uv_active: false,
+                pivot_active: false,
             },
         );
     }
@@ -143,6 +149,16 @@ impl NodeItemMap {
         self.slots.get_mut(&node).map(|slot| {
             let was = slot.uv_active;
             slot.uv_active = now;
+            was
+        })
+    }
+
+    /// 读写条目的 pivot 推送标记（S16.3 非(0,0)→(0,0) 迁移检测用；
+    /// `None` = 无条目）。
+    pub fn take_pivot_active(&mut self, node: NodeId, now: bool) -> Option<bool> {
+        self.slots.get_mut(&node).map(|slot| {
+            let was = slot.pivot_active;
+            slot.pivot_active = now;
             was
         })
     }

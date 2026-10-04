@@ -21,7 +21,8 @@
 //!        ▼
 //!   set_transform / set_flip / set_z / set_visible          全量属性快照
 //!   （Label 追加 set_text、Control 追加 set_rect；Sprite2D 追加
-//!   set_tint（S16.1 alpha）与图集帧激活时的 set_uv（S16.2））
+//!   set_tint（S16.1 alpha）、图集帧激活时的 set_uv（S16.2）与非
+//!   (0,0) 锚点的 set_pivot（S16.3））
 //!        │
 //!        ▼
 //!   retain_seen()：本帧没见过的条目全部 destroy_item          ← 节点删除 / 子树摘除
@@ -89,6 +90,8 @@ pub const PROP_SHEET_COLS: &str = "sheet_cols";
 pub const PROP_SHEET_ROWS: &str = "sheet_rows";
 /// `Sprite2D` 的图集帧索引属性名（S16.2；行主序，越界模运算回绕）。
 pub const PROP_FRAME: &str = "frame";
+/// `Sprite2D` 的锚点属性名（S16.3；归一化 0..1，缺省 (0,0) = 左上角）。
+pub const PROP_PIVOT: &str = "pivot";
 /// `Node2D` 的层号属性名（已裁决：`set_z` 的 `z` 取此属性）。
 pub const PROP_Z_INDEX: &str = "z_index";
 /// 通用节点的可见性属性名。
@@ -481,6 +484,21 @@ impl RenderExtractor {
                 }
                 if self.map.take_uv_active(node, wants_uv) == Some(true) && !wants_uv {
                     server.set_uv(handle, [0.0, 0.0, 1.0, 1.0]);
+                }
+                // —— S16.3 精灵锚点：非 (0,0) 逐帧重发（照 tint/uv 全量
+                //    快照口径）；**(0,0) 缺省不推** —— 缺省路径的命令流与
+                //    既有路径逐条相同（渲染侧无记录 = 无平移）。pivot 簿记
+                //    跨帧持久，**设过非零 → 回调 (0,0) 的迁移帧补推一次零
+                //    向量**（`pivot_active` 标记，照裁剪 Some→None / uv
+                //    激活→整图迁移的同一义务 —— 否则陈旧锚点会永久残留；
+                //    渲染侧零平移 = 恒等，像素意义上的清除）。
+                let pivot = sprite_pivot(tree, node);
+                let wants_pivot = pivot != [0.0, 0.0];
+                if wants_pivot {
+                    server.set_pivot(handle, pivot);
+                }
+                if self.map.take_pivot_active(node, wants_pivot) == Some(true) && !wants_pivot {
+                    server.set_pivot(handle, [0.0, 0.0]);
                 }
             }
             stats.pushed += 1;
@@ -1027,6 +1045,21 @@ fn sprite_sheet_uv_rect(tree: &SceneTree, node: NodeId) -> Option<[f32; 4]> {
     let row = (f / cols) as f32;
     let (fc, fr) = (cols as f32, rows as f32);
     Some([col / fc, row / fr, 1.0 / fc, 1.0 / fr])
+}
+
+/// Sprite2D 的锚点（S16.3 精灵锚点）：`pivot` 属性直读为归一化
+/// `[px, py]`（0..1 相对精灵矩形；越界值照实接受 —— 超出精灵外锚定是
+/// 合法创作用途，schema 同样不设钳制）。
+///
+/// 缺省/类型错 → `(0,0)`（= 左上角锚定的既有行为）；非有限值按缺省处理
+///（与 [`sprite_tint_rgba`] 的非有限兜底同一口径 —— NaN 进平移会把整个
+/// 世界矩阵污染成 NaN，宁可退回无锚定）。
+fn sprite_pivot(tree: &SceneTree, node: NodeId) -> [f32; 2] {
+    let v = vec2_prop(tree, node, PROP_PIVOT, Vec2::ZERO);
+    if !v.is_finite() {
+        return [0.0, 0.0];
+    }
+    [v.x, v.y]
 }
 
 /// 取布尔属性（缺失 → `default`）。

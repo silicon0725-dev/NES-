@@ -333,6 +333,16 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                  cols）。越出 cols*rows 时模运算回绕（负值同样回绕）—— 补间\
                  循环到末帧后回到 0 的正主通道，不设数值钳制。",
             ),
+            PropDesc::new(
+                "pivot",
+                ValueType::Vec2,
+                Value::Vec2(Vec2::ZERO),
+                H::None,
+                "归一化锚点（S16.3；0..1 相对精灵矩形，缺省 (0,0) = 左上角 \
+                 = 既有行为逐位不变）。绘制/旋转/缩放的基准点：(0.5,0.5) \
+                 = 中心锚定（位置即精灵中心）。越界值照实接受 = 锚点落在 \
+                 精灵外（拖尾/关节挂点等合法用途），不设数值钳制。",
+            ),
         ],
         NodeKindTag::Camera2D => vec![
             PropDesc::new(
@@ -659,14 +669,20 @@ mod tests {
                 "alpha",
                 "sheet_cols",
                 "sheet_rows",
-                "frame"
+                "frame",
+                "pivot"
             ]
         );
-        assert_eq!(s.len(), 10);
+        assert_eq!(s.len(), 11);
         // S16.2 加性缺省 = 整图现状：三键缺省全 0。
         assert_eq!(s.default_value("sheet_cols"), Some(&Value::I64(0)));
         assert_eq!(s.default_value("sheet_rows"), Some(&Value::I64(0)));
         assert_eq!(s.default_value("frame"), Some(&Value::I64(0)));
+        // S16.3 加性缺省 = 左上角锚定（既有行为）：pivot 缺省 (0,0)。
+        assert_eq!(
+            s.default_value("pivot"),
+            Some(&Value::Vec2(crate::transform::Vec2::ZERO))
+        );
     }
 
     #[test]

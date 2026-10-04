@@ -1339,3 +1339,92 @@ fn sheet_props_push_set_uv() {
     assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetUv { .. })));
     assert_eq!(srv.uv_of(handle), None, "销毁随条目清理");
 }
+
+/// S16.3（精灵锚点）：`pivot` 属性 -> `SetPivot` 的推送 —— 缺省 (0,0)
+/// 不推（T-P-01 的提取侧根：命令流与既有路径逐条相同）、非零逐帧重发、
+/// 非(0,0)→(0,0) 迁移帧补推一次零向量（照裁剪 Some→None / uv 激活→整图
+/// 迁移的同一生产者侧义务）、输出序恒在 SetUv 之后、销毁随条目清理。
+#[test]
+fn pivot_prop_pushes_set_pivot() {
+    let keys = KeyMap::new();
+    keys.set(ResId::new(1), key(1, 1));
+
+    let mut tree = SceneTree::new("root");
+    let sprite = add_root_sprite(&mut tree, "s1", ResId::new(1));
+
+    let mut ex = RenderExtractor::new();
+    let mut srv = NullRenderServer::new();
+    let mut out = Vec::new();
+
+    // 缺省（pivot = (0,0)）：命令流没有任何 SetPivot —— 既有路径逐位
+    // 不变（加性缺省的根；与 uv 缺省不发同一口径）。
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 1);
+    assert_synced(&ex, &srv, &stats);
+    assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetPivot { .. })));
+    let handle = ex.handle_of(sprite).expect("已建条目");
+    assert_eq!(srv.pivot_of(handle), None, "无记录 = 无平移");
+
+    // 非 (0,0)：推送当前值；同帧再改 = 同键覆写（后写者生效）。
+    set_prop(&mut tree, sprite, "pivot", Value::vec2(0.5, 0.5));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 2);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.pivot_of(handle),
+        Some(&[0.5, 0.5]),
+        "中心锚定值照实下发"
+    );
+    set_prop(&mut tree, sprite, "pivot", Value::vec2(0.0, 1.0));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 3);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(srv.pivot_of(handle), Some(&[0.0, 1.0]), "同键覆写");
+
+    // 越界值照实接受（超出精灵外锚定是合法用途；schema 无钳制）。
+    set_prop(&mut tree, sprite, "pivot", Value::vec2(-0.25, 1.5));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 4);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(srv.pivot_of(handle), Some(&[-0.25, 1.5]), "越界不钳制");
+
+    // 输出序：同句柄同帧 SetPivot 恒在 SetUv 之后（null 与 wgpu 两处
+    // submit 严格同序的推送侧事实；无 uv 时以 SetTint 为界仍应成立）。
+    set_prop(&mut tree, sprite, "sheet_cols", Value::I64(2));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 5);
+    assert_synced(&ex, &srv, &stats);
+    let uv_at = out
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetUv { handle: h, .. } if *h == handle));
+    let pivot_at = out
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetPivot { handle: h, .. } if *h == handle));
+    assert!(uv_at.is_some() && pivot_at.is_some());
+    assert!(pivot_at > uv_at, "SetPivot 恒在 SetUv 之后");
+
+    // 回调 (0,0)：迁移帧补推**一次**零向量（渲染侧零平移 = 恒等，
+    // 像素意义上的清除），其后只剩服务端全量快照对已存零值的重发。
+    set_prop(&mut tree, sprite, "pivot", Value::vec2(0.0, 0.0));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 6);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.pivot_of(handle),
+        Some(&[0.0, 0.0]),
+        "迁移帧补推零向量（陈旧锚点的显式清除）"
+    );
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 7);
+    assert_synced(&ex, &srv, &stats);
+    let pivot_cmds: Vec<&RenderCommand> = out
+        .iter()
+        .filter(|c| matches!(c, RenderCommand::SetPivot { .. }))
+        .collect();
+    assert_eq!(pivot_cmds.len(), 1, "稳态只剩快照重发");
+    assert_eq!(
+        pivot_cmds[0],
+        &RenderCommand::SetPivot { handle, pivot: [0.0, 0.0] }
+    );
+
+    // 资源消失 -> 条目销毁 -> pivot 簿记随之清理（不悬垂）。
+    keys.remove(ResId::new(1));
+    advance(&mut tree);
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 8);
+    assert_synced(&ex, &srv, &stats);
+    assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetPivot { .. })));
+    assert_eq!(srv.pivot_of(handle), None, "销毁随条目清理");
+}

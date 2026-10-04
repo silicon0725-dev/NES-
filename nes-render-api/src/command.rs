@@ -196,6 +196,34 @@ pub enum RenderCommand {
         /// 越界不在此钳制 —— 采样取舍的权威在后端单处折算）。
         rect: [f32; 4],
     },
+    /// 精灵锚点（S16.3 精灵锚点的契约扩展）：**归一化锚点** `[px, py]`
+    /// （0..1 相对精灵矩形；越界照实接受 = 锚点落在精灵外，合法用途）。
+    ///
+    /// 与 [`RenderCommand::SetTint`] / [`RenderCommand::SetUv`] 同一性质
+    /// 与同一条纪律：
+    ///
+    /// - 属性动作、全量快照、同键覆写：`submit` 时对有 pivot 簿记的条目
+    ///   按序重发当前值（漏推一帧不漂移）；条目销毁时随条目消亡；
+    /// - 输出序冻结在对应条目的 `SetUv` 之后（同一渲染物的属性流序：
+    ///   … → SetRect → SetClip → SetTint → SetUv → SetPivot —— null 与
+    ///   wgpu 两处 submit 严格同序）；
+    /// - 空句柄 / 未知句柄静默忽略（契约 I1 口径）；
+    /// - **无记录 = 无平移**（既有行为逐位不变）：后端只在注册表精灵
+    ///   分支消费本命令 —— 语义是精灵四边形在**变换前的局部空间**平移
+    ///   `-pivot × 16px 基准格`（`world ∘ translation`，平移在 world 之后
+    ///   乘 = 先平移后过世界变换），旋转/缩放因此绕锚点发生；`[0, 0]`
+    ///   记录 = 零平移 = 恒等（"清除"零向量即可表达）；
+    /// - **与图集帧的关系**：pivot 归一化相对**当前帧矩形**（帧动画换帧
+    ///   不换 pivot 语义）—— 帧采样只影响 uv 不影响几何，天然成立；
+    /// - 提取层把 Sprite2D 的 `pivot` 属性（Vec2）直读下发；`(0,0)` 缺省
+    ///   不推（命令流与既有路径逐条相同）。
+    SetPivot {
+        /// 句柄。
+        handle: ItemHandle,
+        /// 归一化锚点 `[px, py]`（0..1 相对精灵矩形；负值/越界照实接受
+        /// —— 超出精灵外锚定是合法创作用途，取舍权威在后端单处折算）。
+        pivot: [f32; 2],
+    },
     /// 帧结束标记（**每条命令流都必须以它结尾**）。
     Submit {
         /// 本帧上下文。
@@ -218,7 +246,8 @@ impl RenderCommand {
             | Self::SetRect { handle, .. }
             | Self::SetClip { handle, .. }
             | Self::SetTint { handle, .. }
-            | Self::SetUv { handle, .. } => Some(*handle),
+            | Self::SetUv { handle, .. }
+            | Self::SetPivot { handle, .. } => Some(*handle),
             Self::SetCamera { .. } | Self::Submit { .. } => None,
         }
     }
