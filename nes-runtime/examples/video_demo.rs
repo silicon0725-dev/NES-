@@ -22,7 +22,7 @@
 //! `tests/s15_video.rs` 的机器断言面）。
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::Instant;
 
 use nes_render_api::{FrameInfo, Vec2};
 use nes_runtime::NesRuntime;
@@ -77,6 +77,8 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(u64::MAX);
+    let mut now = Instant::now();
+    let mut delta = 1.0 / 60.0;
     let mut transient = 0u64;
     const TRANSIENT_LIMIT: u64 = 120;
     for index in 0..total {
@@ -84,9 +86,7 @@ fn main() {
         let _ = rt.emit_input_signals(&snap);
         // tick 由引擎内建发射（S8.1）；video_play 的 Cmd 在 tick 后由
         // 运行时消费；换页发生在帧路径提取之前（当帧像素即当前帧）。
-        let frame = FrameInfo::new(
-            index,
-            1.0 / 60.0,
+        let frame = FrameInfo::new(index, delta,
             index as f64 / 60.0,
             Vec2::new(384.0, 216.0),
         );
@@ -112,7 +112,11 @@ fn main() {
                 rt.video_page_swaps(),
             );
         }
-        std::thread::sleep(Duration::from_millis(16));
+        // 帧节拍（S12-4 同款纪律）：无固定 sleep——FIFO present 自节流，
+        // 固定 sleep + vsync = 双重等待（卡顿感的根因）。delta 用实测
+        // 帧差（clamp 0.1s），视频换页与音画同步都吃真实时间。
+        delta = now.elapsed().as_secs_f32().min(0.1);
+        now = std::time::Instant::now();
     }
     println!("[完成] Video Demo 退出（page swaps = {}）", rt.video_page_swaps());
 }
