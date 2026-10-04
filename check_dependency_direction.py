@@ -486,7 +486,7 @@ def main() -> int:
         or "(无)",
     )
     detail += "\n传递依赖 %d 个：%s" % (len(rt_trans), ", ".join(rt_trans))
-    detail += "\n合法直接依赖白名单：七个项目 crate（全部 path；含 S13 第 2 期正向接入的 nes-audio、S14 第 1 期正向接入的 nes-media）"
+    detail += "\n合法直接依赖白名单：九个项目 crate（全部 path；含 S13 第 2 期正向接入的 nes-audio、S14 第 1 期正向接入的 nes-media、S17 第 2 期正向接入的 nes-extension-api/nes-extension-js）"
     detail += "\n" + "\n".join(rt_rev_lines)
     if rt_illegal:
         detail += "\n越界依赖：" + ", ".join(rt_illegal)
@@ -498,7 +498,7 @@ def main() -> int:
         detail += "\n违规反向依赖：" + ", ".join(rt_rev_bad)
     record(
         "G11",
-        "%s 仅向下依赖七个项目 crate（path）、零第三方、独立工作区根、无人反向依赖"
+        "%s 仅向下依赖白名单内项目 crate（path）、零第三方、独立工作区根、无人反向依赖"
         % RUNTIME_CRATE,
         not (rt_illegal or rt_unpathed or rt_registry or not rt_own_ws or rt_rev_bad),
         detail,

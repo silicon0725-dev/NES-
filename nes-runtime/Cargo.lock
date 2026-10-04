@@ -553,6 +553,18 @@ name = "nes-audio"
 version = "0.1.0"
 
 [[package]]
+name = "nes-extension-api"
+version = "0.1.0"
+
+[[package]]
+name = "nes-extension-js"
+version = "0.1.0"
+dependencies = [
+ "nes-extension-api",
+ "rquickjs",
+]
+
+[[package]]
 name = "nes-media"
 version = "0.1.0"
 dependencies = [
@@ -586,6 +598,8 @@ version = "0.1.0"
 dependencies = [
  "nes-asset",
  "nes-audio",
+ "nes-extension-api",
+ "nes-extension-js",
  "nes-media",
  "nes-render-api",
  "nes-render-extract",
@@ -942,6 +956,33 @@ name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
+
+[[package]]
+name = "rquickjs"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c5227859c4dfc83f428e58f9569bf439e628c8d139020e7faff437e6f5abaa0"
+dependencies = [
+ "rquickjs-core",
+]
+
+[[package]]
+name = "rquickjs-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e82e0ca83028ad5b533b53b96c395bbaab905a5774de4aaf1004eeacafa3d85d"
+dependencies = [
+ "rquickjs-sys",
+]
+
+[[package]]
+name = "rquickjs-sys"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fed0097b0b4fbb2a87f6dd3b995a7c64ca56de30007eb7e867dfdfc78324ba5"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "rustversion"

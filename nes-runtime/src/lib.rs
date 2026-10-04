@@ -32,7 +32,7 @@
 //! - **不改上游**：七个 crate 一行不动（本层是它们之上的新叶子，G11 钉住）；
 //! - **纹理解码口径**：资产以 **BMP** 交付（`nes-render-wgpu::bmp` 手写解析，
 //!   零依赖纪律，快路径）；S14 起图片（PNG/JPEG/GIF/WebP…）与扩展音频
-//!   （MP3/FLAC/OGG/M4A）经 **nes-media 适配层**解码（全仓库唯一允许第三
+//!   （MP3/FLAC/OGG/M4A）经 **nes-media 适配层**解码（两个白名单适配层之一，允许第三
 //!   方的 crate，G13 白名单：image 系 / symphonia 系）—— 解码产物映射到
 //!   既有类型（RGBA8 -> 纹理注册表；`nes_audio::Wav` 同构 -> 混音器），
 //!   装载序恒为 **手写快路径优先、适配层回落**（零解码开销者优先）。
@@ -50,6 +50,7 @@
 //! "改磁盘文件 -> 下一帧画面变化"的完整链路。
 
 use std::collections::BTreeMap;
+pub mod extension;
 pub mod headless;
 mod video;
 
@@ -75,6 +76,7 @@ use nes_scene::{
     SceneTree, ScriptVm, TableError, Value, UiVm};
 use nes_audio::{AudioDevice, Mixer};
 
+pub use extension::{ExtCapsState, ExtensionManager};
 pub use headless::{run, HeadlessReport};
 
 /// 组装好的引擎帧循环。
@@ -117,6 +119,10 @@ pub struct NesRuntime {
     step_remainder: f32,
     /// 螺旋钳制丢弃的模拟步累计数（S8.1 如实计数）。
     steps_dropped: u64,
+    /// 扩展运行时（S17 第 2 期；`None` = 未开扩展 —— 与音频面同一纪律，
+    /// 不开扩展的路径零开销）。只持 JS 侧 + 快照/队列；树的真身仍在本
+    /// 结构体，经 `update_extensions` 的字段级借用拆分桥接。
+    extensions: Option<extension::ExtensionManager>,
     /// 混音器（S13 第 2 期；`None` = 未开音频）。与设备线程共享同一份
     ///（`Arc<Mutex>`：设备填充线程每 ~10ms 锁一次做 mix_into；宿主侧
     /// 注册/播放走同一把锁，毒化容忍 —— 音频不因别处 panic 哑掉）。
@@ -239,6 +245,7 @@ impl NesRuntime {
             fixed_step: None,
             step_remainder: 0.0,
             steps_dropped: 0,
+            extensions: None,
             mixer: None,
             device: None,
             sound_slots: Vec::new(),

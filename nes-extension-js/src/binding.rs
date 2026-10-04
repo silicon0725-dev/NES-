@@ -29,6 +29,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use rquickjs::function::Func;
+use rquickjs::IntoJs;
 use rquickjs::{Array, Ctx, Value};
 #[allow(unused_imports)]
 use nes_extension_api::JsRuntime;
@@ -103,6 +104,51 @@ fn node_get_pos_js<'js>(
     Ok(arr.into_value())
 }
 
+/// `nes.scene.find(name)` 的实现体：Some -> number，None -> null。
+fn scene_find_js<'js>(
+    scene: &Rc<RefCell<dyn SceneCapability>>,
+    ctx: Ctx<'js>,
+    name: String,
+) -> rquickjs::Result<Value<'js>> {
+    let found = match scene.try_borrow() {
+        // 借用冲突 = 宿主侧重入 bug，如实抛 JS 异常（不吞）。
+        Ok(ok) => ok.find(&name),
+        Err(_) => {
+            return Err(rquickjs::Error::FromJs {
+                from: "capability",
+                to: "RefCell",
+                message: Some("scene capability busy".into()),
+            })
+        }
+    };
+    Ok(match found {
+        Some(r) => (r.0 as f64).into_js(&ctx)?,
+        None => Value::new_null(ctx),
+    })
+}
+
+/// `nes.node.getName(ref)` 的实现体：Some -> string，None -> null。
+fn node_get_name_js<'js>(
+    node: &Rc<RefCell<dyn NodeCapability>>,
+    ctx: Ctx<'js>,
+    r: f64,
+) -> rquickjs::Result<Value<'js>> {
+    let name = match node.try_borrow() {
+        Ok(ok) => ok.get_name(NodeRef(r as u64)),
+        Err(_) => {
+            return Err(rquickjs::Error::FromJs {
+                from: "capability",
+                to: "RefCell",
+                message: Some("node capability busy".into()),
+            })
+        }
+    };
+    Ok(match name {
+        Some(s) => s.into_js(&ctx)?,
+        None => Value::new_null(ctx),
+    })
+}
+
 impl CapabilityBinding {
     /// 由宿主实现组装（宿主持有 Rc 端，本 binding 持另一端）。
     pub fn new(
@@ -126,10 +172,9 @@ impl CapabilityBinding {
         let scene = Rc::clone(&self.scene);
         globals.set(
             "__nes_scene_find",
-            Func::new(move |name: String| -> Option<f64> {
-                let ok = scene.try_borrow().ok()?;
-                ok.find(&name).map(|r| r.0 as f64)
-            }),
+            // None -> **null**（不是 undefined：rquickjs 0.9 的 Option IntoJs
+            // 把 None 映射成 undefined，而能力契约里"未找到"是个值语义）。
+            Func::new(move |ctx, name: String| scene_find_js(&scene, ctx, name)),
         )?;
 
         let node = Rc::clone(&self.node);
@@ -163,10 +208,8 @@ impl CapabilityBinding {
         let node = Rc::clone(&self.node);
         globals.set(
             "__nes_node_get_name",
-            Func::new(move |r: f64| -> Option<String> {
-                let ok = node.try_borrow().ok()?;
-                ok.get_name(NodeRef(r as u64))
-            }),
+            // 同 find：None -> null（不是 undefined）。
+            Func::new(move |ctx, r: f64| node_get_name_js(&node, ctx, r)),
         )?;
 
         let input = Rc::clone(&self.input);

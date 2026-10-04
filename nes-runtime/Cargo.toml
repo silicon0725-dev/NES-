@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "engine_frame"
 path = "examples/engine_frame.rs"
 
+[[example]]
+name = "ext_demo"
+path = "examples/ext_demo.rs"
+
 # 依赖方向（组装层是全链的**顶端叶子**）：
 #
 #     nes-asset ──▶ nes-scene ──▶ nes-render-extract ──▶ nes-render-api ──▶ nes-render-wgpu
@@ -42,6 +46,8 @@ path = "examples/engine_frame.rs"
 [dependencies]
 nes-asset = { path = "../nes-asset" }
 nes-scene = { path = "../nes-scene" }
+nes-extension-api = { path = "../nes-extension-api" }
+nes-extension-js = { path = "../nes-extension-js" }
 nes-render-api = { path = "../nes-render-api" }
 nes-render-extract = { path = "../nes-render-extract" }
 nes-render-wgpu = { path = "../nes-render-wgpu" }
