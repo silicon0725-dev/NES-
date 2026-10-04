@@ -1,13 +1,18 @@
 //! S15 视频资产面 · 运行时契约回归：Video 资源装载链 + 同键逐帧换页 +
-//! 音画同播（P0 起点对齐）+ 确定性边界。
+//! 音画同播 + 确定性边界。
 //!
 //! | 编号 | 契约 |
 //! |---|---|
 //! | T-Vid-01 | 装载链：declare_video -> bind -> 容器解析入表（派生键存在、类别 Video、渲染键存在、AdoptReport 干净 —— texture 提示放宽） |
 //! | T-Vid-02 | headless 确定性：video_play 的 Cmd 消费即弃，指纹与"无 video_play"对照面**逐位相同**；同轨迹两遍同 |
-//! | T-Vid-03 | 同键逐帧换页（GPU）：bind 即上传首帧（swaps=1）；play 后逐帧推进 swaps 增长、当前帧号前进；stop 定格 |
-//! | T-Vid-04 | 音画同播（P0）：play 时音轨声部启动（active_voices>=1）；stop 后归零（stop_key 点名停，不碰其他声部） |
+//! | T-Vid-03 | 同键逐帧换页（GPU）：bind 即上传首帧（swaps=1）；play 后逐帧推进 swaps 增长、当前帧号前进；stop 定格。**未开音频** —— 本用例走的就是 S15.1 三态分叉的"回退帧差钟"分支（混音器缺席），页号随 elapsed 推进即回退路径回归 |
+//! | T-Vid-04 | 音画同播：play 时音轨声部启动（active_voices>=1）；stop 后归零（stop_key 点名停，不碰其他声部） |
 //! | T-Vid-05 | 场景声明面：RON `Res(kind:"Video")` + Sprite2D.texture 引用 + 脚本 video_play 全链（headless 消费无错） |
+//!
+//! S15.1 音频钟主控（帧号从声部已播采样位导出 / 声部移除即音画同终 / 无轨
+//! 回退帧差钟）的机器断言面在 `src/video.rs` 的模块内测试（`t_vid_sync01..03`
+//! + `t_vfa01..02`）：注入无设备混音器 + 手动 mix_into 推进，全程确定性、
+//!   不依赖 waveOut 实时性。
 //!
 //! 真实测试资产（skip-if-missing 惯例）：`spider_amv.amv`（13.5MB，160x128
 //! @ 15fps + IMA ADPCM 音轨）在用户机器上，不在仓库 —— CI/他机安全跳过。
@@ -244,7 +249,8 @@ fn t_vid_04_audio_starts_and_stops_with_video() {
     assert!(report.is_clean(), "装载干净：{report:?}");
     assert_eq!(rt.active_voice_count(), 0, "起播前无声部");
 
-    // 起播：音轨（IMA ADPCM 解码）即刻开声部 —— P0 起点对齐。
+    // 起播：音轨（IMA ADPCM 解码）即刻开声部 —— 音频钟主控的同步起点
+    //（帧号从声部已播采样位导出；分叉的机器断言在 src/video.rs 模块内测试）。
     assert!(rt.play_video(VIDEO_KEY), "起播");
     assert!(
         rt.active_voice_count() >= 1,

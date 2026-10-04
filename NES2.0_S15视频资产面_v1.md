@@ -1,6 +1,8 @@
 # NES 2.0 · S15 视频资产面 —— Video 资源 / 逐帧渲染 / 脚本控制 / 音画同播
 
-- worktree：`wt-video`（分支 `s15-video-assets`，基线 HEAD = c02ea7c）
+- worktree：`wt-video`（分支 `s15-video-assets`，基线 HEAD = c02ea7c）；
+  **S15.1 升级**：`wt-sync`（分支 `s15-1-av-sync`，基线 HEAD = 431a4e0）——
+  音画从"P0 起点对齐"升级为"严格同步：音频钟主控"（见 §3）
 - 上游：S14.3（AMV 解码 + IMA ADPCM 音轨，`nes-media::AmvVideo` / `AviVideo` 已就绪）
 - 本期把视频从"解码器"升格为**一等资产**：场景声明 Video 资源 → Sprite 显示当前帧 →
   脚本 `video_play` / `video_stop` 控制 → 有音轨则同步出声。
@@ -12,16 +14,21 @@
 ```
 场景 Res(kind:"Video") ──▶ bind：nes-media 内容探测解析（AMV/AVI）+ 首帧上 GPU
     ──▶ 脚本 video_play "key" ──▶ Cmd::VideoPlay ──▶ tick 后转渲染侧播放状态机
-    ──▶ 每帧 floor(elapsed × fps) 帧 同键覆写 GPU 注册表（Sprite 即播画面）
-    ──▶ 音轨即刻开声部（非循环，P0 起点对齐）；video_stop / 播完即停声
+    ──▶ 每帧 当前帧号 同键覆写 GPU 注册表（Sprite 即播画面；S15.1 起
+    帧号从声部已播采样位导出 —— 音频钟主控，严格同步）
+    ──▶ 音轨即刻开声部（非循环）；video_stop / 声部播完移除即音画同终
 ```
 
 - 契约测试新增 11 条全绿：nes-scene `tests/s15_video.rs`（6）+ nes-runtime
-  `tests/s15_video.rs`（5，真文件 skip-if-missing）；
-- 门禁：八 crate `cargo test --release` 657 通过（基线 646 + 新增 11）、
-  clippy 0 警告 ×8、依赖方向守卫 13/13、editor_shell 冒烟（NES_EDIT_DEMO=1
-  420 帧，含 video on/video stopped 取证）、video_demo 冒烟（NES_GAME_FRAMES=180
-  真实有声跑，换页计数随帧正确推进）；
+  `tests/s15_video.rs`（5，真文件 skip-if-missing）；**S15.1 再增 7 条**：
+  nes-audio `t_mix17/18`（`voice_position` 采样位口径）+ nes-runtime
+  `src/video.rs` 模块内 `t_vfa01/02`（音频钟纯函数）与 `t_vid_sync01..03`
+  （回退钟回归 / 保持首帧+音画同终 / GPU 页帧号跟随采样位）；
+- 门禁（S15.1 后）：八 crate `cargo test --release` 665 通过（基线 658 +
+  新增 7）、clippy 0 警告 ×8、依赖方向守卫 13/13、editor_shell 冒烟
+  （NES_EDIT_DEMO=1 420 帧，含 video on/video stopped 取证）、video_demo
+  冒烟（NES_GAME_FRAMES=180 真实有声跑：帧号增速与 15fps 一致 ——
+  音频钟按真实消耗推进，页号 = 已播秒数 × fps）；
 - 提交：见 §4（单提交，`Media/*.amv` 不入库）。
 
 ## §1 架构
@@ -81,26 +88,42 @@
 - 宿主直调 API：`play_video` / `stop_video` / `video_is_playing` /
   `video_current_frame` / `video_page_swaps` / `video_count` / `active_voice_count`。
 
-## §3 音画同步 P0 口径
+## §3 音画严格同步口径（S15.1：音频钟主控，升级自 P0 起点对齐）
 
-- **起点对齐**：`video_play` 时刻 = 计时清零 + 音轨声部开声（同一同步点）；
-- 帧号 = `floor(播放经过时间 × fps)`，经过时间由帧循环 delta 累计（渲染侧）；
-  fps ≤ 0（病态头）帧号停 0（静帧播放直到 stop）；
-- **终点**：目标帧越界 → 钳到末帧上屏 + 停播 + 停声（P0 无 loop；音轨比画面
-  长的容器不残留背景声 —— `stop_key` 幂等收口）；`video_stop` 同样双停；
-- 采样级严格同步（漂移校正/时钟主从）**不在本期**，归 §5；
-- 声部点名停是本期唯一的 nes-audio 改动：`Voice` 记录库键 + `Mixer::stop_key`
-  （additive，既有 `stop_all`/voices 语义不动，混音数学零变化）。
+- **同步起点**：`video_play` 时刻 = 计时清零 + 音轨声部开声（同一同步点）；
+  声部开动后**帧号从声部已播采样位导出**：`帧号 = floor(已播源样本 /
+  源采样率 × fps)`（`video_frame_from_audio` 纯函数，f64 中间量）。采样位
+  由设备钟真实消耗推进（混音器 mix_into 逐帧吃光标）—— 天然采样级对齐，
+  免疫帧节拍抖动与起播缓冲延迟（waveOut 队列 ~80ms 深度：设备消耗队列
+  之前读数为 0，视频保持首帧，正是唇同步的正确起点）；
+- **步进三态分叉**（`advance_videos`，每帧每在播视频）：
+
+  | 态 | 条件 | 帧号来源 | 终局判据 |
+  |---|---|---|---|
+  | 主路径（音频钟） | 有音轨且声部在场 | `floor(已播源样本 / 源采样率 × fps)` | 声部移除 → 停播（音画同终） |
+  | 同终 | 有音轨、声部开过后消失（非循环播完被移除） | 钳末帧上屏 | 本帧即停播 + 停声 |
+  | 回退（帧差钟） | 无音轨 / 混音器不在场（headless、未开音频） | `floor(elapsed × fps)`（P0 既有行为逐位保留） | 目标帧越界 → 钳末帧 + 停播 |
+
+- 画面先于音轨走完时钳末帧定格、等声部收尾才停播 —— **终点以声部移除为
+  主判据**（elapsed 钳制路径退役为回退钟专用）；`video_stop` 依旧双停；
+- fps ≤ 0（病态头）：两钟同口径帧号停 0（静帧播放直到 stop）；
+- nes-audio 改动 additive：`Mixer::voice_position(key) -> Option<(u64, u32)>`
+  只读观测面（活动声部的 `floor(cursor)` + 源采样率；键无活动声部 = None），
+  混音数学零变化；确定性边界不变（播放状态仍全在渲染侧表，不进指纹）；
+- 机器断言面：nes-audio `t_mix17/18`（采样位口径）、nes-runtime
+  `src/video.rs` 模块内 `t_vfa01/02`（纯函数）、`t_vid_sync01`（回退钟
+  回归）、`t_vid_sync02`（保持首帧 + 同终）、`t_vid_sync03`（GPU 页帧号
+  逐位跟随采样位 —— 注入无设备混音器 + 手动 mix_into，全程确定性）。
 
 ## §4 门禁（全部在本 worktree 内执行）
 
 | 项 | 结果 |
 |---|---|
-| `cargo test --release` ×8 | 全绿 657（基线 646 + 新增 11）：nes-asset 34 / nes-audio 49 / nes-scene 239 / nes-render-api 45 / nes-render-extract 56 / nes-render-wgpu 123 / nes-media 27 / nes-runtime 84 |
+| `cargo test --release` ×8 | 全绿 665（基线 658 + S15.1 新增 7）：nes-asset 34 / nes-audio 52 / nes-scene 239 / nes-render-api 45 / nes-render-extract 56 / nes-render-wgpu 123 / nes-media 27 / nes-runtime 89 |
 | `cargo clippy --release --all-targets` ×8 | 0 警告 |
-| `check_dependency_direction.py` | 13/13（G13 白名单未扩 —— nes-media 零新依赖） |
+| `check_dependency_direction.py` | 13/13（G13 白名单未扩 —— nes-media 零新依赖；nes-audio additive 只读面不触分层） |
 | editor_shell 冒烟 | `NES_EDIT_DEMO=1 NES_EDIT_FRAMES=420` 通过：video on / video stopped 取证 + 无 "video:" 错误行；res:// 树 Media/ 行适配（F9 切档 + 双击行修正，两种形态断言兼容） |
-| video_demo 冒烟 | `NES_GAME_FRAMES=180` 真实有声跑通：缺失自动从用户目录复制；换页 1→45 随帧正确推进（30 帧 @60fps = 第 7 帧 @15fps） |
+| video_demo 冒烟 | `NES_GAME_FRAMES=180` 真实有声跑通：缺失自动从用户目录复制；音频钟主控下帧号增速与 15fps 一致（帧 30→150 页号 4→24 = 真实秒数 × 15fps，页号随已播采样位推进）；音画同终日志行已备（"video ended (audio-clock sync)"，282s 容器在截断冒烟内不可达 —— 终局判据由 `t_vid_sync02` 机器断言） |
 
 新增文件：`nes-runtime/src/video.rs`、`nes-runtime/examples/video_demo.rs`、
 `nes-runtime/examples/assets/video_demo.ron`、`nes-runtime/tests/s15_video.rs`、
@@ -108,12 +131,11 @@
 
 ## §5 遗留（下一轮输入）
 
-1. **采样级严格音画同步**：P0 只对齐起点，长播漂移不校正（视频帧率与音轨时长
-   独立累计）；时钟主从（音轨驱动视频）归后续；
-2. **loop / 倍速 / 倒放**：P0 播完即停；`video_play` 无循环与速率参数；
-3. **压缩视频资源内存策略**：整容器驻留内存 + 音轨全量 PCM 缓存（13.5MB AMV
+1. **loop / 倍速 / 倒放**：播完即停（音频钟下终点 = 声部移除）；
+   `video_play` 无循环与速率参数；
+2. **压缩视频资源内存策略**：整容器驻留内存 + 音轨全量 PCM 缓存（13.5MB AMV
    实测进程增量约 15-20MB），流式 demux / LRU 换出 / 帧解码缓存上限均未做；
-4. **每帧解码开销**：MJPG 帧每帧全量 JPEG 解码（160x128 实测无压力；大分辨率
+3. **每帧解码开销**：MJPG 帧每帧全量 JPEG 解码（160x128 实测无压力；大分辨率
    视频需要帧缓存或跳帧策略）；
-5. **编辑器资源面板集成**：res:// 双击 .amv 目前仅"列出"（fs open 无动作分支）；
+4. **编辑器资源面板集成**：res:// 双击 .amv 目前仅"列出"（fs open 无动作分支）；
    检查器对 Video 资源的专用控件（时长/帧率/缩略图）未做。

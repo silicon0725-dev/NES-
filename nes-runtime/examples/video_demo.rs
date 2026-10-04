@@ -1,12 +1,14 @@
 //! S15 视频资产面演示：**Video 资源 + 全屏 Sprite + 脚本 video_play +
-//! 音画同播** 全链（照 audio_demo 的宿主形态）。
+//! 音画严格同步（音频钟主控）** 全链（照 audio_demo 的宿主形态）。
 //!
 //! ```text
 //! Media/spider.amv（用户机器实测 AMV，不入库）──▶ Res(kind:"Video")
 //!     ──▶ bind：nes-media 解析容器（AMV 内容探测）+ 第 0 帧上传 GPU
 //!     ──▶ 脚本 video_play "Media/spider" ──▶ Cmd::VideoPlay ──▶ tick 后
 //!     转渲染侧播放状态机 ──▶ 每帧当前解码帧同键覆写上 GPU（Sprite 即播
-//!     画面）；有音轨（IMA ADPCM）则混音器同步出声（P0 起点对齐）。
+//!     画面）。帧号由混音器声部的已播采样位导出（音频钟主控，S15.1）——
+//!     设备把声部队列真实消耗之前视频保持首帧，采样级对齐；声部播完移除
+//!     = 视频同步停播（音画同终，控制台见 "video ended (audio-clock sync)"）。
 //! ```
 //!
 //! 资产口径（不入库的纪律与取材链）：
@@ -16,10 +18,11 @@
 //!
 //! 帧号观测：宿主每 30 帧向 stdout 打印当前视频帧号（选打印、不走
 //! set_prop —— 播放状态是渲染侧的，写树会破坏"不进语义状态"的裁决）。
+//! 音频钟在场的观测口径：帧号增速与 15fps 一致（页号 = 已播秒数 × fps）。
 //!
 //! 冒烟：`NES_GAME_FRAMES=180 cargo run --release --example video_demo`
 //! （真 AMV 在场时 180 帧有声跑完；换页计数随帧增长，见
-//! `tests/s15_video.rs` 的机器断言面）。
+//! `tests/s15_video.rs` 的机器断言面与 `src/video.rs` 模块内分叉测试）。
 
 use std::path::Path;
 use std::time::Instant;
@@ -81,6 +84,9 @@ fn main() {
     let mut delta = 1.0 / 60.0;
     let mut transient = 0u64;
     const TRANSIENT_LIMIT: u64 = 120;
+    // 音画同终观测：在播 -> 非在播的翻转沿打印一行（S15.1 音频钟主控下，
+    // 视频的终点 = 声部播完移除，宿主在此取证）。
+    let mut was_playing = rt.video_is_playing("Media/spider");
     for index in 0..total {
         let snap = rt.collect_input();
         let _ = rt.emit_input_signals(&snap);
@@ -104,6 +110,16 @@ fn main() {
                 }
             }
         }
+        // 音画同终取证（翻转沿打一次，不刷屏）。
+        let playing = rt.video_is_playing("Media/spider");
+        if was_playing && !playing {
+            println!(
+                "[帧 {index}] video ended (audio-clock sync) | page swaps = {} | last frame = {:?}",
+                rt.video_page_swaps(),
+                rt.video_current_frame("Media/spider"),
+            );
+        }
+        was_playing = playing;
         // 帧号观测：打印（不走 set_prop —— 播放状态不进树/指纹）。
         if index % 30 == 0 {
             println!(

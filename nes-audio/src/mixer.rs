@@ -151,6 +151,23 @@ impl Mixer {
         &self.voices
     }
 
+    /// 指定键的活动声部**已播源样本位**与源采样率（S15.1 音频钟观测面）。
+    ///
+    /// * 返回 `(已播源样本数, 源采样率)`：样本数 = `floor(voice.cursor)`
+    ///   （光标单位本来就是源样本，见 [`Voice::cursor`]；[`Mixer::mix_into`]
+    ///   被设备真实消耗逐帧推进 —— 所以这个读数天然是"耳朵已经听到的位置"，
+    ///   视频帧号由它导出即得采样级音画对齐）；
+    /// * 该键没有活动声部（未播放 / 非循环已播完被移除 / `stop_key` 点名停）
+    ///   返回 `None` —— 上层以"见过声部之后变 None"判音画同终；
+    /// * 同键多个声部取第一个（视频音轨每键只开一个声部；普通声音不经过
+    ///   此面）；只读，不动声部、不加锁语义 —— 与 [`Self::voices`] 同读面。
+    pub fn voice_position(&self, key: &str) -> Option<(u64, u32)> {
+        self.voices
+            .iter()
+            .find(|v| v.key == key)
+            .map(|v| (v.cursor.floor().max(0.0) as u64, v.wav.sample_rate))
+    }
+
     /// 把全部活动声部混进一个设备缓冲。
     ///
     /// * `out`：交错 `i16` 样本，长度应能被 `channels` 整除（余数按 0 混出后写回）；
@@ -485,5 +502,58 @@ mod tests {
         assert_eq!(m.list(), vec!["a", "b"], "list 按字典序");
         assert!(m.has("a"));
         assert!(!m.has("c"));
+    }
+
+    #[test]
+    fn t_mix17_voice_position_tracks_consumed_source_samples() {
+        // 100 样本 @1000Hz 的"小 Wav"：无设备，纯 mix_into 手动推进。
+        let mut m = Mixer::new();
+        m.register("v", mono(1000, &[300; 100]));
+        assert_eq!(m.voice_position("v"), None, "未播放：键无活动声部");
+        m.play("v", 1.0, false).unwrap();
+        assert_eq!(m.voice_position("v"), Some((0, 1000)), "开声即播：光标 0、源采样率如实带出");
+
+        // 同率推进：1000Hz 设备吃 40 帧 -> 已播 40 源样本。
+        let mut out = [0i16; 40];
+        m.mix_into(&mut out, 1000, 1);
+        assert_eq!(m.voice_position("v"), Some((40, 1000)));
+        m.mix_into(&mut out, 1000, 1);
+        assert_eq!(m.voice_position("v"), Some((80, 1000)));
+
+        // 重采样口径：读数是**源样本**空间 —— 500Hz 设备步进 2.0/帧，
+        // 10 设备帧 = 20 源样本（不是 10）。
+        let mut r = Mixer::new();
+        r.register("r", mono(1000, &[500; 100]));
+        r.play("r", 1.0, false).unwrap();
+        let mut half = [0i16; 10];
+        r.mix_into(&mut half, 500, 1);
+        assert_eq!(r.voice_position("r"), Some((20, 1000)), "光标单位 = 源样本");
+        assert_eq!(m.voice_position("v"), Some((80, 1000)), "各自混音器互不串扰");
+    }
+
+    #[test]
+    fn t_mix18_voice_position_none_after_finish_and_loop_wraps() {
+        let mut m = Mixer::new();
+        m.register("s", mono(1000, &[10; 100]));
+        m.play("s", 1.0, false).unwrap();
+        // 一次吃 120 帧（> 源长 100）：声部播完被移除 -> 读数归 None。
+        let mut out = [0i16; 120];
+        assert_eq!(m.mix_into(&mut out, 1000, 1), 1, "非循环到尾本帧移除");
+        assert_eq!(m.voice_position("s"), None, "播完移除后键无活动声部");
+
+        // stop_key 点名停同样归 None（音画同终判据的另一条来路）。
+        m.register("k", mono(1000, &[10; 100]));
+        m.play("k", 1.0, false).unwrap();
+        assert!(m.voice_position("k").is_some());
+        assert_eq!(m.stop_key("k"), 1);
+        assert_eq!(m.voice_position("k"), None);
+
+        // 循环声部永不移除：读数随回绕取模（10 帧源吃 25 帧 -> 光标 5）。
+        m.register("loop", mono(1000, &[10; 10]));
+        m.play("loop", 1.0, true).unwrap();
+        let mut out = [0i16; 25];
+        m.mix_into(&mut out, 1000, 1);
+        assert_eq!(m.voice_position("loop"), Some((5, 1000)), "回绕后余量保留");
+        assert_eq!(m.voice_position("ghost"), None, "未注册键如实 None");
     }
 }

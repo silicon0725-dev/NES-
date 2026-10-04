@@ -150,7 +150,7 @@
 //! ② **演示视频接入**：装配时若用户视频目录里有实测 AMV（不在仓库
 //! —— CI/他机安全跳过），复制进 assets/Media/ 并 declare_video 随
 //! bind 解析（首帧即上 GPU）。PLAY 会话自动起播（Output 记 "video on"，
-//! 音轨同步出声 —— P0 起点对齐）、STOP 停播（记 "video stopped"，
+//! 音频钟主控严格同步 —— S15.1）、STOP 停播（记 "video stopped"，
 //! stop_key 点名停音轨）。
 //!
 //! 运行：`cargo run --example editor_shell`
