@@ -16,6 +16,10 @@
 //!   `nes`（`nes.scene.find` / `nes.node.getPos|setPos|setVisible|getName`
 //!   / `nes.input.isPressed` / `nes.audio.play` / `nes.registerExtension`
 //!   / `nes.onUpdate`）；**不需要引擎在场 —— mock traits 即可驱动**；
+//!   S17.3 起 bootstrap 内含两件纯 JS 机制：**生成器协程调度器**
+//!   （`onUpdate`/`onSignal` 处理器可为 `function*`，帧计数驱动，见
+//!   [`COROUTINE_CAP`]）与**权限守卫**（`registerExtension` 第二参
+//!   声明权限数组，能力调用逐调用裁决，未授予 = JS 异常走 fault 隔离）；
 //! * [`JsExtension`] —— [`nes_extension_api::ExtensionLifecycle`] 的 JS
 //!   实现（update 钩子经全局蹦床转发到 JS 注册的回调）。
 //!
@@ -39,6 +43,6 @@ mod binding;
 mod runtime;
 mod value;
 
-pub use binding::{CapabilityBinding, JsExtension, NES_BOOTSTRAP_JS};
+pub use binding::{CapabilityBinding, COROUTINE_CAP, JsExtension, NES_BOOTSTRAP_JS};
 pub use runtime::{EXEC_BUDGET, INTERRUPTED_MARK, RquickjsRuntime};
 pub use value::{js_to_nes, nes_to_js};

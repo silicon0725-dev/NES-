@@ -3,20 +3,28 @@
 //! # 冻结的 JS 面（S17 第 1 期，P0）
 //!
 //! ```text
-//! nes.scene.find(name)                    -> NodeRef(number) | null
+//! nes.scene.find(name)                    -> NodeRef(number) | null   （需 "scene.read"）
 //! nes.node.getPos(ref)                    -> {x, y} 形态省略，P0 返回 [x, y] | null
-//! nes.node.setPos(ref, x, y)              -> undefined
-//! nes.node.setVisible(ref, v)             -> undefined
-//! nes.node.getName(ref)                   -> string | null
-//! nes.input.isPressed(name)               -> bool
-//! nes.audio.play(key, volume)             -> undefined
-//! nes.registerExtension(id)               -> undefined   （扩展自报身份）
-//! nes.onUpdate(fn)                        -> undefined   （P0 单回调槽）
-//! nes.onSignal(name, fn)                  -> undefined   （S17.2 注册 hat；
-//!                                            同名多个 handler = 都调，注册序）
-//! nes.emitSignal(name, payload)           -> undefined   （S17.2 反向发射；
+//!                                                                  （需 "scene.read"）
+//! nes.node.setPos(ref, x, y)              -> undefined               （需 "scene.write"）
+//! nes.node.setVisible(ref, v)             -> undefined               （需 "scene.write"）
+//! nes.node.getName(ref)                   -> string | null           （需 "scene.read"）
+//! nes.input.isPressed(name)               -> bool                    （需 "input"）
+//! nes.audio.play(key, volume)             -> undefined               （需 "audio"）
+//! nes.registerExtension(id[, perms])      -> undefined   （扩展自报身份 + S17.3 权限声明；
+//!                                             缺省 perms = 全授予，声明期静态）
+//! nes.onUpdate(fn)                        -> undefined   （P0 单回调槽；fn 可为生成器函数
+//!                                             —— S17.3 C4 帧驱动协程）
+//! nes.onSignal(name, fn)                  -> undefined   （S17.2 注册 hat，需 "signal"；
+//!                                            同名多个 handler = 都调，注册序；fn 可为
+//!                                            生成器函数 —— 每次触发新建实例）
+//! nes.emitSignal(name, payload)           -> undefined   （S17.2 反向发射，需 "signal"；
 //!                                            落地时序由宿主取走时机决定）
 //! ```
+//!
+//! 权限名全集（S17.3 B3）：`scene.read` / `scene.write` / `input` /
+//! `audio` / `signal`。未授予的能力调用抛
+//! `Error("permission denied: <cap>")` → 既有 fault 隔离路径（不炸不静默）。
 //!
 //! NodeRef 在 JS 侧是**不透明 number**（P0 位形 < 2^53，double 精确承载）。
 //!
@@ -46,33 +54,125 @@ use nes_extension_api::{
 use crate::runtime::RquickjsRuntime;
 use crate::value::js_to_nes;
 
+/// 扩展协程容量上界（S17.3 C4；**每扩展**的活动生成器实例数）。
+///
+/// 真源是 [`NES_BOOTSTRAP_JS`] 里的 `__nes_coro_cap`（调度器在 JS 侧，
+/// Rust 不参与驱动）—— 本常量是它与 Rust 世界的同步锚（集成测试核对
+/// 两侧字面量一致），超限行为 = 拒新留旧 + 抛错（走既有 fault 路径）。
+pub const COROUTINE_CAP: u32 = 32;
+
 /// `nes` 对象组装 + update 蹦床 + 信号 hat 表（ASCII；在能力函数注入**之后**求值）。
 ///
 /// S17.2 信号面（照 onUpdate 的形态：JS 值留在 JS 堆，Rust 侧零句柄）：
 /// * `__nes_signal_handlers`：名字 -> handler 数组（`nes.onSignal` 注册序）；
 /// * `nes.onSignal(name, fn)`：handler 入 JS 堆表 + 经 `__nes_signal_subscribe`
-///   向宿主声明订阅名一次（泵过滤器据此装配）；
+///   向宿主声明订阅名一次（泵过滤器据此装配）；**需 "signal" 权限**（S17.3）；
 /// * `__nes_signal_dispatch(name, payload)`：宿主派发入口 —— 逐 handler
 ///   try/catch（单个 handler 抛错不殃及同表后续 handler），首个错误在循环
 ///   后重抛 —— 错误文本沿标准 `rt.call` 错误路径浮出成 fault（S17.1 隔离），
 ///   预算中断（uncatchable）直接浮出；
 /// * `nes.emitSignal(name, payload)`：经 `__nes_signal_emit` 进宿主
-///   SignalCapability（泵内派发期间 = 同泵级联；update 期 = 下帧泵）。
+///   SignalCapability（泵内派发期间 = 同泵级联；update 期 = 下帧泵）；
+///   **需 "signal" 权限**（S17.3）。
+///
+/// S17.3 C4 生成器协程（纯 JS 侧调度器，每扩展一份 —— 上下文即沙箱边界）：
+/// * `onUpdate` / `onSignal` 的处理器**可为生成器函数**（`function*`）——
+///   包装判定：调用返回值有 `.next`（生成器对象）→ 进入调度器；普通返回值
+///   = 一次性执行（现状）。语法糖不需要存在：`yield n` 即 "停 n 帧"；
+/// * `__nes_coros`：活动生成器表 `{gen, wait}`；`__nes_update` 每帧先
+///   [`drive`](C4 帧驱动) 全表再调一次性钩子 —— `wait > 0` 减一（归零当帧
+///   仍停，次帧推进）；`wait == 0` 推进 `gen.next()`；`done` 移除；`value`
+///   为正数 → `wait = floor(value)`，其余（裸 yield / 非数 / 非正数）→ 1/0
+///   （裸 yield = 停一帧；`yield 0` = 不停顿）；
+/// * hat 触发 = **新建生成器实例**（Scratch startHats 重入语义）：派发即推
+///   首段（预算内），后续帧随 `__nes_update` 推进；同 hat 并发多实例；总
+///   量超 [`COROUTINE_CAP`] → 拒新留旧 + 抛错（fault 计数）；
+/// * 生成器内 throw → 逐表项 try/catch、首错循环后重抛 → 既有 fault 隔离
+///   （S17.1）；生成器推进在 `__nes_update`/派发同一次 `rt.call` 内 =
+///   同一份 ExecBudget 预算。
+///
+/// S17.3 B3 权限模型（声明期静态；裁决点 = 能力注入处的方法包装）：
+/// * `nes.registerExtension(id[, perms])`：第二参为权限名数组（如
+///   `["scene.read", "scene.write", "input", "audio", "signal"]`）——
+///   **缺省 = 全授予**（hello.js 兼容；Beta 后可切 default-deny）；
+///   空数组 = 全拒绝；未知名忽略（前向兼容）；注册期定死，运行期无提权；
+/// * `__nes_guard(cap, fn)`：逐调用裁决 —— 未授予抛
+///   `Error("permission denied: <cap>")` → 既有 fault 隔离路径（不炸不静默）。
 pub const NES_BOOTSTRAP_JS: &str = r#"
 globalThis.__nes_signal_handlers = {};
+globalThis.__nes_coros = [];
+globalThis.__nes_coro_cap = 32;
+globalThis.__nes_grants = null;
+globalThis.__nes_is_generator = function (v) {
+  return v !== null && typeof v === "object" && typeof v.next === "function";
+};
+globalThis.__nes_allowed = function (cap) {
+  var g = globalThis.__nes_grants;
+  return g === null || g.indexOf(cap) !== -1;
+};
+globalThis.__nes_guard = function (cap, fn) {
+  return function () {
+    if (!globalThis.__nes_allowed(cap)) {
+      throw new Error("permission denied: " + cap);
+    }
+    return fn.apply(null, arguments);
+  };
+};
+globalThis.__nes_coro_step = function (e) {
+  var r = e.gen.next();
+  if (r.done) { return false; }
+  var w = 1;
+  if (typeof r.value === "number" && isFinite(r.value)) {
+    w = Math.floor(r.value);
+    if (w < 0) { w = 0; }
+  }
+  e.wait = w;
+  return true;
+};
+globalThis.__nes_coro_start = function (gen) {
+  if (globalThis.__nes_coros.length >= globalThis.__nes_coro_cap) {
+    throw new Error("coroutine cap exceeded: max " + globalThis.__nes_coro_cap + " active generators per extension");
+  }
+  var e = { gen: gen, wait: 0 };
+  if (globalThis.__nes_coro_step(e)) { globalThis.__nes_coros.push(e); }
+};
+globalThis.__nes_coro_drive = function () {
+  var table = globalThis.__nes_coros;
+  var keep = [];
+  var firstError = null;
+  for (var i = 0; i < table.length; i++) {
+    var e = table[i];
+    var alive = true;
+    try {
+      if (e.wait > 0) { e.wait = e.wait - 1; }
+      else { alive = globalThis.__nes_coro_step(e); }
+    } catch (err) {
+      alive = false;
+      if (firstError === null) { firstError = err; }
+    }
+    if (alive) { keep.push(e); }
+  }
+  globalThis.__nes_coros = keep;
+  if (firstError !== null) { throw firstError; }
+};
 globalThis.nes = {
-  scene: { find: globalThis.__nes_scene_find },
+  scene: { find: globalThis.__nes_guard("scene.read", globalThis.__nes_scene_find) },
   node: {
-    getPos: globalThis.__nes_node_get_pos,
-    setPos: globalThis.__nes_node_set_pos,
-    setVisible: globalThis.__nes_node_set_visible,
-    getName: globalThis.__nes_node_get_name
+    getPos: globalThis.__nes_guard("scene.read", globalThis.__nes_node_get_pos),
+    setPos: globalThis.__nes_guard("scene.write", globalThis.__nes_node_set_pos),
+    setVisible: globalThis.__nes_guard("scene.write", globalThis.__nes_node_set_visible),
+    getName: globalThis.__nes_guard("scene.read", globalThis.__nes_node_get_name)
   },
-  input: { isPressed: globalThis.__nes_input_is_pressed },
-  audio: { play: globalThis.__nes_audio_play },
-  registerExtension: function (id) { globalThis.__nes_extension_id = id; },
+  input: { isPressed: globalThis.__nes_guard("input", globalThis.__nes_input_is_pressed) },
+  audio: { play: globalThis.__nes_guard("audio", globalThis.__nes_audio_play) },
+  registerExtension: function (id, perms) {
+    globalThis.__nes_extension_id = id;
+    globalThis.__nes_grants = (perms === undefined || perms === null)
+      ? null
+      : Array.from(perms, function (p) { return String(p); });
+  },
   onUpdate: function (fn) { globalThis.__nes_update_hook = fn; },
-  onSignal: function (name, fn) {
+  onSignal: globalThis.__nes_guard("signal", function (name, fn) {
     if (typeof fn !== "function") { throw new Error("onSignal: handler must be a function"); }
     var t = globalThis.__nes_signal_handlers;
     if (t[name] === undefined) {
@@ -80,16 +180,23 @@ globalThis.nes = {
       globalThis.__nes_signal_subscribe(name);
     }
     t[name].push(fn);
-  },
-  emitSignal: globalThis.__nes_signal_emit
+  }),
+  emitSignal: globalThis.__nes_guard("signal", globalThis.__nes_signal_emit)
 };
 globalThis.__nes_set_extension_id = function (id) { globalThis.__nes_extension_id = id; };
 globalThis.__nes_get_extension_id = function () {
   return globalThis.__nes_extension_id === undefined ? null : globalThis.__nes_extension_id;
 };
 globalThis.__nes_update = function () {
+  globalThis.__nes_coro_drive();
   var hook = globalThis.__nes_update_hook;
-  if (typeof hook === "function") { hook(); }
+  if (typeof hook === "function") {
+    var ret = hook();
+    if (globalThis.__nes_is_generator(ret)) {
+      globalThis.__nes_update_hook = null;
+      globalThis.__nes_coro_start(ret);
+    }
+  }
 };
 globalThis.__nes_signal_dispatch = function (name, payload) {
   var list = globalThis.__nes_signal_handlers[name];
@@ -98,7 +205,8 @@ globalThis.__nes_signal_dispatch = function (name, payload) {
   var firstError = null;
   for (var i = 0; i < list.length; i++) {
     try {
-      list[i](payload);
+      var ret = list[i](payload);
+      if (globalThis.__nes_is_generator(ret)) { globalThis.__nes_coro_start(ret); }
       called = called + 1;
     } catch (e) {
       if (firstError === null) { firstError = e; }
@@ -376,7 +484,11 @@ impl ExtensionLifecycle for JsExtension {
     }
 
     fn update(&mut self) {
-        // 经全局蹦床调 JS 注册的 onUpdate 回调（P0 单回调槽）。
+        // 错误状态按次自洽（与 dispatch_signal 同一口径：每次调用先清上次
+        // 残留 —— 成功路径的 last_error 必为 None）。
+        self.last_error = None;
+        // 经全局蹦床调 JS 注册的 onUpdate 回调（P0 单回调槽；S17.3 起蹦床
+        // 先驱动生成器协程表，再调一次性钩子 —— 错误沿同一通道浮出）。
         match self.runtime.borrow_mut().call(self.ctx, "__nes_update", &[]) {
             Ok(_) => {}
             Err(e) => self.last_error = Some(e.to_string()),
