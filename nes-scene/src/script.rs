@@ -234,6 +234,20 @@ pub enum Op {
         /// 播放模式。
         mode: TweenMode,
     },
+    /// 精灵锚点补间（S16.4）：`tween_pivot "name" px py ms ["easing"]
+    /// ["mode"]` 的编译产物。栈交互与 [`Op::TweenScale`] 同构（弹序
+    /// ms、py、px —— 压序 px、py、ms = 源序）；写 Sprite2D 的 `pivot`
+    /// 属性（Vec2 归一化 0..1，经既有属性写路径 —— 进语义指纹，与
+    /// alpha/frame 同口径）。px/py 超界照实接受不钳制（S16.3 越界锚定
+    /// 合法语义）；`from` 在 Cmd 落地时采样当前 pivot 属性值。
+    TweenPivot {
+        /// 目标节点名。
+        name: String,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
     /// 停止补间（S16；S16.1 起 = 该节点**全部通道**）：`tween_stop "name"`
     /// 的编译产物。**零栈交互**（照 `play` 形态）；执行 = 经
     /// [`VmCtx::tween_stop`] 发 [`crate::tree::Cmd::TweenStop`]，各通道
@@ -419,6 +433,21 @@ impl VmCtx<'_, '_> {
         match self {
             VmCtx::Node(c) => c.tween_frame(node, from, to, duration_ms, easing, mode),
             VmCtx::Signal(c) => c.tween_frame(node, from, to, duration_ms, easing, mode),
+        }
+    }
+
+    /// 精灵锚点补间（S16.4）：两入口同权。
+    fn tween_pivot(
+        &mut self,
+        node: NodeId,
+        to: Vec2,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        match self {
+            VmCtx::Node(c) => c.tween_pivot(node, to.x, to.y, duration_ms, easing, mode),
+            VmCtx::Signal(c) => c.tween_pivot(node, to.x, to.y, duration_ms, easing, mode),
         }
     }
 
@@ -1050,6 +1079,22 @@ fn run<'a, 'b>(
                     *mode,
                 );
             }
+            Op::TweenPivot { name, easing, mode } => {
+                // tween_pivot "name" px py ms ["easing"] ["mode"]（S16.4）：
+                // 与 TweenScale 同构 —— 弹序 ms、py、px；写 Sprite2D 的
+                // pivot 属性（归一化 Vec2；越界照实接受，树侧不钳制）。
+                let ms = pop_val!();
+                let pyv = pop_val!();
+                let pxv = pop_val!();
+                let (Some(px), Some(py), Some(ms)) = (num_of(&pxv), num_of(&pyv), num_of(&ms))
+                else {
+                    halt!("tween_pivot 需要数值 px py ms");
+                };
+                let Some(node) = ctx.tree().find_by_name(name) else {
+                    halt!(format!("tween_pivot(\"{name}\") 找不到该名节点"));
+                };
+                ctx.tween_pivot(node, Vec2::new(px, py), ms as f64, *easing, *mode);
+            }
             Op::TweenStop { name } => {
                 // tween_stop "name"（S16；S16.1 起 = 全部通道）：零栈交互，
                 // 目标解析同 TweenPos。
@@ -1592,6 +1637,8 @@ impl SceneObserver for ScriptVm {
 //     tween_frame "b" 0 4 600 "linear" "loop"     // 图集帧补间（S16.2；写
 //                                                 // Sprite2D.frame，loop+回绕
 //                                                 // = 走路循环）
+//     tween_pivot "b" 0.5 0.5 600    // 锚点补间（S16.4；写 Sprite2D.pivot，
+//                                    // 归一化 Vec2，越界照实接受）
 //     tween_stop "box"               // 停止补间（S16.1 起 = 该节点全部通道）
 // }
 // ```
@@ -1874,10 +1921,10 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 23] = [
+const RESERVED: [&str; 24] = [
     "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
     "arg", "this", "true", "false", "play", "video_play", "video_stop", "tween_pos", "tween_stop",
-    "tween_scale", "tween_alpha", "tween_frame",
+    "tween_scale", "tween_alpha", "tween_frame", "tween_pivot",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -2583,6 +2630,39 @@ impl TextParser {
                 }
                 let (easing, mode) = self.opt_easing_mode()?;
                 ops.push(Op::TweenFrame { name, easing, mode });
+                Ok(())
+            }
+            // tween_pivot 语句（S16.4）：`tween_pivot "name" px py ms
+            // ["easing"] ["mode"]` —— 与 tween_scale 同构的双表达式语句
+            //（弹序 ms、py、px；写 Sprite2D 的 pivot 属性，归一化 Vec2；
+            // 超界照实接受不钳制 —— S16.3 越界锚定合法语义）。
+            Tok::Ident(k) if k == "tween_pivot" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                self.expr(ops)?; // px
+                self.expr(ops)?; // py
+                let ms_at = ops.len();
+                self.expr(ops)?; // ms
+                let lit_ms = match &ops[ms_at..] {
+                    [Op::Const(Value::I64(i))] => Some(*i as f64),
+                    [Op::Const(Value::F32(f))] => Some(*f as f64),
+                    [Op::Const(Value::I64(0)), Op::Const(Value::I64(n)), Op::Sub] => {
+                        Some(-(*n as f64))
+                    }
+                    [Op::Const(Value::I64(0)), Op::Const(Value::F32(f)), Op::Sub] => {
+                        Some(-(*f as f64))
+                    }
+                    _ => None,
+                };
+                if let Some(ms) = lit_ms {
+                    if ms <= 0.0 {
+                        return Err(
+                            self.err_here(format!("tween_pivot 的 ms 必须 > 0（得到 {ms}）"))
+                        );
+                    }
+                }
+                let (easing, mode) = self.opt_easing_mode()?;
+                ops.push(Op::TweenPivot { name, easing, mode });
                 Ok(())
             }
             // tween_stop 语句（S16；S16.1 起 = 全部通道）：`tween_stop "name"`

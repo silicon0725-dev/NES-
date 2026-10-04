@@ -186,7 +186,8 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
         h = mix(h, b"|"); // 节点分隔
     }
 
-    // 补间登记表（S16 第 1 期；S16.1 起三通道 + 缓动/模式）—— **条件混入**：
+    // 补间登记表（S16 第 1 期；S16.1 起缓动/模式 + 通道，S16.4 加 pivot
+    // —— 共五变体）—— **条件混入**：
     // 补间是游戏可见状态（每 tick 直写节点 local/属性），登记表本身必须可
     // 复现、进指纹；但采样面做成"有补间才摺进" —— 无补间的场景（登记表空）
     // 零混入，既有基线指纹逐位不变（S16 冻结：基线漂移即为实现错误）。
@@ -208,7 +209,10 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
             h = mix(h, tw.channel.kind().as_bytes());
             match &tw.channel {
                 crate::tree::TweenChannel::Pos { from, to }
-                | crate::tree::TweenChannel::Scale { from, to } => {
+                | crate::tree::TweenChannel::Scale { from, to }
+                // 锚点通道（S16.4）：同为 Vec2 对（x/y 逐分量位形）—— 与
+                // pos/scale 同一混入口径（写属性面进指纹，与 alpha 同理）。
+                | crate::tree::TweenChannel::Pivot { from, to } => {
                     h = mix(h, &from.x.to_bits().to_le_bytes());
                     h = mix(h, &from.y.to_bits().to_le_bytes());
                     h = mix(h, &to.x.to_bits().to_le_bytes());

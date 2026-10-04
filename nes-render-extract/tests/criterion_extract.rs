@@ -36,7 +36,9 @@ use nes_render_extract::{
     affine2_of, ExtractStats, RenderExtractor, RenderKeySource, PROP_FLIP_H, PROP_FLIP_V,
     PROP_TEXTURE, PROP_VISIBLE, PROP_Z_INDEX,
 };
-use nes_scene::{Affine, NodeId, NodeKind, ResId, ResourceTable, SceneTree, Transform2D, Value};
+use nes_scene::{
+    Affine, NodeId, NodeKind, ResId, ResourceTable, SceneTree, ScriptVm, Transform2D, Value,
+};
 
 // ---------------------------------------------------------------- 公共替身与工具
 
@@ -1427,4 +1429,72 @@ fn pivot_prop_pushes_set_pivot() {
     assert_synced(&ex, &srv, &stats);
     assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetPivot { .. })));
     assert_eq!(srv.pivot_of(handle), None, "销毁随条目清理");
+}
+
+/// T-TP-03（S16.4 补间 pivot 通道的渲染跟随）：`tween_pivot` 推进直写
+/// `pivot` 属性（场景层真实树状态）——提取层每帧直读该属性的既有路径
+/// （S16.3）自动跟随：推进中属性非 (0,0) -> `SetPivot` 被推；时满落位
+/// 终值渲染照收。本测试走**全链**：脚本语句编译 -> VM 登记 -> 树推进
+/// 阶段写属性 -> 提取推命令（零渲染侧新路径）。
+#[test]
+fn tween_pivot_render_follows_set_pivot() {
+    let keys = KeyMap::new();
+    keys.set(ResId::new(1), key(1, 1));
+
+    let mut tree = SceneTree::new("root");
+    let sprite = add_root_sprite(&mut tree, "s1", ResId::new(1));
+    let root = tree.root();
+    let brain = tree.add_node(root, "brain", NodeKind::Script);
+    tree.apply_pending(); // 脚本节点先落地（attach_all 只认在树节点）
+    set_prop(
+        &mut tree,
+        brain,
+        "source",
+        Value::Str(r#"on "go" { tween_pivot "s1" 0.5 0.5 1000 }"#.into()),
+    );
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(&mut tree).is_empty());
+
+    let mut ex = RenderExtractor::new();
+    let mut srv = NullRenderServer::new();
+    let mut out = Vec::new();
+
+    // 补间未登记帧：pivot 属性 = 缺省 (0,0)，命令流没有任何 SetPivot
+    //（加性缺省，与 S16.3 既有口径一致）。
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 1);
+    assert_synced(&ex, &srv, &stats);
+    assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetPivot { .. })));
+    let handle = ex.handle_of(sprite).expect("已建条目");
+
+    // 登记补间（信号泵落地）+ 推进 500ms：tween 直写 pivot 属性 =
+    // (0.25, 0.25)（场景层读面先钉住，属性写 = 进指纹）。
+    tree.emit_signal("go", Value::I64(0));
+    let _ = tree.tick(1.0 / 60.0, &mut vm);
+    let _ = tree.tick(0.5, &mut vm);
+    assert_eq!(
+        tree.prop(sprite, "pivot"),
+        Some(&Value::vec2(0.25, 0.25)),
+        "补间推进写 pivot 属性（场景层读面）"
+    );
+
+    // 提取侧：推进中 pivot 属性非 (0,0) -> SetPivot 被推（渲染自动跟随，
+    // 本通道零渲染侧新路径 —— 走 S16.3 既有属性直读路径）。
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 2);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.pivot_of(handle),
+        Some(&[0.25, 0.25]),
+        "tween 推进中 SetPivot 被推（渲染跟随）"
+    );
+
+    // 时满落位 (0.5, 0.5)：登记移除、渲染跟随到终值。
+    let _ = tree.tick(0.5, &mut vm);
+    assert!(tree.tweens().is_empty(), "时满移除登记");
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 3);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.pivot_of(handle),
+        Some(&[0.5, 0.5]),
+        "落位终值渲染照收"
+    );
 }

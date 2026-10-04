@@ -13,10 +13,14 @@
 //! | T-S-01 | `tween_scale` 中点断言（scale 插值）+ 与 pos 通道并存互不干扰（last-wins 按（节点，通道）二元组） |
 //! | T-A-01 | `tween_alpha` 推进中 alpha 属性值变化（schema 读面，真实树状态）+ 越界夹取 + 到站落位 |
 //! | T-SIG-01 | 到站信号：载荷 = 节点名 Str；每通道完成各发一条、次序 = 注册序（同帧双通道完成 = 两条 tween_done） |
+//! | T-TP-01 | `tween_pivot`（S16.4）：登记（from = 当前 pivot 属性）-> 中点断言（pivot 属性读面 = (0.25,0.25)）-> 完成落 (0.5,0.5) + 到站信号；px/py 越界照实接受（不钳制）；解析产物形状 + 字面量 ms <= 0 报错 + 保留字 |
+//! | T-TP-02 | pivot yoyo 去回往返（到 to 换向不落位、回零落 from + 移除 + 信号）；last-wins 中途换程从当前 pivot 起算（不跳变）；`tween_stop` 全通道语义含 pivot（与 pos 并存一并停） |
 //!
 //! 补间是**游戏可见状态**（推进在 `SceneTree::tick` 专属阶段：结构落地后、
 //! enter/process 前，每 tick 直写 local/属性并进语义指纹）；序列化面是
 //! **会话态**（不进 RON 往返 —— 补间不在 `NodeData`，`to_doc` 天然不携带）。
+//! pivot 通道的渲染跟随（提取层直读 pivot 属性推 SetPivot 的既有路径）
+//! 由提取层的 T-TP-03（criterion_extract.rs）钉住。
 
 use nes_scene::{
     compile_script, scene_fingerprint, NodeId, NodeKind, Op, SceneTree, ScriptEntry, ScriptVm,
@@ -755,5 +759,290 @@ fn t_sig_01_tween_done_payload_and_order() {
         local_of(&vm, watch, "second"),
         Some(Value::Str("bbb".into())),
         "次序 = 注册序"
+    );
+}
+
+// ---------------------------------------------------------------- S16.4 pivot 通道
+
+/// T-TP-01：pivot 通道（S16.4）—— 解析产物形状 / 字面量 ms <= 0 解析期
+/// 报错 / 保留字；登记（from = 当前 pivot 属性，缺省 (0,0)）-> 中点断言
+///（推进写 `pivot` 属性，schema 读面 = (0.25,0.25) —— 真实树状态，与
+/// alpha 同口径进指纹）-> 完成落 (0.5,0.5) + 到站信号；px/py 越界照实
+/// 接受（S16.3 越界锚定合法语义，不钳制）。
+#[test]
+fn t_tp_01_pivot_channel_advances_prop_and_lands() {
+    // 解析产物形状：px/py/ms 三表达式 + TweenPivot（压序 = 源序；缺省缓动/模式）。
+    let script = compile_script(r#"every { tween_pivot "box" 0.25 0.75 500 }"#).expect("compile");
+    assert_eq!(
+        script.ops,
+        vec![
+            Op::Const(Value::F32(0.25)),
+            Op::Const(Value::F32(0.75)),
+            Op::Const(Value::I64(500)),
+            Op::TweenPivot {
+                name: "box".into(),
+                easing: TweenEasing::Linear,
+                mode: TweenMode::Once,
+            },
+        ]
+    );
+    // 可选尾缀（缓动名 / 模式名）照位落进编译产物。
+    let script = compile_script(r#"every { tween_pivot "box" 0 0 500 "smoothstep" "yoyo" }"#)
+        .expect("compile");
+    assert_eq!(
+        script.ops,
+        vec![
+            Op::Const(Value::I64(0)),
+            Op::Const(Value::I64(0)),
+            Op::Const(Value::I64(500)),
+            Op::TweenPivot {
+                name: "box".into(),
+                easing: TweenEasing::Smoothstep,
+                mode: TweenMode::Yoyo,
+            },
+        ]
+    );
+    // 字面量 ms <= 0：解析期报错；保留字不得作变量名。
+    assert!(compile_script(r#"every { tween_pivot "box" 0 0 0 }"#).is_err());
+    assert!(compile_script(r#"every { tween_pivot "box" 0 0 -5 }"#).is_err());
+    assert!(compile_script(r#"every { tween_pivot = 1 }"#).is_err());
+    assert!(compile_script(r#"every { x = tween_pivot }"#).is_err());
+
+    // 推进面。
+    let mut t = SceneTree::new("root");
+    let spr = t.add_node(t.root(), "spr", NodeKind::Sprite2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    let far_brain = t.add_node(t.root(), "far_brain", NodeKind::Script);
+    let watch = t.add_node(t.root(), "watch", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(
+        brain,
+        "source",
+        Value::Str(r#"on "go" { tween_pivot "spr" 0.5 0.5 1000 }"#.into()),
+    )
+    .unwrap();
+    t.set_prop(
+        far_brain,
+        "source",
+        Value::Str(r#"on "far" { tween_pivot "spr" -0.25 1.5 100 }"#.into()),
+    )
+    .unwrap();
+    t.set_prop(watch, "source", Value::Str(TWEEN_DONE_WATCH.into()))
+        .unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(&mut t).is_empty());
+    assert_eq!(
+        t.prop(spr, "pivot"),
+        Some(&Value::Vec2(Vec2::ZERO)),
+        "schema 缺省物化 pivot=(0,0)"
+    );
+
+    // 登记：from = 落地时当前 pivot 属性（缺省 (0,0)）、缺省 linear/once。
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(t.tweens().len(), 1, "补间已登记");
+    assert!(
+        matches!(&t.tweens()[0].channel, TweenChannel::Pivot { from, to }
+            if *from == Vec2::ZERO && *to == Vec2::new(0.5, 0.5)),
+        "from = 当前 pivot、to = 终点：{:?}",
+        t.tweens()[0].channel
+    );
+    assert_eq!(t.tweens()[0].duration_ms, 1000.0);
+    assert_eq!(t.tweens()[0].easing, TweenEasing::Linear, "缺省缓动 = linear");
+    assert_eq!(t.tweens()[0].mode, TweenMode::Once, "缺省模式 = once");
+
+    // 中点：t = 0.5 -> pivot 属性 = (0.25, 0.25)（既有属性写路径，schema 可读）。
+    let _ = t.tick(0.5, &mut vm);
+    assert_eq!(
+        t.prop(spr, "pivot"),
+        Some(&Value::Vec2(Vec2::new(0.25, 0.25))),
+        "中点插值写 pivot 属性"
+    );
+
+    // 时满落位 (0.5, 0.5) + 到站信号恰一次（载荷 = 节点名）。
+    let _ = t.tick(0.5, &mut vm);
+    assert_eq!(
+        t.prop(spr, "pivot"),
+        Some(&Value::Vec2(Vec2::new(0.5, 0.5))),
+        "落位终值"
+    );
+    assert!(t.tweens().is_empty(), "时满移除登记");
+    assert_eq!(local_of(&vm, watch, "n"), Some(Value::I64(1)), "到站信号");
+    assert_eq!(
+        local_of(&vm, watch, "first"),
+        Some(Value::Str("spr".into())),
+        "载荷 = 节点名"
+    );
+    // 登记表已空：额外 tick 零行为（pivot 保持）。
+    let _ = t.tick(1.0, &mut vm);
+    assert_eq!(t.prop(spr, "pivot"), Some(&Value::Vec2(Vec2::new(0.5, 0.5))));
+
+    // 越界照实接受（S16.3 越界锚定合法语义）：to (-0.25, 1.5) 不钳制；
+    // from = 上程落位值（同节点同通道换程从当前值起算）。
+    t.emit_signal("far", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert!(
+        matches!(&t.tweens()[0].channel, TweenChannel::Pivot { from, to }
+            if *from == Vec2::new(0.5, 0.5) && *to == Vec2::new(-0.25, 1.5)),
+        "from = 上程落位值、to 越界不钳制：{:?}",
+        t.tweens()[0].channel
+    );
+    let _ = t.tick(0.1, &mut vm);
+    assert_eq!(
+        t.prop(spr, "pivot"),
+        Some(&Value::Vec2(Vec2::new(-0.25, 1.5))),
+        "越界终点照实落位"
+    );
+    assert!(t.tweens().is_empty());
+}
+
+/// T-TP-02：pivot 通道的组合行为 —— yoyo 去回往返（到 to 换向不落位、
+/// 回零落 from + 移除 + 到站信号恰一次）；last-wins 中途换程从当前实际
+/// pivot 起算（不跳变、注册表不叠加）；`tween_stop` 全通道语义含 pivot
+///（与 pos 并存一并停）。
+#[test]
+fn t_tp_02_pivot_yoyo_last_wins_and_stop_all() {
+    let pivot_of = |t: &SceneTree, spr: NodeId| -> Vec2 {
+        match t.prop(spr, "pivot") {
+            Some(Value::Vec2(p)) => *p,
+            other => panic!("pivot 属性缺失或类型不符：{:?}", other),
+        }
+    };
+
+    // --- yoyo：去 (0,0)->(0,1)、回 (0,1)->(0,0)；duration 1000 -> 总时长 2000ms。
+    let mut t = SceneTree::new("root");
+    let spr = t.add_node(t.root(), "spr", NodeKind::Sprite2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    let watch = t.add_node(t.root(), "watch", NodeKind::Script);
+    t.apply_pending();
+    t.set_prop(
+        brain,
+        "source",
+        Value::Str(r#"on "go" { tween_pivot "spr" 0.0 1.0 1000 "linear" "yoyo" }"#.into()),
+    )
+    .unwrap();
+    t.set_prop(watch, "source", Value::Str(TWEEN_DONE_WATCH.into()))
+        .unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(&mut t).is_empty());
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(t.tweens().len(), 1);
+    assert_eq!(t.tweens()[0].mode, TweenMode::Yoyo, "模式落进登记");
+
+    // 去程：p = 0.5 -> (0, 0.5)；p = 1.0 -> 到 to（换向不落位不移除、不到站）。
+    let _ = t.tick(0.5, &mut vm);
+    assert_eq!(pivot_of(&t, spr), Vec2::new(0.0, 0.5), "去程中点");
+    let _ = t.tick(0.5, &mut vm);
+    assert_eq!(pivot_of(&t, spr), Vec2::new(0.0, 1.0), "去程到 to");
+    assert_eq!(t.tweens().len(), 1, "yoyo 换向不落位不移除");
+    assert_eq!(local_of(&vm, watch, "n"), None, "换向点不是到站");
+
+    // 回程：p = 1.5 -> shape = 0.5 -> (0, 0.5)；p = 2.0 -> 回零落位 from +
+    // 移除 + 到站信号恰一次。
+    let _ = t.tick(0.5, &mut vm);
+    assert_eq!(pivot_of(&t, spr), Vec2::new(0.0, 0.5), "回程中点");
+    let _ = t.tick(0.5, &mut vm);
+    assert_eq!(pivot_of(&t, spr), Vec2::ZERO, "回零落位 from");
+    assert!(t.tweens().is_empty(), "yoyo 完成移除登记");
+    assert_eq!(local_of(&vm, watch, "n"), Some(Value::I64(1)), "到站信号恰一次");
+    assert_eq!(
+        local_of(&vm, watch, "first"),
+        Some(Value::Str("spr".into()))
+    );
+
+    // --- last-wins 中途换程：新程从当前实际 pivot 起算（不跳变、不叠加）。
+    let mut t = SceneTree::new("root");
+    let spr = t.add_node(t.root(), "spr", NodeKind::Sprite2D);
+    let brain = t.add_node(t.root(), "brain", NodeKind::Script);
+    let redo = add_signal_script(
+        &mut t,
+        "redo_brain",
+        "redo",
+        r#"on "redo" { tween_pivot "spr" 0.0 1.0 400 }"#,
+    );
+    let both = add_signal_script(
+        &mut t,
+        "both_brain",
+        "both",
+        r#"on "both" { tween_pivot "spr" 0.5 0.5 1000; tween_pos "spr" 9.0 9.0 1000 }"#,
+    );
+    let halt = add_signal_script(&mut t, "halt_brain", "halt", r#"on "halt" { tween_stop "spr" }"#);
+    let _ = (redo, both, halt);
+    t.set_prop(
+        brain,
+        "source",
+        Value::Str(r#"on "go" { tween_pivot "spr" 1.0 1.0 1000 }"#.into()),
+    )
+    .unwrap();
+    let mut vm = ScriptVm::new();
+    assert!(vm.attach_all(&mut t).is_empty());
+
+    // 首程推进 250ms -> pivot = (0.25, 0.25)。
+    t.emit_signal("go", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    let _ = t.tick(0.25, &mut vm);
+    assert_eq!(pivot_of(&t, spr), Vec2::new(0.25, 0.25), "首程 1/4 处");
+
+    // 进行中换程（last-wins）：本 tick 先推进旧程（1.75 阶段），信号泵后
+    // 落地新程 —— from = 落地时当前实际 pivot（含本帧推进），注册表长度
+    // 仍 1（替换非叠加）；登记本身不挪属性（不跳变）。
+    t.emit_signal("redo", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(t.tweens().len(), 1, "last-wins：替换而非叠加");
+    let tw = t.tweens()[0].clone();
+    let (tw_from, tw_to) = match &tw.channel {
+        TweenChannel::Pivot { from, to } => (*from, *to),
+        other => panic!("pivot 通道预期，实际 {other:?}"),
+    };
+    assert_eq!(tw_to, Vec2::new(0.0, 1.0), "新程终点");
+    assert_eq!(tw.elapsed_ms, 0.0, "换程从头计");
+    let cur = pivot_of(&t, spr);
+    assert!(
+        approx(tw_from.x, cur.x) && approx(tw_from.y, cur.y),
+        "from = 落地时当前实际 pivot（不跳变）：from={:?} pivot={:?}",
+        tw_from,
+        cur
+    );
+    assert!(
+        tw_from.x > 0.25,
+        "from 含本帧推进（> 0.25），不是旧起点 0：{:?}",
+        tw_from
+    );
+
+    // 新程推进 200ms -> t = 0.5 -> from 与 (0,1) 的中点（换程连续无跳变）。
+    let _ = t.tick(0.2, &mut vm);
+    let p = pivot_of(&t, spr);
+    assert!(
+        approx(p.x, tw_from.x * 0.5) && approx(p.y, tw_from.y * 0.5 + 0.5),
+        "新程中点：{:?}（from={:?}）",
+        p,
+        tw_from
+    );
+
+    // tween_stop（S16.1 起 = 全部通道，S16.4 确认 pivot 臂包含在内）：
+    // pivot + pos 并存时一并停，各通道停在当前值。
+    t.emit_signal("both", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert_eq!(t.tweens().len(), 2, "pivot + pos 并存");
+    t.emit_signal("halt", Value::I64(0));
+    let _ = t.tick(1.0 / 60.0, &mut vm);
+    assert!(t.tweens().is_empty(), "tween_stop = 全部通道一并停（含 pivot）");
+    let p = pivot_of(&t, spr);
+    let pos = t.local(spr).unwrap().pos;
+    let _ = t.tick(1.0, &mut vm);
+    let p2 = pivot_of(&t, spr);
+    let pos2 = t.local(spr).unwrap().pos;
+    assert!(
+        approx(p.x, p2.x) && approx(p.y, p2.y),
+        "pivot 停在当前值：{:?} vs {:?}",
+        p,
+        p2
+    );
+    assert!(
+        approx(pos.x, pos2.x) && approx(pos.y, pos2.y),
+        "pos 同停：{:?} vs {:?}",
+        pos,
+        pos2
     );
 }
