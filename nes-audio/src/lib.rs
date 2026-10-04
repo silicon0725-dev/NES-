@@ -32,14 +32,24 @@
 //! # waveOut 线程模型（[`device`] 模块 doc 有全图）
 //!
 //! `CALLBACK_NULL`（无回调）+ 专属线程轮询：线程每 ~10ms 用 [`Mixer::mix_into`]
-//! 填充环形 4 个 `WAVEHDR` 缓冲并 `waveOutWrite` 提交；关闭时同线程串行执行
-//! `waveOutReset → waveOutUnprepareHeader × N → waveOutClose` 后退出，
-//! 所有 winmm 调用单线程化，根除"句柄在 write 中被另一线程 close"一类竞态。
+//! 轮转填充 4 × 20ms（共 80ms 排队深度）的 `WAVEHDR` 缓冲并 `waveOutWrite`
+//! 提交；关闭时同线程串行执行 `waveOutReset → waveOutUnprepareHeader × N →
+//! waveOutClose` 后退出，所有 winmm 调用单线程化，根除"句柄在 write 中被
+//! 另一线程 close"一类竞态。
+//!
+//! # 设备线程硬化（S13 追加：对 Windows 定时器分辨率陷阱）
+//!
+//! 用户实测 waveOut 间歇性停顿/爆音的根因与三项修复（`timeBeginPeriod(1)`
+//! 配对守卫、设备线程 `THREAD_PRIORITY_HIGHEST`、缓冲 10ms → 20ms）及
+//! 欠载诊断计数 [`device::underruns`]（回归门要求连续播放为 0），全部
+//! 证据与取舍见 [`device`] 模块 doc「设备线程硬化」；soak 长跑：
+//! `cargo run --release --example soak`。
 //!
 //! # 怎么跑
 //!
 //! ```text
 //! cargo test --release          # 混音数学全部无设备可测；设备冒烟在无 waveOut 时自动跳过
+//! cargo run --release --example soak   # 设备长跑浸泡（默认 60s，NES_SOAK_SECS 可调）
 //! cargo clippy --release --all-targets
 //! ```
 
@@ -51,6 +61,6 @@ pub mod mixer;
 pub mod wav;
 
 pub use adpcm::{decode_ima_amv, AdpcmError};
-pub use device::{AudioDevice, AudioError};
+pub use device::{underruns, AudioDevice, AudioError};
 pub use mixer::{Mixer, MixerError, Voice};
 pub use wav::{parse, Wav, WavError};

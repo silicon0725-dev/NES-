@@ -1,4 +1,4 @@
-//! 设备冒烟测试：waveOut 开/关 + 静音填充 + 反复开合无泄漏。
+//! 设备冒烟测试：waveOut 开/关 + 静音填充 + 反复开合无泄漏 + 硬化回归门。
 //!
 //! 覆盖面：
 //!
@@ -7,6 +7,7 @@
 //! | `open_fill_silence_close` | 是 | 打开 → ~1 秒静音填充（空混音器）→ 关闭，全程无 panic |
 //! | `reopen_ten_times_idempotent` | 是 | open-close 反复 10 次：占位释放、无 AlreadyOpen 残留、Drop 幂等 |
 //! | `already_open_rejected` | 是 | 双开被指名拒绝（`AlreadyOpen`），首设备不受影响 |
+//! | `underrun_free_playback` | 是 | 1.5 秒连续播放欠载为 0（硬化回归门，见 device 模块 doc） |
 //! | `error_display_named` | 否 | 错误 Display 中文指名道姓（无设备也可跑） |
 //!
 //! # 设备用例的跳过纪律（照 GPU 用例惯例，如实报告）
@@ -20,7 +21,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use nes_audio::device::waveout_device_count;
-use nes_audio::{AudioDevice, AudioError, Mixer};
+use nes_audio::{AudioDevice, AudioError, Mixer, Wav};
 
 /// 设备用例串行锁：本 crate 进程级只允许一个 `AudioDevice`，
 /// 两个设备用例并发跑会互相顶出 `AlreadyOpen`，必须串行。
@@ -93,6 +94,33 @@ fn t_dev03_double_open_rejected_named() {
     let again = AudioDevice::open(empty_mixer(), 44100, 2);
     assert!(again.is_ok(), "close 释放占位后必须能再开");
     again.unwrap().close();
+}
+
+#[test]
+fn t_dev06_underrun_free_continuous_playback() {
+    let _guard = device_lock();
+    if no_device_skip() {
+        return;
+    }
+    // 硬化回归门（device 模块 doc「设备线程硬化」）：循环音保证全程有
+    // 非静音数据，队列打干（underruns 增长）只可能来自设备线程供数不及
+    // —— 定时器 1ms + 高优先级 + 80ms 深度三连后必须为 0。
+    // 80ms 排队深度下要打出欠载需要 ~70ms 级别的单次停顿，正常调度下
+    // 1.5 秒窗口不可能触达（soak 60s 实测 0）。
+    let mixer = Arc::new(Mutex::new(Mixer::new()));
+    {
+        let mut m = mixer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 0.2 秒 @22050 的循环音（ASCII 键，数据全常数 —— 与混音测试同法）。
+        let wav = Arc::new(Wav { sample_rate: 22050, channels: 1, samples: vec![6000; 4410] });
+        m.register("soak", wav);
+        m.play("soak", 0.5, true).expect("soak 已注册，play 必成功");
+    }
+    let device = AudioDevice::open(mixer, 48_000, 2).expect("系统有 waveOut 设备时打开必须成功");
+    let before = nes_audio::underruns();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let delta = nes_audio::underruns() - before;
+    device.close();
+    assert_eq!(delta, 0, "1.5 秒连续播放欠载必须为 0（硬化回归门）");
 }
 
 #[test]

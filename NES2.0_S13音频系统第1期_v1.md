@@ -109,3 +109,75 @@ farm.ron / dungeon.ron / tower_defense.ron / 各 trace 文件**零改动**（`gi
 4. **B7 扩展音频联动**：扩展清单（`NES2.0_扩展生态扫描与三块缺口清单_v1.md`）中"脚本可感知播放结束/声部事件"的联动——需先裁决音频事件是否进信号总线（表现事件 vs 语义事件的边界，本期裁决先例：不进）。
 5. **audio() 访问器的开放面**：设备开着时返回 `None`（§2.2）——若宿主需要"开着设备也直接调音量/停声部"，需补 `with_audio(f)` 锁式访问器（Mutex 锁就是正确的同步原语）。
 6. **热重载声部接管**：重注册同键覆盖库条目，正在播的旧 `Arc` 声部继续播完——换版即听头（可接受）；若要"重载即换声"需声部级重定向。
+
+## §6 设备线程硬化（用户实测卡顿修复，worktree `wt-audiofix` 分支 `s13-audio-hardening2`）
+
+### 6.1 症状与根因链（机制论证 + 实测复现）
+
+用户实测：waveOut 播放**间歇性**停顿/爆音。根因链：
+
+1. Windows 默认系统定时器节拍 **~15.6ms**：`thread::sleep(10ms)` 实际睡 10~15.6ms；
+2. 旧参数（4 × 10ms 头、sleep 10ms）的回填节拍与队列深度同量级，任何一次
+   调度抖动都直接吃穿余量，队列周期性打干 = 输出静默段（可听为停顿/爆音）；
+3. 系统节拍是否已被压到 1ms 取决于**其它进程**（浏览器、游戏等）恰好拉高过
+   分辨率——所以症状"间歇性"：有的机器/时段正常，有的卡。
+
+**soak 实测复现**（修复前基线，本机，12 秒）：**underruns = 6**（约每 2 秒队列
+打干 1 次）；定时器实测 `sleep(10ms)` 实际 min/avg/max = 10.2/11.2/15.0 ms
+（本机有后台进程部分拉高分辨率，故非 15.6 满值——正是"间歇性"的机理）。
+
+### 6.2 三项组合修复（取舍）
+
+| 项 | 实现 | 取舍/理由 |
+|---|---|---|
+| 定时器分辨率 | `timeBeginPeriod(1)` / `timeEndPeriod(1)`，**RAII 配对守卫**（`open` 构造、close/Drop 经字段 Drop 撤销；panic 路径也保证恢复） | 把 sleep 抖动从 +5.6ms 压到 ~+1ms；请求失败尽力而为（退回系统默认分辨率，不算 open 失败）；引用计数进程级由 OS 管，反复开合配对不泄漏 |
+| 线程优先级 | 设备线程函数体**首行**自提 `SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST=2)` | 普通优先级下宿主 CPU 脉冲会把单次唤醒拖后一个时间片；HIGHEST（普通档顶格）消除该项。**有意不用 TIME_CRITICAL(=15 实时档)**：线程出 bug 忙旋时会饿死全进程，而缓冲硬化后余量已有 3-4 倍，优先级只需兜单次抖动——收益/风险比 HIGHEST 更优 |
+| 缓冲深度 | 4 × 10ms → **4 × 20ms**（80ms 排队深度），回填节拍保持 10ms | 10ms 节拍下最坏抖动至多吃 10ms，80ms 深度余 ~60ms（机制性 3-4 倍）；代价：音效触发延迟上界 +10ms（新声部从"下一个 10ms 头"挪到"下一个 20ms 头"起混），首响差异人耳阈值 ~20-30ms，可感知性低 |
+
+修复后 60 秒 soak（背景音循环 + 宿主抖动风暴〔周期性锁 mixer 做
+play/register 覆盖/stop_key，与 nes-runtime 持锁形态同构〕+ 2 条 CPU 脉冲
+线程）：**underruns = 0**；定时器复测（提升生效中）min/avg/max =
+10.1/10.6/11.1 ms——max 从 15.0 压到 11.1，抖动尾巴被砍掉。
+
+### 6.3 欠载诊断口径（`device::underruns() -> u64`）
+
+回填轮询一轮中发现**全部 4 个头都已 DONE**（= 设备队列已打干、输出跨过一段
+最多一个回填节拍的静默）且**曾经提交过**（排除启动首轮的必然全空）计 1 次。
+进程级累加、不重置。硬化回归门：连续播放必须为 0——落在两处：
+`tests/device_smoke.rs::t_dev06_underrun_free_continuous_playback`（1.5s 断言）
+与 `examples/soak.rs`（60s 长跑，`NES_SOAK_SECS` 可调；无设备环境跳过、
+欠载 >0 非零码退出）。
+
+### 6.4 为什么不升级 CALLBACK_EVENT 精确唤醒（候选 2 裁决）
+
+事件等待（waveOutOpen 传事件句柄 + `WaitForSingleObject`）可消掉 sleep 的
+离散抖动，但需新增 CreateEvent/SetEvent/WaitForSingleObject 三个 FFI 与跨线
+程事件语义。6.2 的 1+3 落地后机制性余量 3-4 倍、60s soak 实测 0 欠载——收益
+不再覆盖改动面，保持"盲睡 + 肥余量"最简形态；**既定下一刀**：soak 再现欠载
+时引入。
+
+### 6.5 锁竞争排查（候选 3，不改宿主的结论）
+
+设备线程持锁段 = 单缓冲 `mix_into`（几个声部 × 20ms 重采样，微秒级）。宿主
+侧逐点核查（nes-runtime/src/lib.rs）：`register_pending_sounds` 的 WAV/
+nes-media **解码在锁外**、锁内只有 `HashMap::insert`；`consume_played_sounds`
+/ `play_host_sound` / `register_host_sound` / `stop_host_sounds` 锁内只有
+play/push/retain/clear（微秒级）；`audio()` 访问器走 `Mutex::get_mut`（不锁）。
+**未发现长持锁点**——soak 风暴线程按同形态扰动下 0 欠载亦是旁证。不改宿主。
+
+### 6.6 门禁（全绿）
+
+| 项 | 结果 |
+|---|---|
+| nes-audio `cargo test --release` | **50 通过 / 0 失败**（基线 44 单元 + 设备冒烟 5→6：新增 t_dev06 硬化回归门） |
+| 八 crate `cargo test --release` | **658 通过 / 0 失败**（nes-scene 239、nes-asset 34、nes-render-api 45、nes-render-extract 56、nes-render-wgpu 123、nes-audio 50、nes-media 27、nes-runtime 84） |
+| `cargo clippy --release --all-targets` | **0 警告 × 8 crate** |
+| worktree 根守卫 `check_dependency_direction.py` | **13/13 通过** |
+| soak 长跑 | 修复前 12s/6 次欠载 → 修复后 60s/0 次（两次独立复跑均 0） |
+| audio_demo 冒烟 | `NES_GAME_FRAMES=180`：`audio on` + `registered 1 sound(s)` + 干净退出 |
+
+改动面：`nes-audio/src/device.rs`（FFI 增 winmm timeBeginPeriod/timeEndPeriod +
+kernel32 GetCurrentThread/SetThreadPriority，全 unsafe 逐点 SAFETY）、
+`nes-audio/src/lib.rs`（doc + `underruns` 再导出）、
+`nes-audio/tests/device_smoke.rs`（t_dev06）、`nes-audio/examples/soak.rs`（新）。
+零新依赖（winmm/kernel32 均系统库 FFI）。
