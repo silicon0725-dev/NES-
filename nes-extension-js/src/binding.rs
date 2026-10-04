@@ -12,6 +12,10 @@
 //! nes.audio.play(key, volume)             -> undefined
 //! nes.registerExtension(id)               -> undefined   （扩展自报身份）
 //! nes.onUpdate(fn)                        -> undefined   （P0 单回调槽）
+//! nes.onSignal(name, fn)                  -> undefined   （S17.2 注册 hat；
+//!                                            同名多个 handler = 都调，注册序）
+//! nes.emitSignal(name, payload)           -> undefined   （S17.2 反向发射；
+//!                                            落地时序由宿主取走时机决定）
 //! ```
 //!
 //! NodeRef 在 JS 侧是**不透明 number**（P0 位形 < 2^53，double 精确承载）。
@@ -36,13 +40,26 @@ use nes_extension_api::JsRuntime;
 
 use nes_extension_api::{
     AudioCapability, ExtError, ExtensionLifecycle, InputCapability, JsContextId, NesValue,
-    NodeCapability, NodeRef, SceneCapability,
+    NodeCapability, NodeRef, SceneCapability, SignalCapability,
 };
 
 use crate::runtime::RquickjsRuntime;
+use crate::value::js_to_nes;
 
-/// `nes` 对象组装 + update 蹦床（ASCII；在能力函数注入**之后**求值）。
+/// `nes` 对象组装 + update 蹦床 + 信号 hat 表（ASCII；在能力函数注入**之后**求值）。
+///
+/// S17.2 信号面（照 onUpdate 的形态：JS 值留在 JS 堆，Rust 侧零句柄）：
+/// * `__nes_signal_handlers`：名字 -> handler 数组（`nes.onSignal` 注册序）；
+/// * `nes.onSignal(name, fn)`：handler 入 JS 堆表 + 经 `__nes_signal_subscribe`
+///   向宿主声明订阅名一次（泵过滤器据此装配）；
+/// * `__nes_signal_dispatch(name, payload)`：宿主派发入口 —— 逐 handler
+///   try/catch（单个 handler 抛错不殃及同表后续 handler），首个错误在循环
+///   后重抛 —— 错误文本沿标准 `rt.call` 错误路径浮出成 fault（S17.1 隔离），
+///   预算中断（uncatchable）直接浮出；
+/// * `nes.emitSignal(name, payload)`：经 `__nes_signal_emit` 进宿主
+///   SignalCapability（泵内派发期间 = 同泵级联；update 期 = 下帧泵）。
 pub const NES_BOOTSTRAP_JS: &str = r#"
+globalThis.__nes_signal_handlers = {};
 globalThis.nes = {
   scene: { find: globalThis.__nes_scene_find },
   node: {
@@ -54,7 +71,17 @@ globalThis.nes = {
   input: { isPressed: globalThis.__nes_input_is_pressed },
   audio: { play: globalThis.__nes_audio_play },
   registerExtension: function (id) { globalThis.__nes_extension_id = id; },
-  onUpdate: function (fn) { globalThis.__nes_update_hook = fn; }
+  onUpdate: function (fn) { globalThis.__nes_update_hook = fn; },
+  onSignal: function (name, fn) {
+    if (typeof fn !== "function") { throw new Error("onSignal: handler must be a function"); }
+    var t = globalThis.__nes_signal_handlers;
+    if (t[name] === undefined) {
+      t[name] = [];
+      globalThis.__nes_signal_subscribe(name);
+    }
+    t[name].push(fn);
+  },
+  emitSignal: globalThis.__nes_signal_emit
 };
 globalThis.__nes_set_extension_id = function (id) { globalThis.__nes_extension_id = id; };
 globalThis.__nes_get_extension_id = function () {
@@ -64,9 +91,25 @@ globalThis.__nes_update = function () {
   var hook = globalThis.__nes_update_hook;
   if (typeof hook === "function") { hook(); }
 };
+globalThis.__nes_signal_dispatch = function (name, payload) {
+  var list = globalThis.__nes_signal_handlers[name];
+  if (list === undefined) { return 0; }
+  var called = 0;
+  var firstError = null;
+  for (var i = 0; i < list.length; i++) {
+    try {
+      list[i](payload);
+      called = called + 1;
+    } catch (e) {
+      if (firstError === null) { firstError = e; }
+    }
+  }
+  if (firstError !== null) { throw firstError; }
+  return called;
+};
 "#;
 
-/// 能力绑定集：四个能力 trait 的宿主实现（共享句柄形态）。
+/// 能力绑定集：五个能力 trait 的宿主实现（共享句柄形态）。
 ///
 /// `Rc<RefCell<...>>` 形态的理由：同一个宿主实现要同时被"装进 QuickJS
 /// 闭包"（'static）与"每帧刷新"（宿主侧 &mut）两端触达 —— 共享计数 +
@@ -76,6 +119,7 @@ pub struct CapabilityBinding {
     node: Rc<RefCell<dyn NodeCapability>>,
     input: Rc<RefCell<dyn InputCapability>>,
     audio: Rc<RefCell<dyn AudioCapability>>,
+    signal: Rc<RefCell<dyn SignalCapability>>,
 }
 
 /// `nes.node.getPos(ref)` 的实现体（具名生命周期统一 ctx 与返回值）。
@@ -156,8 +200,9 @@ impl CapabilityBinding {
         node: Rc<RefCell<dyn NodeCapability>>,
         input: Rc<RefCell<dyn InputCapability>>,
         audio: Rc<RefCell<dyn AudioCapability>>,
+        signal: Rc<RefCell<dyn SignalCapability>>,
     ) -> Self {
-        Self { scene, node, input, audio }
+        Self { scene, node, input, audio, signal }
     }
 
     /// 把 `nes` 对象注入指定上下文（能力函数 + 引导脚本）。
@@ -233,7 +278,36 @@ impl CapabilityBinding {
             }),
         )?;
 
-        // 引导脚本：组装 `nes` 对象 + update 蹦床 + 扩展身份槽。
+        // S17.2 信号面：订阅声明 + 反向发射（载荷过 NesValue 边界）。
+        let signal = Rc::clone(&self.signal);
+        globals.set(
+            "__nes_signal_subscribe",
+            Func::new(move |name: String| {
+                if let Ok(mut ok) = signal.try_borrow_mut() {
+                    ok.on_signal(&name);
+                }
+            }),
+        )?;
+
+        let signal = Rc::clone(&self.signal);
+        globals.set(
+            "__nes_signal_emit",
+            // 载荷就地过 js_to_nes（函数值读作 Null —— 与返回值边界同一口径）；
+            // 借用冲突静默让路（与写能力同口径 —— 闭包体零 panic）。
+            Func::new(move |_ctx: Ctx<'_>, name: String, v: Value<'_>| -> rquickjs::Result<()> {
+                let payload = js_to_nes(&v).map_err(|_| rquickjs::Error::FromJs {
+                    from: "payload",
+                    to: "NesValue",
+                    message: Some("emitSignal payload conversion failed".into()),
+                })?;
+                if let Ok(mut ok) = signal.try_borrow_mut() {
+                    ok.emit(&name, payload);
+                }
+                Ok(())
+            }),
+        )?;
+
+        // 引导脚本：组装 `nes` 对象 + update 蹦床 + 扩展身份槽 + 信号 hat 表。
         ctx.eval::<(), _>(NES_BOOTSTRAP_JS.to_string())
     }
 }
@@ -306,6 +380,32 @@ impl ExtensionLifecycle for JsExtension {
         match self.runtime.borrow_mut().call(self.ctx, "__nes_update", &[]) {
             Ok(_) => {}
             Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+}
+
+impl JsExtension {
+    /// 向本扩展派发一条信号（S17.2 hat 重入；`__nes_signal_dispatch`
+    /// 蹦床逐 handler try/catch，首个错误循环后重抛）。
+    ///
+    /// 返回 `Ok(命中 handler 数)`（蹦床返回值；仅观测用）或
+    /// `Err(ExtError::CallFailed)`（handler 异常 / 预算中断 / 内存超限
+    /// —— 三者同形态，隔离语义由宿主侧继承 S17.1）。
+    pub fn dispatch_signal(&mut self, name: &str, payload: &NesValue) -> Result<usize, ExtError> {
+        self.last_error = None;
+        match self.runtime.borrow_mut().call(
+            self.ctx,
+            "__nes_signal_dispatch",
+            &[NesValue::str(name), payload.clone()],
+        ) {
+            Ok(ret) => Ok(match ret {
+                NesValue::F64(n) => n as usize,
+                _ => 0,
+            }),
+            Err(e) => {
+                self.last_error = Some(e.to_string());
+                Err(e)
+            }
         }
     }
 }

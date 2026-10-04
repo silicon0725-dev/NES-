@@ -13,7 +13,8 @@
 //!   ├─ NesValue            引擎 <-> 脚本的值边界（自有类型，不暴露任何第三方类型）
 //!   ├─ JsRuntime           可换 backend 的 JS 执行面（create_context / load_module /
 //!   │                      call / collect）—— QuickJS-NG 只是它的第一个实现方
-//!   ├─ 能力 traits         Scene / Node / Input / Audio（宿主实现、JS 侧绑定）
+//!   ├─ 能力 traits         Scene / Node / Input / Audio / Signal（S17.2 起
+//!   │                      五个：宿主实现、JS 侧绑定）
 //!   └─ ExtensionLifecycle  扩展生命周期（注册 + 每帧 update 钩子）
 //!
 //! nes-extension-api ──▶ nes-extension-js（QuickJS-NG 绑定实现，G15 白名单）
@@ -42,6 +43,7 @@ mod value;
 
 pub use capability::{
     AudioCapability, ExtensionLifecycle, InputCapability, NodeCapability, NodeRef, SceneCapability,
+    SignalCapability,
 };
 pub use error::ExtError;
 pub use runtime::{JsContextId, JsRuntime};

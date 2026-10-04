@@ -52,7 +52,10 @@ impl NesRuntime {
         delta: f32,
         obs: &mut dyn nes_scene::SceneObserver,
     ) -> TickStats {
-        let stats = self.tree.tick(delta, obs);
+        // S17.2：树推进走与帧路径同一条咽喉（hat 组装在此）；扩展写队列
+        // 当步落地（泵内 hat 写 = 游戏状态）。
+        let stats = self.tick_tree(delta, obs);
+        self.apply_extension_ops();
         self.consume_played_sounds();
         self.consume_video_cmds();
         stats

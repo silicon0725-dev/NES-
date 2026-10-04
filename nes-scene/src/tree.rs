@@ -790,6 +790,83 @@ impl SceneObserver for Observers {
     }
 }
 
+/// 双观察者组合（S17.2，**借用形态**）：把同一事件流转发给两个观察者
+/// —— 宿主需要同时驱动"游戏观察者（VM 等）"与"扩展信号观察者"时用。
+///
+/// 与 [`Observers`]（拥有式 Vec 组合）的分工：`Observers` 收
+/// `Box<dyn SceneObserver>`（'static），适合装配期固定的成员；本类型收
+/// **借用**（`&mut dyn`），适合帧路径里"外部传入的宿主观察者 + 运行时
+/// 内部的扩展观察者"这类生命周期不齐的组合 —— 两者并存，能拥有成员的
+/// 场合用 `Observers`，借用场合用本类型（功能上是同一裁决的两副面孔）。
+///
+/// 口径与 [`Observers`] 一致：
+/// - **派发序 = 构造序**（先 `first` 后 `second`），无优先级数值；
+/// - **订阅过滤取并集**：任一侧 `All` 即 `All`，否则合并名/前缀集 ——
+///   一侧的过滤器不能静默掐掉另一侧的邮件；
+/// - 组合对引擎是**一个**观察者（`TickStats` 按泵交付计，不按成员数放大）。
+pub struct TeeObserver<'a> {
+    first: &'a mut dyn SceneObserver,
+    second: &'a mut dyn SceneObserver,
+}
+
+impl<'a> TeeObserver<'a> {
+    /// 由两个观察者引用组装（派发序即参数序）。
+    pub fn new(first: &'a mut dyn SceneObserver, second: &'a mut dyn SceneObserver) -> Self {
+        Self { first, second }
+    }
+}
+
+impl SceneObserver for TeeObserver<'_> {
+    fn on_tree_event(&mut self, tree: &SceneTree, ev: &TreeEvent) {
+        self.first.on_tree_event(tree, ev);
+        self.second.on_tree_event(tree, ev);
+    }
+
+    fn on_enter_tree(&mut self, ctx: &mut NodeCtx<'_>) {
+        self.first.on_enter_tree(ctx);
+        self.second.on_enter_tree(ctx);
+    }
+
+    fn on_ready(&mut self, ctx: &mut NodeCtx<'_>) {
+        self.first.on_ready(ctx);
+        self.second.on_ready(ctx);
+    }
+
+    fn on_process(&mut self, ctx: &mut NodeCtx<'_>, delta: f32) {
+        self.first.on_process(ctx, delta);
+        self.second.on_process(ctx, delta);
+    }
+
+    fn on_exit_tree(&mut self, tree: &SceneTree, node: NodeId) {
+        self.first.on_exit_tree(tree, node);
+        self.second.on_exit_tree(tree, node);
+    }
+
+    fn on_signal(&mut self, ctx: &mut SignalCtx<'_>, sig: &Signal) {
+        self.first.on_signal(ctx, sig);
+        self.second.on_signal(ctx, sig);
+    }
+
+    fn signal_filter(&self) -> SignalFilter {
+        // 并集（与 Observers 同一条逻辑）：任一侧 All 即 All，否则合并集合。
+        let (mut names, mut prefixes) = match self.first.signal_filter() {
+            SignalFilter::All => return SignalFilter::All,
+            SignalFilter::Select { names, prefixes } => (names, prefixes),
+        };
+        match self.second.signal_filter() {
+            SignalFilter::All => return SignalFilter::All,
+            SignalFilter::Select {
+                names: n,
+                prefixes: p,
+            } => {
+                names.extend(n);
+                prefixes.extend(p);
+            }
+        }
+        SignalFilter::Select { names, prefixes }
+    }
+}
+
 /// 一条信号：名字键 + 值载荷 + 发射源（`None` = 宿主/无名源）。
 ///
 /// 载荷是 [`Value`]（值语义，交付即拷贝）。草案 §12：入队、帧末统一 flush、

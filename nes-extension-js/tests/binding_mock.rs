@@ -7,8 +7,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use nes_extension_api::{
-    AudioCapability, ExtensionLifecycle, InputCapability, JsRuntime, NodeCapability, NodeRef,
-    SceneCapability,
+    AudioCapability, ExtensionLifecycle, InputCapability, JsRuntime, NesValue, NodeCapability,
+    NodeRef, SceneCapability, SignalCapability,
 };
 use nes_extension_js::{CapabilityBinding, JsExtension, RquickjsRuntime};
 
@@ -64,6 +64,25 @@ impl AudioCapability for MockHost {
     }
 }
 
+/// S17.2 信号能力 mock：订阅名去重 + 发射记账（与引擎桥同构）。
+#[derive(Default)]
+struct MockSignals {
+    subscribed: RefCell<Vec<String>>,
+    emitted: RefCell<Vec<(String, NesValue)>>,
+}
+
+impl SignalCapability for MockSignals {
+    fn on_signal(&mut self, name: &str) {
+        let mut subs = self.subscribed.borrow_mut();
+        if !subs.iter().any(|n| n == name) {
+            subs.push(name.to_string());
+        }
+    }
+    fn emit(&mut self, name: &str, payload: NesValue) {
+        self.emitted.borrow_mut().push((name.to_string(), payload));
+    }
+}
+
 const TEST_EXTENSION: &str = r#"
 nes.registerExtension("mock-ext");
 nes.onUpdate(function () {
@@ -84,11 +103,13 @@ var last_seen = null;
 #[test]
 fn js_extension_drives_mock_capabilities_end_to_end() {
     let host = Rc::new(RefCell::new(MockHost::default()));
+    let signals = Rc::new(RefCell::new(MockSignals::default()));
     let binding = CapabilityBinding::new(
         Rc::clone(&host) as Rc<RefCell<dyn SceneCapability>>,
         Rc::clone(&host) as Rc<RefCell<dyn NodeCapability>>,
         Rc::clone(&host) as Rc<RefCell<dyn InputCapability>>,
         Rc::clone(&host) as Rc<RefCell<dyn AudioCapability>>,
+        Rc::clone(&signals) as Rc<RefCell<dyn SignalCapability>>,
     );
 
     let runtime = Rc::new(RefCell::new(RquickjsRuntime::new().unwrap()));
@@ -154,13 +175,15 @@ fn missing_capability_object_is_script_visible_not_fatal() {
     }
 
     let scene = Rc::new(RefCell::new(NullScene));
-    // 其余三个能力用 Default mock（永远空记账）。
+    // 其余四个能力用 Default mock（永远空记账）。
     let host = Rc::new(RefCell::new(MockHost::default()));
+    let signals = Rc::new(RefCell::new(MockSignals::default()));
     let binding = CapabilityBinding::new(
         scene,
         Rc::clone(&host) as Rc<RefCell<dyn NodeCapability>>,
         Rc::clone(&host) as Rc<RefCell<dyn InputCapability>>,
         Rc::clone(&host) as Rc<RefCell<dyn AudioCapability>>,
+        Rc::clone(&signals) as Rc<RefCell<dyn SignalCapability>>,
     );
 
     let runtime = Rc::new(RefCell::new(RquickjsRuntime::new().unwrap()));
@@ -180,4 +203,105 @@ fn missing_capability_object_is_script_visible_not_fatal() {
         .call(ctx, "__nes_get_extension_id", &[])
         .unwrap();
     assert_eq!(probe, nes_extension_api::NesValue::Null);
+}
+
+const HAT_EXTENSION: &str = r#"
+nes.registerExtension("hat-ext");
+var got = null;
+nes.onSignal("enemy-died", function (payload) { got = payload; });
+nes.onSignal("enemy-died", function (payload) { got = got + 1; });
+nes.onSignal("relay", function (payload) { nes.emitSignal("hat-relay", payload); });
+"#;
+
+#[test]
+fn signal_hat_dispatch_and_reverse_emit_reach_mock_host() {
+    // S17.2 绑定层端到端（无引擎）：注册 hat -> 派发 -> 反向发射。
+    let signals = Rc::new(RefCell::new(MockSignals::default()));
+    let host = Rc::new(RefCell::new(MockHost::default()));
+    let binding = CapabilityBinding::new(
+        Rc::clone(&host) as Rc<RefCell<dyn SceneCapability>>,
+        Rc::clone(&host) as Rc<RefCell<dyn NodeCapability>>,
+        Rc::clone(&host) as Rc<RefCell<dyn InputCapability>>,
+        Rc::clone(&host) as Rc<RefCell<dyn AudioCapability>>,
+        Rc::clone(&signals) as Rc<RefCell<dyn SignalCapability>>,
+    );
+    let runtime = Rc::new(RefCell::new(RquickjsRuntime::new().unwrap()));
+    let ctx = runtime.borrow_mut().create_context().unwrap();
+    binding.install(&mut runtime.borrow_mut(), ctx).unwrap();
+
+    let mut ext = JsExtension::new(Rc::clone(&runtime), ctx);
+    ext.load_source(HAT_EXTENSION).unwrap();
+    assert!(ext.take_last_error().is_none());
+
+    // 订阅声明到达宿主（同名两个 handler 只声明一次 —— JS 侧去重）。
+    {
+        let s = signals.borrow();
+        assert_eq!(
+            s.subscribed.borrow().as_slice(),
+            &["enemy-died".to_string(), "relay".to_string()]
+        );
+    }
+
+    // 派发：同名 handler 按注册序都调（42 -> 43）。
+    let called = ext
+        .dispatch_signal("enemy-died", &NesValue::F64(42.0))
+        .expect("dispatch must succeed");
+    assert_eq!(called, 2, "both registered handlers must run");
+    let seen = runtime
+        .borrow_mut()
+        .call(ctx, "__nes_get_extension_id", &[])
+        .unwrap();
+    assert_eq!(seen, NesValue::str("hat-ext")); // 上下文仍健康
+
+    // 反向发射到达宿主能力（载荷过 NesValue 边界）。
+    ext.dispatch_signal("relay", &NesValue::str("ping")).unwrap();
+    {
+        let s = signals.borrow();
+        assert_eq!(
+            s.emitted.borrow().as_slice(),
+            &[("hat-relay".to_string(), NesValue::str("ping"))]
+        );
+    }
+    assert!(ext.take_last_error().is_none());
+
+    // 未订阅的名字：蹦床早退（0 命中，无 JS 调用）。
+    assert_eq!(ext.dispatch_signal("nobody-listens", &NesValue::Null).unwrap(), 0);
+}
+
+#[test]
+fn handler_throw_surfaces_through_the_trampoline() {
+    // 隔离继承的绑定层半边：handler 抛错 -> 蹦床重抛 -> Err 携带异常文本；
+    // 抛错者**之后**的 handler 仍然跑到（记账 payload）。
+    const THROWER: &str = r#"
+nes.registerExtension("throwhat");
+var after = null;
+nes.onSignal("boom", function () { throw new Error("hat-boom"); });
+nes.onSignal("boom", function (p) { after = p; });
+function __nes_hat_after() { return after; }
+"#;
+    let signals = Rc::new(RefCell::new(MockSignals::default()));
+    let host = Rc::new(RefCell::new(MockHost::default()));
+    let binding = CapabilityBinding::new(
+        Rc::clone(&host) as Rc<RefCell<dyn SceneCapability>>,
+        Rc::clone(&host) as Rc<RefCell<dyn NodeCapability>>,
+        Rc::clone(&host) as Rc<RefCell<dyn InputCapability>>,
+        Rc::clone(&host) as Rc<RefCell<dyn AudioCapability>>,
+        Rc::clone(&signals) as Rc<RefCell<dyn SignalCapability>>,
+    );
+    let runtime = Rc::new(RefCell::new(RquickjsRuntime::new().unwrap()));
+    let ctx = runtime.borrow_mut().create_context().unwrap();
+    binding.install(&mut runtime.borrow_mut(), ctx).unwrap();
+
+    let mut ext = JsExtension::new(Rc::clone(&runtime), ctx);
+    ext.load_source(THROWER).unwrap();
+    let err = ext
+        .dispatch_signal("boom", &NesValue::F64(1.0))
+        .expect_err("throwing handler must fault");
+    let text = err.to_string();
+    assert!(text.contains("hat-boom"), "exception text missing: {text}");
+    // 抛错后的同表 handler 已跑到（蹦床 try/catch 继续）—— 用全局探针核实。
+    let after = runtime.borrow_mut().call(ctx, "__nes_hat_after", &[]).unwrap();
+    assert_eq!(after, NesValue::F64(1.0));
+    // 上下文存活：下一次派发照常。
+    assert_eq!(ext.dispatch_signal("nobody", &NesValue::Null).unwrap(), 0);
 }

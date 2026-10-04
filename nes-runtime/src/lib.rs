@@ -73,10 +73,12 @@ use nes_render_wgpu::window::{drain_input, Window};
 use nes_scene::scene_io::{instantiate_doc_with_resources, parse_ron, write_ron_with_resources};
 use nes_scene::{
     AdoptReport, BindReport, NoObserver, PackOptions, ResId, ResourceTable, SceneDoc, SceneObserver,
-    SceneTree, ScriptVm, TableError, Value, UiVm};
+    SceneTree, ScriptVm, TableError, TeeObserver, TickStats, Value, UiVm};
 use nes_audio::{AudioDevice, Mixer};
 
-pub use extension::{ExtCapsState, ExtensionManager};
+pub use extension::{
+    nes_to_value, value_to_nes, ExtCapsState, ExtensionManager, ExtensionSignalObserver,
+};
 pub use headless::{run, HeadlessReport};
 
 /// 组装好的引擎帧循环。
@@ -808,7 +810,7 @@ impl NesRuntime {
     ///
     /// 1. 发射**内建 `tick` 信号**（每帧恰一次，载荷 = 树帧号 ——
     ///    宿主级确定性事件；宿主不得再手发 `tick`，否则双交付）；
-    /// 2. 按 `fixed_step` 蓄步分步调用 `SceneTree::tick`（未设置则
+    /// 2. 按 `fixed_step` 蓄步分步调用 [`Self::tick_tree`]（未设置则
     ///    帧原样一步）：快帧可为 0 步（余量跨帧携带），慢帧补步
     ///    （上限 5，超限丢弃并计数）。
     ///
@@ -833,7 +835,10 @@ impl NesRuntime {
         let frame_no = self.tree.frame() as i64;
         self.tree.emit_signal("tick", Value::I64(frame_no));
         for _ in 0..steps {
-            self.tree.tick(delta, obs);
+            self.tick_tree(delta, obs);
+            // S17.2：泵内 hat 写队列当步落地（与 update 期 apply 同一落地
+            // 函数 —— 提交序一致；下一帧 refresh 不会把它当残留清掉）。
+            self.apply_extension_ops();
             // Cmd::PlaySound 的消费点（S13 第 2 期）：每步 tick 后取走 ——
             // 未开音频时即取即弃（headless 确定性；缓冲不跨帧积压）。
             self.consume_played_sounds();
@@ -842,6 +847,38 @@ impl NesRuntime {
             self.consume_video_cmds();
         }
         steps
+    }
+
+    /// 树推进一帧的**唯一咽喉**（S17.2 hat 接线）：有扩展订阅过信号 hat
+    /// 时，把帧观察者与扩展信号观察者组合（[`TeeObserver`]，宿主在前、
+    /// 扩展在后 —— 派发序即注册序）；**无订阅时不组装** —— tick 路径与
+    /// S17.1 基线逐位一致（零开销，T-HAT-06）。字段级拆借：
+    /// `extensions` 与 `tree` 是不相交字段。
+    fn tick_tree(&mut self, delta: f32, obs: &mut dyn SceneObserver) -> TickStats {
+        let has_hats = match &self.extensions {
+            Some(mgr) => mgr.has_signal_hats(),
+            None => false,
+        };
+        if !has_hats {
+            return self.tree.tick(delta, obs);
+        }
+        let Some(mgr) = self.extensions.as_mut() else {
+            return self.tree.tick(delta, obs); // 上面刚判过 Some —— 防御口径
+        };
+        let mut ext_obs = extension::ExtensionSignalObserver::new(mgr);
+        let mut tee = TeeObserver::new(obs, &mut ext_obs);
+        self.tree.tick(delta, &mut tee)
+    }
+
+    /// 扩展写队列的当步落地（S17.2）：hat 在泵内的 setPos 等写与 update
+    /// 期写走同一条提交序队列（[`ExtCapsState::apply`]）—— 泵一收步就
+    /// 落地（与 `consume_played_sounds` 的消费点同一家法），同帧后续阶段
+    /// 与下一帧 refresh 都看得见。
+    fn apply_extension_ops(&mut self) {
+        let Some(mgr) = &mut self.extensions else {
+            return;
+        };
+        mgr.apply_writes(&mut self.tree);
     }
 
     /// headless 宿主的帧步进（含内建 tick 与蓄步；与窗口帧路径同一

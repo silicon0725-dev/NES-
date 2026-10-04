@@ -1,8 +1,9 @@
 //! 引擎能力面（P0 最小集）：宿主实现、JS 侧绑定。
 //!
 //! 这是"JS 扩展永远不直接碰 SceneTree/Renderer/WGPU"那条裁决的**正面**：
-//! 扩展能做什么，完全由宿主把这组 traits 桥出多少来决定。P0 冻结四个
-//! 能力（Scene / Node / Input / Audio）+ 一个生命周期（register / update）。
+//! 扩展能做什么，完全由宿主把这组 traits 桥出多少来决定。P0 冻结五个
+//! 能力（Scene / Node / Input / Audio + S17.2 的 Signal）+ 一个生命周期
+//! （register / update）。
 //!
 //! 与用户草图的两处 ergonomics 微调（均为防实现方被迫上内部可变性）：
 //! * `NodeCapability` 的写方法（`set_pos` / `set_visible`）取 `&mut self`
@@ -48,6 +49,31 @@ pub trait AudioCapability {
     fn play(&self, key: &str, volume: f32);
 }
 
+/// 信号能力（S17.2 hat 触发）：订阅声明 + 反向发射。
+///
+/// Scratch 语义的 hat = 事件处理器：事件发生 -> 重入扩展代码。NES 的实现
+/// 载荷是既有的确定性信号总线（S6 契约：FIFO 泵、级联、1024 上限、订阅
+/// 过滤）—— 本能力是扩展与总线之间的唯一通道：
+///
+/// * [`Self::on_signal`]：扩展注册 hat（`nes.onSignal(name, fn)`）时声明
+///   订阅名。宿主据此装配信号泵的订阅过滤（未订阅 = 泵根本不进扩展）；
+///   同名多个 handler 由 JS 侧注册表管理，宿主只收一次声明（去重由宿主
+///   实现负责）。
+/// * [`Self::emit`]：扩展 -> 引擎的反向发射（`nes.emitSignal(name, payload)`，
+///   载荷过 [`NesValue`] 边界）。落地时序由宿主的取走时机决定：**信号泵内**
+///   派发期间发射 = 同泵级联（`SignalCtx::emit` 语义，受 1024 交付上限
+///   约束）；**update 期**发射 = 入下一帧的泵。
+///
+/// 两个方法都取 `&mut self`（与 [`NodeCapability`] 的写方法同一裁决：
+/// 防实现方被迫上内部可变性 —— 宿主桥（nes-runtime 的 `ExtCapsState`）
+/// 经 `Rc<RefCell<..>>` 共享，闭包端 `try_borrow_mut` 触达）。
+pub trait SignalCapability {
+    /// 声明订阅一个信号名（注册 hat；去重由实现方负责）。
+    fn on_signal(&mut self, name: &str);
+    /// 反向发射一条信号（载荷过 [`NesValue`] 边界；落地时序见 trait 文档）。
+    fn emit(&mut self, name: &str, payload: crate::NesValue);
+}
+
 /// 扩展生命周期：注册 + 每帧 update 钩子。
 ///
 /// JS 侧由 `nes.registerExtension(id)` / `nes.onUpdate(fn)` 承接；
@@ -62,7 +88,8 @@ pub trait ExtensionLifecycle {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioCapability, ExtensionLifecycle, InputCapability, NodeCapability, NodeRef, SceneCapability};
+    use super::{AudioCapability, ExtensionLifecycle, InputCapability, NodeCapability, NodeRef, SceneCapability, SignalCapability};
+    use crate::NesValue;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -182,6 +209,39 @@ mod tests {
         ExtensionLifecycle::update(&mut m);
         assert_eq!(m.registered, vec!["hello".to_string()]);
         assert_eq!(m.updates, 2);
+    }
+
+    /// S17.2：信号能力的 mock 宿主（订阅名去重 + 发射记账 —— 引擎桥
+    /// `ExtCapsState` 的同构行为）。
+    #[derive(Default)]
+    struct MockSignals {
+        subscribed: Vec<String>,
+        emitted: Vec<(String, NesValue)>,
+    }
+
+    impl SignalCapability for MockSignals {
+        fn on_signal(&mut self, name: &str) {
+            if !self.subscribed.iter().any(|n| n == name) {
+                self.subscribed.push(name.to_string());
+            }
+        }
+        fn emit(&mut self, name: &str, payload: NesValue) {
+            self.emitted.push((name.to_string(), payload));
+        }
+    }
+
+    #[test]
+    fn signal_capability_records_subscription_and_emit() {
+        let mut sig = MockSignals::default();
+        SignalCapability::on_signal(&mut sig, "enemy-died");
+        SignalCapability::on_signal(&mut sig, "enemy-died"); // 去重
+        SignalCapability::on_signal(&mut sig, "player-hit");
+        SignalCapability::emit(&mut sig, "hat-seen", NesValue::F64(42.0));
+        assert_eq!(sig.subscribed, vec!["enemy-died".to_string(), "player-hit".to_string()]);
+        assert_eq!(
+            sig.emitted,
+            vec![("hat-seen".to_string(), NesValue::F64(42.0))]
+        );
     }
 
     #[derive(Default)]
