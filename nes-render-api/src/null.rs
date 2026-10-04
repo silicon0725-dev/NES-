@@ -57,6 +57,11 @@ pub struct NullRenderServer {
     /// 精灵锚点簿记（S16.3）：`set_pivot` 存（同键覆写）、销毁移除。
     /// 有 pivot 的条目在 `submit_into` 输出序里于 `SetUv` 之后追加 `SetPivot`。
     pivots: BTreeMap<ItemHandle, [f32; 2]>,
+    /// 九宫格簿记（S16.6）：`set_nine_slice` 存（同键覆写，NIL 键 = 恒等
+    /// 记录照存照发 —— 照 pivot 零向量先例）、销毁移除。有九宫格条目的
+    /// （含恒等记录）在 `submit_into` 输出序里于 `SetPivot` 之后追加
+    /// `SetNineSlice`。载荷 = `(源纹理键, [l, t, r, b])`。
+    nines: BTreeMap<ItemHandle, (RenderAssetKey, [f32; 4])>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
     counters: ServerCounters,
@@ -123,6 +128,12 @@ impl NullRenderServer {
         self.pivots.get(&handle)
     }
 
+    /// 取渲染物的九宫格配置（S16.6；未设置返回 `None` —— 无记录 =
+    /// fill/border 照旧）。
+    pub fn nine_slice_of(&self, handle: ItemHandle) -> Option<&(RenderAssetKey, [f32; 4])> {
+        self.nines.get(&handle)
+    }
+
     /// 当前相机。
     pub fn camera(&self) -> Option<&Camera2DState> {
         self.camera.as_ref()
@@ -164,6 +175,7 @@ impl RenderServer for NullRenderServer {
         self.tints.remove(&handle);
         self.uvs.remove(&handle);
         self.pivots.remove(&handle);
+        self.nines.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
         self.counters.destroyed += 1;
     }
@@ -275,6 +287,27 @@ impl RenderServer for NullRenderServer {
         self.pivots.insert(handle, pivot);
     }
 
+    fn set_nine_slice(
+        &mut self,
+        handle: ItemHandle,
+        texture: RenderAssetKey,
+        l: f32,
+        t: f32,
+        r: f32,
+        b: f32,
+    ) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1），计数器使其可观测。
+            self.counters.ignored_ops += 1;
+            return;
+        }
+        // 同键覆写（全量快照语义）。NIL 键**照存**（不摘条目）—— 恒等
+        // 记录 = fill/border 照旧，随每帧快照重发，消费端据此清除跨帧
+        // 簿记（照 pivot `[0,0]` 零向量先例：清除必须可在命令流里承载，
+        // 否则跨帧簿记的后端永远收不到"清掉"这件事）。
+        self.nines.insert(handle, (texture, [l, t, r, b]));
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空：缓冲跨帧复用，绝不留上一帧的残留。
         out.clear();
@@ -359,6 +392,19 @@ impl RenderServer for NullRenderServer {
                 out.push(RenderCommand::SetPivot {
                     handle: item.handle,
                     pivot: *pivot,
+                });
+            }
+            // 九宫格（S16.6）：恒在 SetPivot 之后（契约 I5 顺序冻结；与
+            // wgpu 后端严格同序）。仅当该条目存在九宫格簿记时追加 ——
+            // 无记录 = fill/border 照旧，命令流与既有路径逐条相同。
+            if let Some((texture, margins)) = self.nines.get(&item.handle) {
+                out.push(RenderCommand::SetNineSlice {
+                    handle: item.handle,
+                    texture: *texture,
+                    l: margins[0],
+                    t: margins[1],
+                    r: margins[2],
+                    b: margins[3],
                 });
             }
         }

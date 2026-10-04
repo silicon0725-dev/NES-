@@ -762,3 +762,70 @@ fn criterion_contract_set_pivot_bookkeeping_and_order() {
     );
     assert!(server.pivot_of(handle).is_none());
 }
+
+/// S16.6（九宫格）：`set_nine_slice` 的 null 簿记 —— 同键覆写、NIL 恒等
+/// 记录照存照发、未知句柄静默忽略、销毁随条目清理；输出序 SetNineSlice
+/// 恒在 SetPivot 之后（与 wgpu 后端严格同构的命令流面抽查）。
+#[test]
+fn criterion_contract_set_nine_slice_bookkeeping_and_order() {
+    let mut server = NullRenderServer::new();
+    let handle = server.create_item(RenderAssetKey::from_parts(7, 1));
+    let tex = RenderAssetKey::from_parts(9, 1);
+
+    // 同键覆写：后写者生效；未知句柄静默忽略（计数器可观测）。
+    server.set_nine_slice(handle, tex, 16.0, 16.0, 16.0, 16.0);
+    server.set_nine_slice(handle, tex, 8.0, 0.0, 12.0, 0.0);
+    server.set_nine_slice(ItemHandle::from_raw(999), tex, 1.0, 1.0, 1.0, 1.0);
+    assert_eq!(
+        server.nine_slice_of(handle),
+        Some(&(tex, [8.0, 0.0, 12.0, 0.0])),
+        "覆写后写者生效（边距四元组逐位）"
+    );
+    assert!(server.nine_slice_of(ItemHandle::from_raw(999)).is_none());
+    assert_eq!(server.counters().ignored_ops, 1, "未知句柄恰好被计一次忽略");
+
+    // 输出序：SetNineSlice 恒在 SetPivot 之后（S16.6 冻结的链尾位置）。
+    server.set_pivot(handle, [0.5, 0.5]);
+    let commands = server.submit(&FrameInfo::default());
+    let pivot_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetPivot { .. }));
+    let nine_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetNineSlice { .. }));
+    assert!(pivot_at.is_some() && nine_at.is_some(), "两命令都在流里");
+    assert!(nine_at > pivot_at, "SetNineSlice 恒在 SetPivot 之后");
+    assert!(
+        commands
+            .iter()
+            .all(|c| c.handle() != Some(ItemHandle::from_raw(999))),
+        "未知句柄不产生命令"
+    );
+
+    // NIL 键 = 恒等记录（照 set_pivot([0,0]) 零向量先例）：照存照发 ——
+    // 消费端据此清除跨帧簿记，fill/border 照旧。
+    server.set_nine_slice(handle, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0);
+    assert_eq!(
+        server.nine_slice_of(handle),
+        Some(&(RenderAssetKey::NIL, [0.0, 0.0, 0.0, 0.0])),
+        "NIL 恒等记录照存（清除必须可在命令流里承载）"
+    );
+    let commands = server.submit(&FrameInfo::default());
+    let nil_clears = commands
+        .iter()
+        .filter(|c| matches!(c, RenderCommand::SetNineSlice { texture, .. } if texture.is_nil()))
+        .count();
+    assert_eq!(nil_clears, 1, "恒等记录随快照重发（消费端的清除载体）");
+
+    // 销毁：九宫格随条目消亡（恒等记录一并消失）。
+    server.set_nine_slice(handle, tex, 16.0, 16.0, 16.0, 16.0);
+    server.destroy_item(handle);
+    assert!(server.nine_slice_of(handle).is_none(), "销毁随条目清理");
+    let commands = server.submit(&FrameInfo::default());
+    assert!(
+        commands
+            .iter()
+            .all(|c| !matches!(c, RenderCommand::SetNineSlice { .. })),
+        "销毁后命令流不再出现 SetNineSlice"
+    );
+}

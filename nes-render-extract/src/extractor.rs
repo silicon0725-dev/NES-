@@ -110,6 +110,16 @@ pub const PROP_CONTROL_ANCHOR: &str = "anchor";
 pub const PROP_CONTROL_OFFSET: &str = "offset";
 /// `Control` 的尺寸属性名（像素；负值照收，不钳制）。
 pub const PROP_CONTROL_SIZE: &str = "size";
+/// `Control` 的九宫格源纹理属性名（S16.6；未绑定 = 九宫格关闭）。
+pub const PROP_NS_TEX: &str = "ns_tex";
+/// `Control` 的九宫格源纹理左边距属性名（S16.6；源纹理像素）。
+pub const PROP_NS_L: &str = "ns_l";
+/// `Control` 的九宫格源纹理上边距属性名（S16.6）。
+pub const PROP_NS_T: &str = "ns_t";
+/// `Control` 的九宫格源纹理右边距属性名（S16.6）。
+pub const PROP_NS_R: &str = "ns_r";
+/// `Control` 的九宫格源纹理下边距属性名（S16.6）。
+pub const PROP_NS_B: &str = "ns_b";
 
 /// `Label` 字号缺省值（与场景层 schema 的 `font_size` 缺省一致）。
 pub const DEFAULT_LABEL_FONT_SIZE: f32 = 16.0;
@@ -469,6 +479,28 @@ impl RenderExtractor {
             }
             if self.map.take_clipped(node, wants_clip) == Some(true) && !wants_clip {
                 server.set_clip(handle, None);
+            }
+            // —— S16.6 九宫格：Control 的面板纹理（ns_tex + ns_l/t/r/b）。
+            //    有效（纹理键非空 + 至少一边距 > 0）时逐帧重发（照 tint/uv
+            //    全量快照口径）；nines 簿记跨帧持久，**设过 → 清空的迁移帧
+            //    补推一次 NIL 恒等记录**（`nines_active` 标记，照裁剪
+            //    Some→None / uv 激活→整图 / pivot 非(0,0)→(0,0) 的同一义务
+            //    —— 否则陈旧九宫格会永久残留）。恒等记录照存照发（pivot
+            //    零向量先例）：消费端收到 NIL 后摘跨帧簿记，面板回到
+            //    fill/border 路径逐位同基线。仅裸 Control 生效（Button /
+            //    TextInput / List 等摊平类与 Label 不读 ns 属性 —— 面板
+            //    纹理化暂不扩大到派生控件，遗留项见 S16.6 文档 §4）。
+            if matches!(admission, Admission::Control(_, _)) {
+                let nine = nine_slice_of(tree, node, source);
+                let wants_nines = nine.is_some();
+                if let Some((key, margins)) = nine {
+                    server.set_nine_slice(
+                        handle, key, margins[0], margins[1], margins[2], margins[3],
+                    );
+                }
+                if self.map.take_nines_active(node, wants_nines) == Some(true) && !wants_nines {
+                    server.set_nine_slice(handle, RenderAssetKey::NIL, 0.0, 0.0, 0.0, 0.0);
+                }
             }
             // —— S16.2 图集帧动画：Sprite 的子矩形采样（同帧只对 Sprite 生效
             //    —— sheet 属性是 Sprite2D 独有；与 tint 同一"全量快照"口径，
@@ -1012,8 +1044,34 @@ fn sprite_tint_rgba(tree: &SceneTree, node: NodeId) -> [u8; 4] {
     [255, 255, 255, (a * 255.0) as u8]
 }
 
-/// Sprite2D 的图集子矩形（S16.2 图集帧动画）：`sheet_cols > 0` 时按
-/// `frame` 算出该帧的**归一化 UV 矩形** `[u0, v0, us, vs]`；整图模式
+/// `Control` 的九宫格配置（S16.6）：`ns_tex` 绑定到可渲染纹理键、且四条
+/// 边距**至少一条 > 0** 时返回 `(键, [l, t, r, b])`；否则 `None` —— 不推
+/// `SetNineSlice`（关闭 = fill/border 照旧，缺省路径逐位不变）。
+///
+/// - 边距读 `ns_l` / `ns_t` / `ns_r` / `ns_b`（I64 属性，缺失/类型错 → 0；
+///   负值照收 —— 钳制权威在渲染侧单处，与本层"不重算算式"纪律一致）；
+/// - "至少一条 > 0" 是关闭判据：全 0 边距的九宫格没有切割线可言，视同
+///   未启用（与 `sheet_cols == 0` 关闭图集的同一口径）；
+/// - 纹理走 [`ResId::from_value`] + `renderable_key`（与 Sprite 的 texture
+///   同一条准入链）：未绑定 `Resource(0)` / 资源被回收都算 `None`。
+fn nine_slice_of(
+    tree: &SceneTree,
+    node: NodeId,
+    source: &dyn RenderKeySource,
+) -> Option<(RenderAssetKey, [f32; 4])> {
+    let id = tree.prop(node, PROP_NS_TEX).and_then(ResId::from_value)?;
+    let key = source.renderable_key(id)?;
+    let l = i64_prop(tree, node, PROP_NS_L, 0) as f32;
+    let t = i64_prop(tree, node, PROP_NS_T, 0) as f32;
+    let r = i64_prop(tree, node, PROP_NS_R, 0) as f32;
+    let b = i64_prop(tree, node, PROP_NS_B, 0) as f32;
+    if l <= 0.0 && t <= 0.0 && r <= 0.0 && b <= 0.0 {
+        return None;
+    }
+    Some((key, [l, t, r, b]))
+}
+
+/// Sprite2D 的图集子矩形（S16.2 图集帧动画）：`sheet_cols > 0` 时按/// `frame` 算出该帧的**归一化 UV 矩形** `[u0, v0, us, vs]`；整图模式
 ///（`sheet_cols <= 0`）返回 `None` —— 不推 `SetUv`，既有整瓦片采样
 /// 逐位不变。
 ///

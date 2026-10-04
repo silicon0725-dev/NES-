@@ -224,6 +224,9 @@ fn kind_of(cmd: &RenderCommand) -> &'static str {
         // S16.3（精灵锚点）新增的 SetPivot：同上 —— 只补枚举臂恢复可编译，
         // 仅非 (0,0) 锚点的精灵才推（criterion_extract 的 pivot 用例专钉）。
         RenderCommand::SetPivot { .. } => "set_pivot",
+        // S16.6（九宫格）新增的 SetNineSlice：同上 —— 只补枚举臂恢复可编译，
+        // 仅 ns 属性有效的 Control 才推（criterion_nineslice 的用例专钉）。
+        RenderCommand::SetNineSlice { .. } => "set_nine_slice",
     }
 }
 

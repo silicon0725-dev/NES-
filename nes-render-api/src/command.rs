@@ -224,6 +224,44 @@ pub enum RenderCommand {
         /// —— 超出精灵外锚定是合法创作用途，取舍权威在后端单处折算）。
         pivot: [f32; 2],
     },
+    /// 九宫格纹理（S16.6 Control 面板纹理化的契约扩展）：控件的**源纹理键**
+    /// 与 3x3 切割边距 `[l, t, r, b]`（源纹理像素）。
+    ///
+    /// 与 [`RenderCommand::SetTint`] / [`RenderCommand::SetUv`] /
+    /// [`RenderCommand::SetPivot`] 同一性质与同一条纪律：
+    ///
+    /// - 属性动作、全量快照、同键覆写：`submit` 时对有九宫格簿记的条目
+    ///   按序重发当前值（漏推一帧不漂移）；条目销毁时随条目消亡；
+    /// - 输出序冻结在对应条目的 `SetPivot` 之后（同一渲染物的属性流序：
+    ///   … → SetRect → SetClip → SetTint → SetUv → SetPivot → SetNineSlice
+    ///   —— null 与 wgpu 两处 submit 严格同序）；
+    /// - 空句柄 / 未知句柄静默忽略（契约 I1 口径）；
+    /// - **清除语义**（照 [`RenderCommand::SetPivot`] 的零向量先例）：
+    ///   `texture` 为 [`RenderAssetKey::NIL`] 的记录是**恒等记录** ——
+    ///   照存照发（fill/border 照旧），消费端收到后清除跨帧九宫格簿记。
+    ///   清除必须可在命令流里承载：簿记跨帧的后端只能从每帧全量快照里
+    ///   读到"清掉"这件事；提取层在"设过 → 清空"的迁移帧补推一次；
+    /// - **消费语义**（后端唯一折算点）：仅 Control 分支（有 `SetRect`
+    ///   状态的条目）消费 —— 不走 fill/border 条带，改为按源纹理 3x3
+    ///   网格展开 9 个实例：四角 1:1、四边单向拉伸、中心双向拉伸；
+    ///   边距在控件边长的一半处钳制（`min(声明边距, 边长/2)`，防角重叠）；
+    ///   纹理未注册 / 矩形退化时本帧不画面板（不回退 fill/border，防
+    ///   模式间闪烁）。
+    SetNineSlice {
+        /// 句柄。
+        handle: ItemHandle,
+        /// 源纹理键；[`RenderAssetKey::NIL`] = 恒等记录（清除载体，
+        /// 见上）。
+        texture: RenderAssetKey,
+        /// 源纹理左边距（像素）。
+        l: f32,
+        /// 源纹理上边距（像素）。
+        t: f32,
+        /// 源纹理右边距（像素）。
+        r: f32,
+        /// 源纹理下边距（像素）。
+        b: f32,
+    },
     /// 帧结束标记（**每条命令流都必须以它结尾**）。
     Submit {
         /// 本帧上下文。
@@ -247,7 +285,8 @@ impl RenderCommand {
             | Self::SetClip { handle, .. }
             | Self::SetTint { handle, .. }
             | Self::SetUv { handle, .. }
-            | Self::SetPivot { handle, .. } => Some(*handle),
+            | Self::SetPivot { handle, .. }
+            | Self::SetNineSlice { handle, .. } => Some(*handle),
             Self::SetCamera { .. } | Self::Submit { .. } => None,
         }
     }

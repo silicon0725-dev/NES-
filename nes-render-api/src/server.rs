@@ -30,7 +30,8 @@ use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 ///    **按需**追加 `SetClip` —— 裁剪恒在 `SetRect` 之后）→（有 tint 簿记则
 ///    追加 `SetTint`，S16.1 —— 恒在 `SetClip` 之后）→（有 uv 簿记则追加
 ///    `SetUv`，S16.2 —— 恒在 `SetTint` 之后）→（有 pivot 簿记则追加
-///    `SetPivot`，S16.3 —— 恒在 `SetUv` 之后）→ `Submit`；
+///    `SetPivot`，S16.3 —— 恒在 `SetUv` 之后）→（有九宫格簿记则追加
+///    `SetNineSlice`，S16.6 —— 恒在 `SetPivot` 之后）→ `Submit`；
 /// 6. **属性流是全量快照**：不做"仅变化时推送"的增量省略，后端无需维护跨帧 diff。
 ///
 /// # 对象安全
@@ -114,6 +115,28 @@ pub trait RenderServer {
     /// - 输出序恒在对应条目的 `set_uv` 之后；
     /// - 后端只在注册表精灵分支消费（无记录 = 无平移，逐位同基线）。
     fn set_pivot(&mut self, handle: ItemHandle, pivot: [f32; 2]);
+
+    /// 设置九宫格纹理（S16.6 Control 面板纹理化；源纹理键 + 3x3 切割边距
+    /// `[l, t, r, b]`，单位 = 源纹理像素）。
+    ///
+    /// - 语义 = Control 分支改走九宫格展开（四角 1:1、四边单向拉伸、中心
+    ///   双向拉伸），`fill` / `border` 条带不再绘制（纹理自带边）；边距在
+    ///   控件边长一半处钳制的折算权威在后端单处；
+    /// - 同键覆写（全量快照/跨帧幂等）；条目销毁时随条目消亡；
+    /// - `texture == [`RenderAssetKey::NIL`]` = **恒等记录**（照
+    ///   `set_pivot([0,0])` 零向量先例）：照存照发、fill/border 照旧 ——
+    ///   消费端收到后清除跨帧九宫格簿记（清除必须可在命令流里承载）；
+    /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
+    /// - 输出序恒在对应条目的 `set_pivot` 之后。
+    fn set_nine_slice(
+        &mut self,
+        handle: ItemHandle,
+        texture: RenderAssetKey,
+        l: f32,
+        t: f32,
+        r: f32,
+        b: f32,
+    );
 
     /// 生成本帧命令序列写入 `out`（**先清空** `out`）。
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>);

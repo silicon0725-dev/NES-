@@ -400,6 +400,46 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 H::None,
                 "边框槽位名（S12.1 主题）。",
             ),
+            PropDesc::new(
+                "ns_tex",
+                ValueType::Resource,
+                Value::Resource(0),
+                H::Resource { kind: "texture" },
+                "九宫格源纹理（S16.6）。按 3x3 网格渲染面板：四角 1:1 固定、\
+                 四边单向拉伸、中心双向拉伸 —— 面板任意缩放角不变形。未绑定 \
+                 （Resource(0)）= 九宫格关闭，fill/border 照旧（缺省路径逐位\
+                 不变）。绑定后 fill/border 不再绘制（纹理自带边）。",
+            ),
+            PropDesc::new(
+                "ns_l",
+                ValueType::I64,
+                Value::I64(0),
+                H::None,
+                "九宫格源纹理左边距（S16.6；像素，定义 3x3 切割线）。四条边距\
+                 全 0 = 九宫格关闭。实际渲染边距 = min(声明边距, 控件边长/2) \
+                 （防负：控件小于边距和时角不重叠）。",
+            ),
+            PropDesc::new(
+                "ns_t",
+                ValueType::I64,
+                Value::I64(0),
+                H::None,
+                "九宫格源纹理上边距（S16.6；语义同 ns_l）。",
+            ),
+            PropDesc::new(
+                "ns_r",
+                ValueType::I64,
+                Value::I64(0),
+                H::None,
+                "九宫格源纹理右边距（S16.6；语义同 ns_l）。",
+            ),
+            PropDesc::new(
+                "ns_b",
+                ValueType::I64,
+                Value::I64(0),
+                H::None,
+                "九宫格源纹理下边距（S16.6；语义同 ns_l）。",
+            ),
         ],
         NodeKindTag::Button => vec![
             PropDesc::new(

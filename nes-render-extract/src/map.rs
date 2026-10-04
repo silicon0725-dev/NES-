@@ -47,6 +47,13 @@ pub struct ItemSlot {
     /// 跨帧持久且"无记录 = 无平移"，从设过非零锚点回调缺省后陈旧锚点
     /// 同样必须显式清除；与 clipped / uv_active 同一条义务）。
     pub pivot_active: bool,
+    /// 上一提取帧是否对该条目推送过 `SetNineSlice`（S16.6：九宫格的
+    /// 有效→清空迁移帧据此补推一次 NIL **恒等记录**（照 pivot 零向量
+    /// 先例：照存照发，消费端据此摘跨帧簿记）—— nines 簿记跨帧持久且
+    /// "无记录 / 恒等记录 = fill/border 照旧"，清掉 ns_tex 或边距归零后
+    /// 陈旧九宫格同样必须显式清除；与 clipped / uv_active / pivot_active
+    /// 同一条"全量快照的生产者侧义务"）。
+    pub nines_active: bool,
 }
 
 impl ItemSlot {
@@ -126,6 +133,7 @@ impl NodeItemMap {
                 clipped: false,
                 uv_active: false,
                 pivot_active: false,
+                nines_active: false,
             },
         );
     }
@@ -159,6 +167,15 @@ impl NodeItemMap {
         self.slots.get_mut(&node).map(|slot| {
             let was = slot.pivot_active;
             slot.pivot_active = now;
+            was
+        })
+    }
+
+    /// 读写条目的九宫格推送标记（S16.6 有效→清空迁移检测用；`None` = 无条目）。
+    pub fn take_nines_active(&mut self, node: NodeId, now: bool) -> Option<bool> {
+        self.slots.get_mut(&node).map(|slot| {
+            let was = slot.nines_active;
+            slot.nines_active = now;
             was
         })
     }

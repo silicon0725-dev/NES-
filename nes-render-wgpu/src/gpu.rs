@@ -285,9 +285,7 @@ unsafe extern "system" fn on_map(
     }
     let callbacks = &*(userdata1 as *const GpuCallbacks);
     callbacks.map_calls.fetch_add(1, Ordering::Relaxed);
-    callbacks
-        .map
-        .publish(status, 0, message.to_string_lossy());
+    callbacks.map.publish(status, 0, message.to_string_lossy());
 }
 
 /// `WGPUUncapturedErrorCallback`（首参是 `device`，共 5 参 —— 见 `ffi.rs` 的实测注释）。
@@ -845,9 +843,8 @@ impl RenderTarget {
             buffer: self.readback,
         };
 
-        let encoder = unsafe {
-            (ctx.api().device_create_command_encoder)(ctx.device(), ptr::null())
-        };
+        let encoder =
+            unsafe { (ctx.api().device_create_command_encoder)(ctx.device(), ptr::null()) };
         if encoder.is_null() {
             return Err(BackendError::NullHandle("WGPUCommandEncoder(readback)"));
         }
@@ -900,9 +897,8 @@ impl RenderTarget {
             return Err(BackendError::NullHandle("mapped range(readback)"));
         }
 
-        let src = unsafe {
-            std::slice::from_raw_parts(mapped as *const u8, self.buffer_size as usize)
-        };
+        let src =
+            unsafe { std::slice::from_raw_parts(mapped as *const u8, self.buffer_size as usize) };
         let row_bytes = (self.size.0 * 4) as usize;
         let mut packed = Vec::with_capacity(row_bytes * self.size.1 as usize);
         for row in 0..self.size.1 as usize {
@@ -1393,7 +1389,11 @@ impl TextureRegistry {
     }
 
     /// 创建（或扩容重建）纹理三件套：纹理 + 视图 + 绑定组。
-    fn create_handles(&mut self, ctx: &GpuContext, tiles_per_side: u32) -> Result<(), BackendError> {
+    fn create_handles(
+        &mut self,
+        ctx: &GpuContext,
+        tiles_per_side: u32,
+    ) -> Result<(), BackendError> {
         let api = ctx.api();
         let device = ctx.device();
         let side = self.tile_px * tiles_per_side;
@@ -1637,6 +1637,18 @@ impl TextureRegistry {
         ))
     }
 
+    /// 取键的注册尺寸（源纹理像素宽高；注册时的 `width`/`height`）。
+    ///
+    /// S16.6 九宫格的补充读法：`sample_info` 只给归一化 UV 矩形（分数面
+    /// 不含像素尺寸），而九宫切割边距是**源纹理像素**口径 —— 子矩形折算
+    /// 需要注册尺寸做分母（`uv = px / 注册宽 x 全瓦片宽`）。数据与
+    /// `sample_info` 同源（同一份 `LayerData`），未注册返回 `None`。
+    pub fn texture_px_size(&self, key: RenderAssetKey) -> Option<(f32, f32)> {
+        let tile = self.layer_of(key)?;
+        let data = self.layers.get(tile as usize)?.as_ref()?;
+        Some((data.width as f32, data.height as f32))
+    }
+
     /// 瓦片号 -> 大纹理内的像素原点。
     fn tile_origin(&self, tile: u32) -> (u32, u32) {
         let tx = tile % self.tiles_per_side;
@@ -1748,9 +1760,6 @@ impl Drop for TextureRegistry {
     }
 }
 
-
-
-
 // ------------------------------------------------------------ 表面目标（S6.1）
 
 /// 表面所需的函数指针（理由同 `TargetOps`：让 `Drop` 与 [`SurfaceTarget::
@@ -1847,9 +1856,7 @@ impl SurfaceTarget {
                 "表面能力查询失败（status={status}）：适配器与窗口表面不兼容"
             )));
         }
-        let formats = unsafe {
-            std::slice::from_raw_parts(caps.formats, caps.format_count)
-        };
+        let formats = unsafe { std::slice::from_raw_parts(caps.formats, caps.format_count) };
         let format = formats
             .iter()
             .copied()

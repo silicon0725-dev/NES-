@@ -69,8 +69,8 @@ use nes_render_api::state::{Camera2DState, ControlState, Flip, LabelState, ListA
 
 use crate::error::BackendError;
 use crate::ffi;
+use crate::glyph::{page_key, GlyphAtlas, GlyphSlot, GLYPH_PAGE_PX};
 use crate::gpu::{self, FrameImage, GpuContext, RenderTarget, SpriteAtlas};
-use crate::glyph::{GlyphAtlas, GlyphSlot, GLYPH_PAGE_PX, page_key};
 use crate::png::write_rgba8_png;
 use crate::ttf::TtfFont;
 
@@ -240,6 +240,12 @@ pub struct WgpuRenderServer {
     /// 销毁移除；`submit_into` 在对应条目的 `SetUv` 之后追加 `SetPivot`。
     /// 无记录 = 无平移（既有行为逐位不变）。
     pivots: BTreeMap<ItemHandle, [f32; 2]>,
+    /// 九宫格簿记（S16.6，与 `NullRenderServer` 同构）：同键覆写（NIL 键
+    /// = 恒等记录照存照发）、销毁移除；`submit_into` 在对应条目的
+    /// `SetPivot` 之后追加 `SetNineSlice`。无记录 = fill/border 照旧
+    ///（既有行为逐位不变）。载荷 = `(源纹理键, [l, t, r, b])`（源纹理
+    /// 像素边距）。
+    nines: BTreeMap<ItemHandle, (RenderAssetKey, [f32; 4])>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
 }
@@ -286,7 +292,8 @@ impl RenderServer for WgpuRenderServer {
         let handle = ItemHandle::from_raw(self.next_handle);
         self.items
             .insert(handle, RenderItem::new(handle, key, Affine2::IDENTITY));
-        self.lifecycle.push(RenderCommand::CreateItem { handle, key });
+        self.lifecycle
+            .push(RenderCommand::CreateItem { handle, key });
         handle
     }
 
@@ -301,6 +308,7 @@ impl RenderServer for WgpuRenderServer {
         self.tints.remove(&handle);
         self.uvs.remove(&handle);
         self.pivots.remove(&handle);
+        self.nines.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
     }
 
@@ -395,6 +403,26 @@ impl RenderServer for WgpuRenderServer {
         self.pivots.insert(handle, pivot);
     }
 
+    fn set_nine_slice(
+        &mut self,
+        handle: ItemHandle,
+        texture: RenderAssetKey,
+        l: f32,
+        t: f32,
+        r: f32,
+        b: f32,
+    ) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1 口径）。
+            return;
+        }
+        // 同键覆写（全量快照语义，S16.6 九宫格）。NIL 键**照存**（恒等
+        // 记录 = fill/border 照旧，随每帧快照重发）—— 与 `NullRenderServer`
+        // 同构：清除必须可在命令流里承载，跨帧簿记的消费端才收得到"清掉"
+        // （照 pivot `[0,0]` 零向量先例）。
+        self.nines.insert(handle, (texture, [l, t, r, b]));
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空（契约 I3：缓冲跨帧复用，不留上一帧残留）。
         out.clear();
@@ -483,6 +511,20 @@ impl RenderServer for WgpuRenderServer {
                     pivot: *pivot,
                 });
             }
+            // 九宫格（S16.6）：恒在 SetPivot 之后（契约 I5 顺序冻结；与
+            // `NullRenderServer` 严格同序）。仅当该条目存在九宫格簿记时
+            // 追加 —— 无记录 = fill/border 照旧，命令流与既有路径逐条
+            // 相同。
+            if let Some((texture, margins)) = self.nines.get(&item.handle) {
+                out.push(RenderCommand::SetNineSlice {
+                    handle: item.handle,
+                    texture: *texture,
+                    l: margins[0],
+                    t: margins[1],
+                    r: margins[2],
+                    b: margins[3],
+                });
+            }
         }
 
         // 5) 帧结束标记（契约 I3：末条必为 Submit）。
@@ -503,7 +545,7 @@ pub struct FrameStats {
     pub destroys: u64,
     /// 命中已知句柄的属性命令数（`SetTransform` / `SetFlip` / `SetZ` /
     /// `SetVisible` / `SetText` / `SetList` / `SetRect` / `SetClip` /
-    /// `SetTint` / `SetUv` / `SetPivot`）。
+    /// `SetTint` / `SetUv` / `SetPivot` / `SetNineSlice`）。
     pub updates: u64,
     /// 因空句柄 / 未知句柄被静默忽略的命令数（契约 I1 的可观测计数）。
     pub ignored: u64,
@@ -511,7 +553,8 @@ pub struct FrameStats {
     pub skipped: u64,
     /// 实际提交绘制的四边形数（精灵 + 控件 + 字形）。
     pub drawn: u64,
-    /// 其中控件边框四边形数（有 `SetRect` 状态、按 HUD 口径绘制的渲染物）。
+    /// 其中控件条目数（有 `SetRect` 状态、按 HUD 口径绘制的渲染物；
+    /// S16.6 起含九宫格展开的面板 —— 每条目计 1，不按实例数计）。
     pub controls: u64,
     /// 其中从纹理注册表采样真实纹理的精灵数（不含字形；字形单列）。
     pub from_registry: u64,
@@ -687,6 +730,95 @@ fn push_list_row(
     }
 }
 
+/// 九宫格展开（S16.6）：把源纹理按 3x3 切割铺进控件矩形 —— 每片一个
+/// 实例（照 Label"一字形一实例"的展开先例）。
+///
+/// # 几何算式（冻结，单处实现）
+///
+/// - **边距钳制**（防负 / 防角重叠）：`实际边距 = min(声明边距, 控件边长 / 2)`
+///   （声明负值按 0 处理）。推论：`中段宽 = w - l' - r' >= 0`、
+///   `中段高 = h - t' - b' >= 0` 恒成立（`x/2` 与 `x/2 + x/2 = x` 在
+///   IEEE 754 下精确）；零中段 = 合法退化（中带片 w/h <= 0，整片跳过）；
+/// - 四角 1:1：目标尺寸 = 钳制后源边距（`l' x t'` 等）—— 任意缩放角
+///   不变形；源子矩形**锚在纹理角上**（右/下角从纹理右/下缘回退 `r'/b'`
+///   切割）：未钳制时与"左上顺序切"逐位同值，钳制退化（控件小于边距和）
+///   时四角仍采到纹理真角（标准九宫格"角永远属于纹理角"口径）；
+/// - 四边单向拉伸：上/下条 = 中段宽 x `t'/b'`（水平拉伸、垂直 1:1）；
+///   左/右条 = `l'/r'` x 中段高（垂直拉伸、水平 1:1）；
+/// - 中心双向拉伸：中段宽 x 中段高；
+/// - 源子矩形 = `sample_info` 全瓦片 uv 的**分数内插**
+///   `uv = 全瓦片.xy + 源px / 注册尺寸 x 全瓦片.wh`（注册尺寸经
+///   [`gpu::TextureRegistry::texture_px_size`] 另取 —— sample_info 的
+///   返回面只有分数，像素口径的分母在此单处折算）；
+/// - `fill` / `border` 条带在九宫格模式**不画**（纹理自带边）—— 由调用
+///   方分臂，本函数只发九片；tint 恒中性（面板色即纹理色，不经着色通道）。
+#[allow(clippy::too_many_arguments)]
+fn push_nine_slice(
+    sprites: &mut Vec<SpriteInstance>,
+    handle: ItemHandle,
+    item_clip: [f32; 4],
+    inv: &Affine2,
+    rect: Rect,
+    tile: u32,
+    sheet: [f32; 4],
+    tex_px: (f32, f32),
+    margins: [f32; 4],
+) {
+    // 边距钳制：负值按 0、超过半边按半边（角不重叠、中段非负恒成立）。
+    let l = margins[0].max(0.0).min(rect.w * 0.5);
+    let t = margins[1].max(0.0).min(rect.h * 0.5);
+    let r = margins[2].max(0.0).min(rect.w * 0.5);
+    let b = margins[3].max(0.0).min(rect.h * 0.5);
+    let cx = rect.w - l - r; // 中段宽（>= 0 由钳制保证）
+    let cy = rect.h - t - b; // 中段高（同上）
+                             // 源 uv 折算：全瓦片矩形是唯一参照，像素 -> 分数内插只有这一处。
+    let (tw, th) = tex_px;
+    let ux = |px: f32| sheet[0] + px / tw * sheet[2];
+    let uy = |px: f32| sheet[1] + px / th * sheet[3];
+    let uw = |px: f32| px / tw * sheet[2];
+    let uh = |px: f32| px / th * sheet[3];
+    // 源切割线**锚在纹理角上**：右/下切割线从纹理右/下缘回退钳制边距
+    //（`tw - r` / `th - b`）。未钳制时与 `l + 中段` 重合（逐位同值）；
+    // 钳制退化（30px 控件 < 32px 边距和）时四角仍采到纹理真角 —— 标准
+    // 九宫格口径"角永远属于纹理角"。
+    let (sx_mid, sy_mid) = (tw - r, th - b);
+    let sw_edge = sx_mid - l; // 源上/下边条宽（未钳制时 = 中段宽）
+    let sh_edge = sy_mid - t; // 源左/右边条高（未钳制时 = 中段高）
+    // 九片 = (目标 x, y, w, h；源 x, y, w, h)（相对矩形左上角 / 纹理左上
+    // 角）。宽或高 <= 0 的片跳过 —— 零中段的合法退化，半开区间无像素可画。
+    let pieces = [
+        // 上带：左角（1:1）/ 上边（水平拉伸）/ 右角（1:1，锚纹理右缘）。
+        (0.0, 0.0, l, t, 0.0, 0.0, l, t),
+        (l, 0.0, cx, t, l, 0.0, sw_edge, t),
+        (l + cx, 0.0, r, t, sx_mid, 0.0, r, t),
+        // 中带：左边（垂直拉伸）/ 中心（双向拉伸）/ 右边（垂直拉伸）。
+        (0.0, t, l, cy, 0.0, t, l, sh_edge),
+        (l, t, cx, cy, l, t, sw_edge, sh_edge),
+        (l + cx, t, r, cy, sx_mid, t, r, sh_edge),
+        // 下带：左角（1:1，锚纹理下缘）/ 下边（水平拉伸）/ 右角（锚双缘）。
+        (0.0, t + cy, l, b, 0.0, sy_mid, l, b),
+        (l, t + cy, cx, b, l, sy_mid, sw_edge, b),
+        (l + cx, t + cy, r, b, sx_mid, sy_mid, r, b),
+    ];
+    for (dx, dy, dw, dh, sx, sy, sw, sh) in pieces {
+        if dw <= 0.0 || dh <= 0.0 {
+            continue;
+        }
+        let quad = Affine2::translation(rect.x + dx, rect.y + dy).mul(&Affine2::scale(
+            dw / gpu::CELL_PX as f32,
+            dh / gpu::CELL_PX as f32,
+        ));
+        sprites.push(SpriteInstance {
+            handle,
+            world: inv.mul(&quad).to_array(),
+            uv_rect: [ux(sx), uy(sy), uw(sw), uh(sh)],
+            source: [tile as f32, 1.0],
+            tint: [1.0, 1.0, 1.0, 1.0],
+            clip: item_clip,
+        });
+    }
+}
+
 /// 视口空间裁剪矩形 -> 帧缓冲像素 scissor（E-2 裁剪契约，S12-3）。
 ///
 /// 折算规则（冻结）：
@@ -794,7 +926,10 @@ impl SpritePipeline {
         )?;
 
         // 3) 管线布局：group 0 = 图集，group 1 = 纹理注册表。
-        let layouts = [atlas.handles().bind_group_layout, registry.bind_group_layout()];
+        let layouts = [
+            atlas.handles().bind_group_layout,
+            registry.bind_group_layout(),
+        ];
         let mut pl_desc = ffi::PipelineLayoutDescriptor {
             bind_group_layout_count: layouts.len(),
             bind_group_layouts: layouts.as_ptr(),
@@ -1063,8 +1198,7 @@ impl SpritePipeline {
             return Err(BackendError::NullHandle("WGPUCommandEncoder(sprite)"));
         }
         // SAFETY: pass_desc 与 attachment 在本次调用期间存活。
-        let pass =
-            unsafe { (api.command_encoder_begin_render_pass)(encoder, &pass_desc) };
+        let pass = unsafe { (api.command_encoder_begin_render_pass)(encoder, &pass_desc) };
         if pass.is_null() {
             unsafe { (api.command_encoder_release)(encoder) };
             return Err(BackendError::NullHandle("WGPURenderPassEncoder(sprite)"));
@@ -1104,7 +1238,13 @@ impl SpritePipeline {
                         clip_to_scissor(clip, (view[6], view[7]), target_size)
                     {
                         (api.render_pass_encoder_set_scissor_rect)(pass, x, y, w, h);
-                        (api.render_pass_encoder_draw)(pass, 6, (end - start) as u32, 0, start as u32);
+                        (api.render_pass_encoder_draw)(
+                            pass,
+                            6,
+                            (end - start) as u32,
+                            0,
+                            start as u32,
+                        );
                         submitted += (end - start) as u64;
                     }
                     // 交集为空的段整段跳过：不可见内容一次 draw 都不发。
@@ -1217,6 +1357,12 @@ pub struct CommandConsumer {
     /// **局部空间**平移 `-pivot × 16px 基准格` —— 无记录 = 无平移（与既有
     /// 路径逐位相同）。归一化锚点 `[px, py]`，消费点单处折算。
     pivots: BTreeMap<ItemHandle, [f32; 2]>,
+    /// 跨帧九宫格登记表（`SetNineSlice` 建/覆写、NIL 清除、`DestroyItem`
+    /// 删；S16.6）。Control 分支查此表决定走九宫格展开还是 fill/border
+    /// 条带 —— 无记录 = fill/border 照旧（与既有路径逐位相同）。载荷 =
+    /// `(源纹理键, [l, t, r, b])`（源纹理像素边距），消费点单处折算
+    /// （见 draw_into Control 分支的九宫展开）。
+    nines: BTreeMap<ItemHandle, (RenderAssetKey, [f32; 4])>,
     /// 字体登记表：资源键 -> 排版参数（字形表本体作为纹理住在注册表里）。
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
@@ -1316,6 +1462,7 @@ impl CommandConsumer {
             tints: BTreeMap::new(),
             uvs: BTreeMap::new(),
             pivots: BTreeMap::new(),
+            nines: BTreeMap::new(),
             fonts: BTreeMap::new(),
             ttf: None,
             glyph_atlas: GlyphAtlas::default(),
@@ -1359,8 +1506,7 @@ impl CommandConsumer {
         height: u32,
         rgba: &[u8],
     ) -> Result<u32, BackendError> {
-        self.registry
-            .register(&self.ctx, key, width, height, rgba)
+        self.registry.register(&self.ctx, key, width, height, rgba)
     }
 
     /// 设置默认字体（`LabelState.font == NIL` 或指向未登记键时使用），返回瓦片号。
@@ -1392,9 +1538,8 @@ impl CommandConsumer {
     /// 显式 `font` 资源键（位图字形表路径）完全不受影响：装载后走 TTF 的
     /// 只有 `font == NIL` 的条目；未登记键仍退回位图默认字体（基线口径）。
     pub fn set_ttf_default(&mut self, data: &[u8]) -> Result<(), BackendError> {
-        let font = TtfFont::parse(data).map_err(|err| {
-            BackendError::ConfigMismatch(format!("TTF 默认字体解析失败：{err}"))
-        })?;
+        let font = TtfFont::parse(data)
+            .map_err(|err| BackendError::ConfigMismatch(format!("TTF 默认字体解析失败：{err}")))?;
         self.ttf = Some(font);
         Ok(())
     }
@@ -1445,8 +1590,7 @@ impl CommandConsumer {
                 "字形表 {width}x{height} 容不下 {count} 个 {cell_w}x{cell_h} 字格（每行 {cols} 格）"
             )));
         }
-        if !(advance.is_finite() && advance > 0.0 && line_height.is_finite() && line_height > 0.0)
-        {
+        if !(advance.is_finite() && advance > 0.0 && line_height.is_finite() && line_height > 0.0) {
             return Err(BackendError::ConfigMismatch(
                 "字距与行高必须是正的有限值".to_string(),
             ));
@@ -1480,12 +1624,15 @@ impl CommandConsumer {
     /// 只有这一处实现。
     fn resolve_font(&self, font: RenderAssetKey) -> Option<(RenderAssetKey, FontEntry)> {
         if font.is_nil() {
-            self.fonts.get(&DEFAULT_FONT_KEY).map(|e| (DEFAULT_FONT_KEY, *e))
-        } else {
             self.fonts
-                .get(&font)
-                .map(|e| (font, *e))
-                .or_else(|| self.fonts.get(&DEFAULT_FONT_KEY).map(|e| (DEFAULT_FONT_KEY, *e)))
+                .get(&DEFAULT_FONT_KEY)
+                .map(|e| (DEFAULT_FONT_KEY, *e))
+        } else {
+            self.fonts.get(&font).map(|e| (font, *e)).or_else(|| {
+                self.fonts
+                    .get(&DEFAULT_FONT_KEY)
+                    .map(|e| (DEFAULT_FONT_KEY, *e))
+            })
         }
     }
 
@@ -1510,7 +1657,10 @@ impl CommandConsumer {
         if let Some(hit) = self.glyph_atlas.cached(ch, size_px) {
             return Ok(hit);
         }
-        let font = self.ttf.as_ref().expect("glyph_slot 只在 TTF 已装载时被调用");
+        let font = self
+            .ttf
+            .as_ref()
+            .expect("glyph_slot 只在 TTF 已装载时被调用");
         let px = size_px as f32;
         let (bitmap, advance) = match font.glyph_index(ch) {
             Some(gid) => {
@@ -1555,7 +1705,8 @@ impl CommandConsumer {
         };
         if let Some((page, x, y)) = placement {
             let bm = bitmap.as_ref().expect("有落位必有位图");
-            self.glyph_atlas.blit(page, x, y, bm.width, bm.height, &bm.coverage);
+            self.glyph_atlas
+                .blit(page, x, y, bm.width, bm.height, &bm.coverage);
             // 字段拆借（blit 已结束）：页缓冲、注册表、上下文三处互不相交，
             // 免去整页 256 KiB 的克隆。
             let this = &mut *self;
@@ -1752,21 +1903,20 @@ impl CommandConsumer {
                         self.tints.remove(handle);
                         self.uvs.remove(handle);
                         self.pivots.remove(handle);
+                        self.nines.remove(handle);
                         stats.destroys += 1;
                     } else {
                         stats.ignored += 1;
                     }
                 }
                 RenderCommand::SetCamera { camera: c } => camera = Some(*c),
-                RenderCommand::SetVisible { handle, visible } => {
-                    match self.items.get_mut(handle) {
-                        Some(item) => {
-                            item.visible = *visible;
-                            stats.updates += 1;
-                        }
-                        None => stats.ignored += 1,
+                RenderCommand::SetVisible { handle, visible } => match self.items.get_mut(handle) {
+                    Some(item) => {
+                        item.visible = *visible;
+                        stats.updates += 1;
                     }
-                }
+                    None => stats.ignored += 1,
+                },
                 RenderCommand::SetTransform { handle, transform } => {
                     match self.items.get_mut(handle) {
                         Some(item) => {
@@ -1872,6 +2022,29 @@ impl CommandConsumer {
                         stats.ignored += 1;
                     }
                 }
+                // SetNineSlice：登记九宫格配置（S16.6）。Control 分支按此
+                // 改走九宫格展开（无记录 = fill/border 照旧，逐位不变）；
+                // NIL 键 = 清除；已知句柄同键覆写，未知句柄静默忽略（契约
+                // I1 口径）。
+                RenderCommand::SetNineSlice {
+                    handle,
+                    texture,
+                    l,
+                    t,
+                    r,
+                    b,
+                } => {
+                    if self.items.contains_key(handle) {
+                        if texture.is_nil() {
+                            self.nines.remove(handle);
+                        } else {
+                            self.nines.insert(*handle, (*texture, [*l, *t, *r, *b]));
+                        }
+                        stats.updates += 1;
+                    } else {
+                        stats.ignored += 1;
+                    }
+                }
                 RenderCommand::Submit { .. } => {} // 终止标记，已在入口校验。
             }
         }
@@ -1949,47 +2122,82 @@ impl CommandConsumer {
                 .unwrap_or(SpriteInstance::NO_CLIP);
             if let (Some(rect_state), Some(inv)) = (self.rects.get(&item.handle), inv_view) {
                 let rect = rect_state.resolve(viewport);
-                // 填充（alpha == 0 不发 —— 缺省透明，与 E-1 之前同像素）。
-                if rect_state.fill[3] > 0 {
-                    let quad = Affine2::translation(rect.x, rect.y).mul(&Affine2::scale(
-                        rect.w / gpu::CELL_PX as f32,
-                        rect.h / gpu::CELL_PX as f32,
-                    ));
-                    sprites.push(SpriteInstance {
-                        handle: item.handle,
-                        world: inv.mul(&quad).to_array(),
-                        uv_rect: fill_uv,
-                        source: [0.0, 0.0],
-                        tint: SpriteInstance::tint_of(rect_state.fill),
-                        clip: item_clip,
-                    });
+                // S16.6 九宫格分臂：有九宫格簿记（非 NIL 键）时面板改走
+                // 九宫格展开，fill/border 条带**不画**（纹理自带边）。
+                // 纹理未注册 / 矩形退化（非正宽高）= 本帧不画面板 —— 不
+                // 回退 fill/border，防"有纹理画九宫、没纹理画边框"的模式
+                // 间闪烁；滚动条两种模式共用（面板内容 chrome，非面板本体）。
+                let nine = match self.nines.get(&item.handle) {
+                    Some((texture, margins)) if !texture.is_nil() => Some((*texture, *margins)),
+                    _ => None,
+                };
+                if let Some((ns_tex, ns_margins)) = nine {
+                    if rect.w > 0.0 && rect.h > 0.0 {
+                        // sample_info（全瓦片 uv）与注册尺寸（像素分母）
+                        // 同查一表；任一缺席 = 纹理未注册，本帧不画
+                        //（不回退 fill/border —— 见上方分臂注释）。
+                        if let Some(((tile, sheet), tex_px)) = self
+                            .registry
+                            .sample_info(ns_tex)
+                            .zip(self.registry.texture_px_size(ns_tex))
+                        {
+                            push_nine_slice(
+                                &mut sprites,
+                                item.handle,
+                                item_clip,
+                                &inv,
+                                rect,
+                                tile,
+                                sheet,
+                                tex_px,
+                                ns_margins,
+                            );
+                        }
+                    }
                 }
-                // 边框：四条 border_w 宽的填充条（上/下/左/右）。
-                if rect_state.border[3] > 0 {
-                    let t = rect_state
-                        .border_w
-                        .clamp(0.0, (rect.h * 0.5).max(0.0))
-                        .clamp(0.0, (rect.w * 0.5).max(0.0));
-                    let border_tint = SpriteInstance::tint_of(rect_state.border);
-                    let strips = [
-                        (rect.x, rect.y, rect.w, t),
-                        (rect.x, rect.y + rect.h - t, rect.w, t),
-                        (rect.x, rect.y + t, t, rect.h - 2.0 * t),
-                        (rect.x + rect.w - t, rect.y + t, t, rect.h - 2.0 * t),
-                    ];
-                    for (sx, sy, sw, sh) in strips {
-                        let quad = Affine2::translation(sx, sy).mul(&Affine2::scale(
-                            sw / gpu::CELL_PX as f32,
-                            sh / gpu::CELL_PX as f32,
+                if nine.is_none() {
+                    // 填充（alpha == 0 不发 —— 缺省透明，与 E-1 之前同像素）。
+                    if rect_state.fill[3] > 0 {
+                        let quad = Affine2::translation(rect.x, rect.y).mul(&Affine2::scale(
+                            rect.w / gpu::CELL_PX as f32,
+                            rect.h / gpu::CELL_PX as f32,
                         ));
                         sprites.push(SpriteInstance {
                             handle: item.handle,
                             world: inv.mul(&quad).to_array(),
                             uv_rect: fill_uv,
                             source: [0.0, 0.0],
-                            tint: border_tint,
+                            tint: SpriteInstance::tint_of(rect_state.fill),
                             clip: item_clip,
                         });
+                    }
+                    // 边框：四条 border_w 宽的填充条（上/下/左/右）。
+                    if rect_state.border[3] > 0 {
+                        let t = rect_state
+                            .border_w
+                            .clamp(0.0, (rect.h * 0.5).max(0.0))
+                            .clamp(0.0, (rect.w * 0.5).max(0.0));
+                        let border_tint = SpriteInstance::tint_of(rect_state.border);
+                        let strips = [
+                            (rect.x, rect.y, rect.w, t),
+                            (rect.x, rect.y + rect.h - t, rect.w, t),
+                            (rect.x, rect.y + t, t, rect.h - 2.0 * t),
+                            (rect.x + rect.w - t, rect.y + t, t, rect.h - 2.0 * t),
+                        ];
+                        for (sx, sy, sw, sh) in strips {
+                            let quad = Affine2::translation(sx, sy).mul(&Affine2::scale(
+                                sw / gpu::CELL_PX as f32,
+                                sh / gpu::CELL_PX as f32,
+                            ));
+                            sprites.push(SpriteInstance {
+                                handle: item.handle,
+                                world: inv.mul(&quad).to_array(),
+                                uv_rect: fill_uv,
+                                source: [0.0, 0.0],
+                                tint: border_tint,
+                                clip: item_clip,
+                            });
+                        }
                     }
                 }
                 // 滚动条（S12-3 任务 4）：`ControlState::scroll_bar` 为 Some
@@ -1997,6 +2205,7 @@ impl CommandConsumer {
                 // 滑块长 max(8, frac*(h-2))，行程 = h-2-滑块长、按 pos 取位，
                 // y 基点 = rect.y+1（上下各让 1px 内衬）。填充格 + tint =
                 // bar.color（提取层算好的视觉状态，本层零再计算）。
+                // 九宫格模式下同样成立（滑块是内容 chrome，不随面板纹理走）。
                 if let Some(bar) = rect_state.scroll_bar {
                     let thumb_h = (bar.frac * (rect.h - 2.0)).max(8.0);
                     let bar_x = rect.x + rect.w - 5.0;
@@ -2049,8 +2258,12 @@ impl CommandConsumer {
                                         let selected = rows.selected == Some(i as u16);
                                         // 选中条：列表矩形内衬边框 1px
                                         //（x+1..w-2），行带内衬 1px 高 row_h-2。
-                                        let band =
-                                            (rect.x + 1.0, top + 1.0, rect.w - 2.0, rows.row_h - 2.0);
+                                        let band = (
+                                            rect.x + 1.0,
+                                            top + 1.0,
+                                            rect.w - 2.0,
+                                            rows.row_h - 2.0,
+                                        );
                                         push_list_row(
                                             &mut sprites,
                                             item.handle,
@@ -2181,12 +2394,12 @@ impl CommandConsumer {
                                 let col = index % font.cols;
                                 let row = index / font.cols;
                                 let pen_x = char_index as f32 * font.advance;
-                                let quad = world
-                                    .mul(&Affine2::translation(pen_x, line_y))
-                                    .mul(&Affine2::scale(
+                                let quad = world.mul(&Affine2::translation(pen_x, line_y)).mul(
+                                    &Affine2::scale(
                                         font.cell.0 / gpu::CELL_PX as f32,
                                         font.cell.1 / gpu::CELL_PX as f32,
-                                    ));
+                                    ),
+                                );
                                 sprites.push(SpriteInstance {
                                     handle: item.handle,
                                     world: quad.to_array(),
@@ -2209,10 +2422,7 @@ impl CommandConsumer {
                         // 30 帧节拍的"隐"半拍），后端零动画状态。
                         if let Some(caret) = label.caret {
                             let quad = world
-                                .mul(&Affine2::translation(
-                                    caret as f32 * CARET_ADVANCE_PX,
-                                    0.0,
-                                ))
+                                .mul(&Affine2::translation(caret as f32 * CARET_ADVANCE_PX, 0.0))
                                 .mul(&Affine2::scale(
                                     1.0 / gpu::CELL_PX as f32,
                                     font.cell.1 / gpu::CELL_PX as f32,
@@ -2374,7 +2584,9 @@ mod tests {
         assert!(b.iter().all(|c| c.handle() != Some(h2)));
         // 空句柄与未知句柄的操作没有产生任何命令。
         assert!(a.iter().all(|c| c.handle() != Some(ItemHandle::NIL)));
-        assert!(a.iter().all(|c| c.handle() != Some(ItemHandle::from_raw(999))));
+        assert!(a
+            .iter()
+            .all(|c| c.handle() != Some(ItemHandle::from_raw(999))));
         assert_eq!(server.len(), 1);
         assert!(!server.is_empty());
         assert_eq!(server.draw_order(), vec![h1]);
