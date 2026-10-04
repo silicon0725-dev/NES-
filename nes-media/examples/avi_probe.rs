@@ -21,7 +21,9 @@
 //!    装载器的镜像手法，**写在示例内**避免污染库公共面（库的面只有
 //!    demux DTO）；
 //! 3. AVI 音轨写 WAV（`nes_audio::wav::write_wav`，混音器同款 16-bit
-//!    面）；AMV 音轨（IMA ADPCM）第 1 期跳过、声明值指名打印。
+//!    面）；AMV 音轨（IMA ADPCM）S14.3 起同样真解码（FFmpeg
+//!    `ADPCM_IMA_AMV` 语义，见 nes-audio `adpcm` 模块）写 `audio.wav`
+//!    —— 换前缀避免与 AVI 路线的产物互踩。
 //!
 //! 打印全 ASCII（Windows 控制台代码页安全，注释中文）。
 
@@ -72,8 +74,8 @@ fn main() {
     }
 }
 
-/// AMV 版探测：解析 -> 元信息打印 -> 全帧写 BMP（前缀 amv_）。
-/// 音轨（IMA ADPCM）第 1 期跳过，声明值指名打印（avi.rs 同款产物面）。
+/// AMV 版探测：解析 -> 元信息打印 -> 全帧写 BMP（前缀 amv_）-> 音轨
+/// （IMA ADPCM -> 16-bit PCM）写 amv_audio.wav（与 AVI 路线同款产物面）。
 fn probe_amv_and_dump(bytes: &[u8], out_dir: &str, source: &str) -> Result<(), String> {
     let started = std::time::Instant::now();
     let amv = AmvVideo::parse(bytes).map_err(|e| e.to_string())?;
@@ -87,8 +89,8 @@ fn probe_amv_and_dump(bytes: &[u8], out_dir: &str, source: &str) -> Result<(), S
     println!("[avi_probe] parse : {parse_ms} ms (file {} KB)", bytes.len() / 1024);
     match amv.audio_declared_format() {
         Some((tag, channels, rate, bits)) => println!(
-            "[avi_probe] audio : DECLARED tag={tag} ch={channels} rate={rate} bits={bits} -- \
-             skipped (real payload is ADPCM_IMA_AMV, not decoded in this stage, see amv.rs docs)"
+            "[avi_probe] audio : DECLARED tag={tag} ch={channels} rate={rate} bits={bits} \
+             (codec field lies -- real payload is ADPCM_IMA_AMV, decoded below)"
         ),
         None => println!("[avi_probe] audio : no stream header"),
     }
@@ -128,6 +130,31 @@ fn probe_amv_and_dump(bytes: &[u8], out_dir: &str, source: &str) -> Result<(), S
     );
     if let Some((i, e)) = decode_fail {
         println!("[avi_probe] frame decode failures: first at {i}: {e}");
+    }
+
+    // ---- 音轨写 WAV（IMA ADPCM 全量解码 -> 16-bit PCM，直接可进 Mixer）----
+    let audio_started = std::time::Instant::now();
+    match amv.audio() {
+        Some(wav) => {
+            let path = std::path::Path::new(out_dir).join("amv_audio.wav");
+            nes_audio::wav::write_wav(&path, &wav).map_err(|e| format!("write {}: {e}", path.display()))?;
+            let secs = if wav.sample_rate > 0 {
+                wav.frames() as f64 / f64::from(wav.sample_rate)
+            } else {
+                0.0
+            };
+            println!(
+                "[avi_probe] audio : {}Hz {}ch {} frames (~{secs:.1} s, {} ms) -> {}",
+                wav.sample_rate,
+                wav.channels,
+                wav.frames(),
+                audio_started.elapsed().as_millis(),
+                path.display()
+            );
+        }
+        None => println!(
+            "[avi_probe] audio : none (ADPCM decode failed or absent, see amv.rs docs)"
+        ),
     }
     println!("[avi_probe] done (amv): {source}");
     Ok(())

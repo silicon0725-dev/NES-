@@ -32,8 +32,9 @@
 //!   PCM 直接产 `nes_audio::Wav` 进混音器；产物同为上面两个 DTO；
 //! * 视频（S14.3 Adapter 试金石 #2）：[`amv::AmvVideo`] —— AMV 容器
 //!   变体手写 demux（坏 hdrl 尺寸/无 pad/表外置）+ 帧解码按 FFmpeg
-//!   sp5x 同款方案合成标准 JPEG 走 `image`；音轨（IMA ADPCM）第 1 期
-//!   如实跳过；
+//!   sp5x 同款方案合成标准 JPEG 走 `image`；音轨 IMA ADPCM 委托
+//!   `nes_audio::adpcm`（FFmpeg `ADPCM_IMA_AMV` 语义）产
+//!   `nes_audio::Wav`；
 //! * 错误：[`MediaError`] 三态（格式不支持 / 解码失败 / IO），Display 中文。
 //!
 //! # 覆盖面与边界
@@ -44,8 +45,8 @@
 //!   isomp4/aac）；解码是**全轨进内存**（一首 4 分钟曲子约 40-80MB
 //!   PCM —— P0 可接受，流式是后续，见 S14 文档 §5）；
 //! * 视频：AVI 1.0 单段（DIB / MJPG 帧 + PCM 音轨）；AMV（S14.3，容器
-//!   变体 + 无头 MJPEG 帧合成解码，见 [`amv`] 模块文档）；avio（FFmpeg）
-//!   路线的边界见 [`avi`] 模块文档；
+//!   变体 + 无头 MJPEG 帧合成解码 + IMA ADPCM 音轨，见 [`amv`] 模块
+//!   文档）；avio（FFmpeg）路线的边界见 [`avi`] 模块文档；
 //! * **下一块试金石**：适配层已留位 —— 新格式 = 本 crate 新模块 +
 //!   G13 白名单扩条，引擎核心不动。
 //!

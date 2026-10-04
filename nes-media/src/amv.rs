@@ -77,13 +77,23 @@
 //! 熵数据实测全程规范 stuffing（`FF` -> `FF 00`，全文件 36069 处、0 处
 //! 裸 FF），与解码器的标记扫描兼容。
 //!
-//! # 音频（第 1 期如实跳过）
+//! # 音频（IMA ADPCM：FFmpeg `ADPCM_IMA_AMV` 语义，解码在 nes-audio）
 //!
 //! 音频 strf 声明 PCM 22050Hz 单声道 16-bit —— **AMV 头会说谎**：
-//! FFmpeg 对 AMV 音频无条件强制 `AV_CODEC_ID_ADPCM_IMA_AMV`（743B 块
-//! 尾随 15fps 视频块的形态也与 IMA ADPCM 分块一致）。第 1 期不做
-//! ADPCM：[`AmvVideo::audio`] 如实返回 `None`，声明值经
-//! [`AmvVideo::audio_declared_format`] 原样暴露供指名报告。
+//! FFmpeg 对 AMV 音频无条件强制 `AV_CODEC_ID_ADPCM_IMA_AMV`。真实块体
+//! 实测（743B）= **8 字节头 + 尼布流**：`i16 predictor` / `u8
+//! step_index` / `u8 reserved` / `u32 frame_size(1470) = (743-8)*2`，
+//! 与 FFmpeg 的头布局逐字节吻合（采样率 22050 经"总样本数 / 视频时长"
+//! 交叉证实为真值，撒谎的只有 codec 字段）。
+//!
+//! 解码本体在 [`nes_audio::adpcm`]（IMA ADPCM 是音频编解码核心件，放
+//! nes-audio 纯叶子 crate）：高半字节在前、展开式
+//! `diff = ((2*delta+1)*step) >> 3`、逐块状态重置 —— FFmpeg `adpcm.c`
+//! `ADPCM_IMA_AMV` 分支语义，且与其编码侧（`adpcmenc.c` 先样本进高半
+//! 字节）自洽。本模块只做接线：收集全部 '01wb' 块体按序展开拼接，
+//! 采样率取 strf 声明值（缺失/为零时回退常量 22050）。任一块坏头 /
+//! step_index 越界 → [`AmvVideo::audio`] 如实返回 `None`（与视频路线
+//! "帧坏不出图"对齐：音轨缺席、视频照常可用，不 panic 不给半截音轨）。
 //!
 //! # 失败面
 //!
@@ -184,9 +194,8 @@ pub struct AmvVideo {
     info: VideoInfo,
     /// 每个视频帧块体的绝对字节区间（movi 内顺序即帧序）。
     frames: Vec<Range<usize>>,
-    /// 每个 'NNwb' 音频块体的绝对字节区间。第 1 期仅定位不解码
-    /// （IMA ADPCM 是后续期）—— 留位字段，暂无读取方。
-    #[allow(dead_code)]
+    /// 每个 'NNwb' 音频块体的绝对字节区间（movi 内顺序即拼接序；
+    /// 块体是自含 8 字节头的 IMA ADPCM 块，解码见 [`AmvVideo::audio`]）。
     audio_chunks: Vec<Range<usize>>,
     /// 音频 strf（WAVEFORMATEX）的声明值 —— AMV 头会说谎，仅供参考。
     audio_declared: Option<(u16, u16, u32, u16)>,
@@ -386,13 +395,35 @@ impl AmvVideo {
         Ok(img)
     }
 
-    /// 音轨（第 1 期恒 `None`）。
+    /// 音轨：全部 '01wb' 块的 IMA ADPCM 解码拼接（块序即拼接序）。
     ///
-    /// AMV 音频实际载荷是 IMA ADPCM（FFmpeg 无条件强制
-    /// `AV_CODEC_ID_ADPCM_IMA_AMV`），第 1 期不做 ADPCM 解码 —— 音轨
-    /// 如实缺席、视频照常可用。声明值见 [`Self::audio_declared_format`]。
+    /// 路线：块体原样交 [`nes_audio::adpcm::decode_ima_amv`]（FFmpeg
+    /// `ADPCM_IMA_AMV` 语义：每块 8 字节头自带 predictor/step_index，
+    /// 逐块状态重置；高半字节在前）。采样率取音频 strf 的声明值 ——
+    /// 该字段经"总样本数 / 视频时长"交叉证实是**真值**（撒谎的只有
+    /// codec 字段），缺失或为零时回退常量 22050；声道恒 1（FFmpeg 对
+    /// 本格式硬性单声道）。任一块坏头 / step_index 越界 → `None`
+    /// （不 panic 不给半截音轨；视频照常可用），声明值仍可经
+    /// [`Self::audio_declared_format`] 取阅。
     pub fn audio(&self) -> Option<Wav> {
-        None
+        if self.audio_chunks.is_empty() {
+            return None;
+        }
+        let chunks: Vec<&[u8]> = self
+            .audio_chunks
+            .iter()
+            .filter_map(|range| self.data.get(range.clone()))
+            .collect();
+        let samples = nes_audio::adpcm::decode_ima_amv(&chunks).ok()?;
+        let rate = match self.audio_declared {
+            Some((_, _, rate, _)) if rate > 0 => rate,
+            _ => 22_050,
+        };
+        Some(Wav {
+            sample_rate: rate,
+            channels: 1,
+            samples,
+        })
     }
 
     /// 音频 strf 的声明值 `(format_tag, channels, sample_rate, bits)`。
@@ -567,8 +598,11 @@ mod tests {
         us_per_frame: u32,
         /// 视频帧块体（'00dc'，与音频块 1:1 交替，真实文件形态）。
         frame_bodies: Vec<Vec<u8>>,
-        /// 音频块体长（真实文件 743，奇数）。
-        audio_chunk_size: usize,
+        /// 音频块体（'01wb'）。缺省 743B 0xA5 填充：块头 step_index =
+        /// 165 越界，`audio()` 对它如实 None（坏载荷不炸容器）。
+        audio_body: Vec<u8>,
+        /// 音频 strf 声明采样率（真实文件 22050，实测为真值）。
+        audio_rate: u32,
         /// 音频 strf 的 wFormatTag（真实文件撒谎写 PCM=1）。
         audio_tag: u16,
         /// 是否追加 'AMV_END_' 字面量尾巴。
@@ -593,13 +627,12 @@ mod tests {
         // 音频流 strl（流 1）：strh 48B 全零 + strf 20B WAVEFORMATEX。
         bytes.extend_from_slice(&broken_list(b"strl"));
         bytes.extend_from_slice(&chunk(b"strh", &[0u8; 48]));
-        bytes.extend_from_slice(&chunk(b"strf", &audio_strf(f.audio_tag, 1, 22050, 16)));
+        bytes.extend_from_slice(&chunk(b"strf", &audio_strf(f.audio_tag, 1, f.audio_rate, 16)));
         // movi：帧块 + 音频块交替。
         bytes.extend_from_slice(&broken_list(b"movi"));
-        let audio = vec![0xA5u8; f.audio_chunk_size];
         for body in &f.frame_bodies {
             bytes.extend_from_slice(&chunk(b"00dc", body));
-            bytes.extend_from_slice(&chunk(b"01wb", &audio));
+            bytes.extend_from_slice(&chunk(b"01wb", &f.audio_body));
         }
         if f.with_trailer {
             bytes.extend_from_slice(b"AMV_END_");
@@ -710,7 +743,8 @@ mod tests {
             height: 16,
             us_per_frame: 66667,
             frame_bodies: bodies,
-            audio_chunk_size: 743,
+            audio_body: vec![0xA5u8; 743],
+            audio_rate: 22050,
             audio_tag: 1,
             with_trailer: true,
         }
@@ -738,8 +772,43 @@ mod tests {
                 "第 {i} 帧必须逐像素精确纯灰 128"
             );
         }
-        assert_eq!(amv.audio(), None, "第 1 期音轨如实缺席");
+        assert_eq!(
+            amv.audio(),
+            None,
+            "0xA5 填充块头 step_index=165 越界 -> 音轨如实缺席（不 panic）"
+        );
         assert_eq!(amv.audio_declared_format(), Some((1, 1, 22050, 16)), "声明值如实暴露");
+    }
+
+    #[test]
+    fn t_amv01b_adpcm_audio_decodes_and_concatenates() {
+        // 容器级 ADPCM 接线：两个 '01wb' 块各含一段手编尼布流（同
+        // nes-audio t_adpcm01 基线：predictor=0、step_index=0、码
+        // [4,7,8,8] -> [7,23,21,19]）。逐块状态重置 + 按序拼接 +
+        // strf 声明采样率直通，一并钉死。
+        let mut adpcm = Vec::new();
+        adpcm.extend_from_slice(&0i16.to_le_bytes()); // predictor
+        adpcm.push(0); // step_index
+        adpcm.push(0); // reserved
+        adpcm.extend_from_slice(&4u32.to_le_bytes()); // frame_size
+        adpcm.extend_from_slice(&[0x47, 0x88]);
+        let mut fx = fixture(vec![gray420_body(2), gray420_body(2)]);
+        fx.audio_body = adpcm;
+        fx.audio_rate = 44100; // 声明什么用什么（真实文件 22050 同源）
+        let amv = AmvVideo::parse(&build_amv(&fx)).expect("合法 AMV 必须可解析");
+        let wav = amv.audio().expect("合法 ADPCM 块必须解出音轨");
+        assert_eq!(wav.sample_rate, 44100, "采样率取 strf 声明值");
+        assert_eq!(wav.channels, 1, "本格式硬性单声道（FFmpeg 同款裁决）");
+        assert_eq!(wav.samples, vec![7, 23, 21, 19, 7, 23, 21, 19], "两块各自从头解码再拼接");
+
+        // 声明值缺位（无音频 strl）时采样率回退常量 22050。
+        let mut bare = build_amv(&fx);
+        let strf_at = bare.windows(4).rposition(|w| w == b"strf").expect("有音频 strf");
+        bare.drain(strf_at..strf_at + 8 + 20); // 连块头一起摘掉音频 strf（8B 头 + 20B 体）
+        let amv = AmvVideo::parse(&bare).expect("摘掉音频 strf 后照常解析");
+        let wav = amv.audio().expect("ADPCM 块照常解码");
+        assert_eq!(wav.sample_rate, 22050, "无声明时回退常量 22050");
+        assert_eq!(amv.audio_declared_format(), None, "声明值如实缺席");
     }
 
     #[test]
@@ -852,11 +921,41 @@ mod tests {
         assert!((info.fps - 15.0).abs() < 0.01, "66667us/帧 -> 15fps（实际 {}）", info.fps);
         assert_eq!(info.frame_count, 4233, "movi 扫块实测 4233 帧");
         assert_eq!(info.codec, VideoCodec::Amv);
-        assert_eq!(amv.audio(), None, "ADPCM 音轨第 1 期跳过");
-        assert_eq!(amv.audio_declared_format(), Some((1, 1, 22050, 16)), "头声明 PCM（谎）");
+        assert_eq!(
+            amv.audio_declared_format(),
+            Some((1, 1, 22050, 16)),
+            "头声明 PCM（谎，载荷是 IMA ADPCM）"
+        );
         eprintln!(
             "[amv real] parsed: {}x{} fps={} frames={} ({} ms, {} KB)",
             info.width, info.height, info.fps, info.frame_count, parse_ms, bytes.len() / 1024
+        );
+
+        // ---- 音轨契约：IMA ADPCM 全量解码（FFmpeg ADPCM_IMA_AMV 语义）----
+        let audio_started = std::time::Instant::now();
+        let audio = amv.audio().expect("真实 ADPCM 音轨必须解出（全部块头合法）");
+        let audio_ms = audio_started.elapsed().as_millis();
+        assert_eq!(audio.sample_rate, 22050, "采样率取 strf 声明（实测真值）");
+        assert_eq!(audio.channels, 1);
+        assert!(!audio.samples.is_empty(), "音轨非空");
+        let peak = audio
+            .samples
+            .iter()
+            .map(|&s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1000, "有声内容（实测峰值 {peak}）");
+        let dur_secs = audio.frames() as f64 / f64::from(audio.sample_rate);
+        let video_secs = f64::from(info.frame_count) / f64::from(info.fps);
+        assert!(
+            (dur_secs - video_secs).abs() / video_secs < 0.10,
+            "音轨时长须与视频吻合 ±10%（音频 {dur_secs:.1}s vs 视频 {video_secs:.1}s）"
+        );
+        eprintln!(
+            "[amv real] audio: {} samples {}Hz peak={peak} dur={dur_secs:.1}s (video {video_secs:.1}s, {} ms)",
+            audio.samples.len(),
+            audio.sample_rate,
+            audio_ms
         );
 
         let dir = std::env::temp_dir().join(format!("nes_amv_test_{}", std::process::id()));

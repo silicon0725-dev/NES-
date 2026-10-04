@@ -1,24 +1,28 @@
 # NES 2.0 · S14.3 AMV 解码移植 —— Adapter 通用性试金石 #2
 
 日期：2026-10-03 · 分支：`s14-3-amv`（独立 worktree `wt-amv`）· 基线：2d88f66
+（帧管线 84ca36c）· 本节追加：**音频轨 IMA ADPCM 解码（§1.3，同日第 2 期增量）**
 
 ---
 
 ## §0 结论
 
 **交付**：nes-media 新增 [`amv`] 模块 —— 用户真实交付物（蜘蛛糸モノポリー
-OP，14179882 字节）从 S14.2 的"指名拒绝"变为**真解码出帧**。容器侧是
+OP，14179882 字节）从 S14.2 的"指名拒绝"变为**真解码出帧 + 出声**。容器侧是
 RIFF 坏头变体的手写 demux（四条与标准 RIFF 相反的怪癖，见 §1）；帧侧按
 **FFmpeg 自家 AMV 解码器的原方案**（`libavcodec/sp5xdec.c` 的
 `ff_sp5x_process_packet` + `sp5x.h` 固定表）把无头帧体重包成标准 JPEG
-交 `image` 白名单库解码。依赖**零新增**（G13 白名单原样覆盖 —— 合成表
-是常量字节，不是依赖），引擎面仍是那两个干净 DTO（`DecodedImage` /
-`nes_audio::Wav`）。
+交 `image` 白名单库解码；音侧（第 2 期增量）是 IMA ADPCM 解码 —— 落位
+nes-audio 新增 [`adpcm`] 模块（FFmpeg `ADPCM_IMA_AMV` 语义，公开标准表
+常量），真文件全轨 282.2s 解出、与视频时长零偏差（见 §1.3）。依赖
+**零新增**（G13 白名单原样覆盖 —— 合成表与 ADPCM 表都是常量字节，不是
+依赖），引擎面仍是那两个干净 DTO（`DecodedImage` / `nes_audio::Wav`）。
 
-**门禁**：八 crate `cargo test --release` 全绿 **636**（基线 631 +
-nes-media 新增 5）；clippy 0 警告 × 8；worktree 根守卫 **13/13**（G13
-未动）；`cargo run --release --example avi_probe` 对真实 AMV 出 17 张
-BMP（6 ms 解析 + 5 ms 解 17 帧）。已 git commit（未 push）。
+**门禁**：八 crate `cargo test --release` 全绿 **646**（基线 631 +
+nes-media 新增 5 + nes-audio adpcm 新增 9 + amv 容器接线用例 1）；
+clippy 0 警告 × 8；worktree 根守卫 **13/13**（G13 未动）；
+`cargo run --release --example avi_probe` 对真实 AMV 出 17 张 BMP +
+**amv_audio.wav（282.2s 满幅有声，可直接播放）**。已 git commit（未 push）。
 
 **实测解码质量**：160x128 @ 15fps、4233 帧；31 帧全片取样 **0 解码失败**；
 帧 141 / 1269 肉眼确认为彩色动画画面（人物立绘 + 片名文字方向正立，
@@ -97,13 +101,45 @@ SOI + DQT(固定两表) + DHT(标准 Annex K 四表) + SOF0(160x128, 4:2:0)
 
 解码产物垂直翻转后即 `DecodedImage`（RGBA8），与 S14.2 完全同构。
 
-### 1.3 音频（第 1 期如实跳过）
+### 1.3 音频轨 IMA ADPCM（第 2 期：真解码，AMV 有声化收口）
 
 音频 strf 声明 PCM/单声道/22050Hz/16-bit —— **AMV 头会说谎**：FFmpeg
-对 AMV 音频无条件强制 `AV_CODEC_ID_ADPCM_IMA_AMV`（743B 奇数块尾随
-15fps 视频块的形态亦与 IMA ADPCM 分块吻合）。第 1 期不做 ADPCM：
-`audio()` 如实返回 `None`（视频照常可用），声明值经
-`audio_declared_format()` 原样暴露（探针指名打印"DECLARED … skipped"）。
+对 AMV 音频无条件强制 `AV_CODEC_ID_ADPCM_IMA_AMV`。真实块体实测
+（743B）= **8 字节头 + 尼布流**，逐块循环（每块自含状态）：
+
+```text
++0  i16 predictor（LE）   实测首块 = 0
++2  u8  step_index        实测首块 = 0（全文件 4233 块 0..=88 全合法）
++3  u8  reserved          FFmpeg 跳过不看
++4  u32 frame_size        实测恒 1470 = (743-8)*2 ✓
++8  尼布流                 实际展开数 = min(尼布数*2, frame_size)（FFmpeg FFMIN）
+```
+
+解码落位 **nes-audio/src/adpcm.rs**（IMA ADPCM 是音频编解码核心件，
+放 nes-audio 纯叶子 crate，零依赖不变）：常量表 `ff_adpcm_step_table
+[89]` / `ff_adpcm_index_table[16]` 手抄自 FFmpeg `adpcm_data.c`（公开
+标准 IMA 表）；展开公式 `diff = ((2*delta+1)*step) >> 3`、predictor
+clamp i16、step_index clamp 0..=88 —— FFmpeg `adpcm.c`
+`ADPCM_IMA_AMV` 分支语义逐条对照。
+
+**尼布序裁决（本期一处与任务书口径相反，以 FFmpeg 为准）**：任务书写
+"低半字节在前"，但本地 FFmpeg 参照 `adpcm.c` 的 AMV 分支明确
+**高半字节在前**（先 `v >> 4` 后 `v & 0xf`，含奇样本尾字节路径），且
+FFmpeg 编码侧（`adpcmenc.c`：`compress(样本0) << 4 | compress(样本1)`）
+同序打包 —— 编解码器自洽闭环，采信 FFmpeg（与 IMA WAV 分支的低半字节
+在前相反，移植时不可混用）。真文件双序对照实测（首 100 块）：低前
+lag-1 相关 0.9834 / 高前 0.9554，高频能量比 0.033 / 0.089，谱平坦度
+0.0514 / 0.0440 —— 指标互有胜负、无定夺力，最终以参照实现为准。
+
+接线（nes-media `amv::AmvVideo::audio`）：收集全部 '01wb' 块体按序交
+`nes_audio::adpcm::decode_ima_amv` 拼接；采样率取 strf 声明值（经
+"总样本数 / 视频时长"交叉证实为**真值**，撒谎的只有 codec 字段；缺失
+/为零回退常量 22050）；声道恒 1（FFmpeg 硬性单声道）。任一块坏头 /
+step_index 越界 → `None`（不 panic 不给半截音轨，视频照常可用）。
+
+**真文件解码结果**：4233 块全解，6,222,510 样本 @ 22050Hz = **282.2s
+= 视频时长 4233 帧 / 15fps（0 偏差）**；峰值 32768（满幅，有声内容）；
+release 解码 37 ms。产物 `avi_probe_out/amv_audio.wav` 直接可听。
 
 ### 1.4 API 形态（引擎面）
 
@@ -111,7 +147,8 @@ SOI + DQT(固定两表) + DHT(标准 Annex K 四表) + SOF0(160x128, 4:2:0)
 let amv = AmvVideo::parse(&bytes)?;   // 整份拷进 Arc<[u8]>（avi.rs 同款）
 let info = amv.video_info();          // VideoInfo { 160, 128, 15.0, 4233, VideoCodec::Amv }
 let img  = amv.frame(i)?;             // DecodedImage（惰性逐帧，已翻转）
-let wav  = amv.audio();               // 第 1 期恒 None（ADPCM 未做）
+let wav  = amv.audio();               // Some(Wav { 22050, 1ch, IMA ADPCM 全轨 })
+                                      // （块头损坏时 None；声明值仍经 audio_declared_format 取阅）
 ```
 
 `VideoCodec` 新增 `Amv` 变体（不复用 `Mjpg` 的语义理由：AMV 帧字节
@@ -155,10 +192,11 @@ SAMPLES 表首项即真实 AMV（ASCII 路径副本）；探针按 RIFF form 分
 [avi_probe] fps   : 14.999925
 [avi_probe] frames: 4233
 [avi_probe] codec : AMV (headerless MJPEG, sp5x-synthesized headers)
-[avi_probe] parse : 6 ms (file 13847 KB)
-[avi_probe] audio : DECLARED tag=1 ch=1 rate=22050 bits=16 -- skipped
-                     (real payload is ADPCM_IMA_AMV, ...)
-[avi_probe] frames decoded+saved: 17/4233 (stride 265, cap 16) -> amv_frame_NNN.bmp (5 ms)
+[avi_probe] parse : 8 ms (file 13847 KB)
+[avi_probe] audio : DECLARED tag=1 ch=1 rate=22050 bits=16 (codec field lies
+                     -- real payload is ADPCM_IMA_AMV, decoded below)
+[avi_probe] frames decoded+saved: 17/4233 (stride 265, cap 16) -> amv_frame_NNN.bmp (7 ms)
+[avi_probe] audio : 22050Hz 1ch 6222510 frames (~282.2 s, 37 ms) -> amv_audio.wav
 ```
 
 **解码质量（肉眼 + 统计双重取证）**：
@@ -174,10 +212,16 @@ SAMPLES 表首项即真实 AMV（ASCII 路径副本）；探针按 RIFF form 分
 * 偏色评估：中段帧通道均值随场景在暖白 (227,223,213) 与暗红 (48,21,16)
   间正常摆动，未见系统性色偏（固定 DQT 是 SP5X 固件原表，FFmpeg 同款）。
 
-测试面（5 个新用例）：手工 4:2:0 熵流逐像素精确往返（独立于任何编码器
+测试面（amv 模块 6 个新用例）：手工 4:2:0 熵流逐像素精确往返（独立于任何编码器
 的规范推导流）、image 库 4:4:4 编码交叉验证 + 翻转方向钉死、无 pad 奇块
 + 坏尺寸 + 'AMV_END_' 尾巴三怪齐上、拒绝面（非 AMV/缺 movi/零尺寸/越界/
-坏壳）、真实文件契约（skip-if-missing，BMP 落 tmpdir 不入仓库）。
+坏壳）、容器级 ADPCM 接线（合法块解码拼接 + 声明采样率直通 + 无 strf 回退
+22050 + 0xA5 坏头如实 None）、真实文件契约（skip-if-missing，音轨断言非空/
+峰值 > 1000/时长 ±10%，BMP 落 tmpdir 不入仓库）。nes-audio `adpcm` 模块另
+有 9 个单元用例：手算展开基线、高半字节序钉死、块头 predictor/step_index
+起步、step_index > 88 指名拒绝、BadHeader、frame_size 截断与奇样本尾字节、
+predictor/step_index 双向 clamp、多块状态重置 + 拼接 + 任一块失败不给半截、
+手抄表抽查。
 
 ---
 
@@ -185,26 +229,27 @@ SAMPLES 表首项即真实 AMV（ASCII 路径副本）；探针按 RIFF form 分
 
 | 项 | 结果 |
 |---|---|
-| nes-media `cargo test --release` | **26 绿**（基线 21 + amv 新增 5；含 real_media 2 项用户实测曲） |
-| 八 crate `cargo test --release` | **636 绿 / 0 败**（基线 631 + 5）：asset 34 / audio 40 / media 26 / render-api 45 / render-extract 56 / render-wgpu 123 / runtime 79 / scene 233 |
+| nes-audio `cargo test --release` | **49 绿**（基线 40 + adpcm 新增 9；含设备冒烟 5 项） |
+| nes-media `cargo test --release` | **27 绿**（基线 26 + amv01b 新增 1；含 real_media 2 项用户实测曲） |
+| 八 crate `cargo test --release` | **646 绿 / 0 败**（基线 636 + 10）：asset 34 / audio 49 / media 27 / render-api 45 / render-extract 56 / render-wgpu 123 / runtime 79 / scene 233 |
 | `cargo clippy --all-targets` | **0 警告 × 8** |
-| worktree 根 `python check_dependency_direction.py` | **13/13**（G13 未改：合成表为常量、zune-jpeg 本就在 image 传递闭包内，白名单原样覆盖） |
-| `cargo run --release --example avi_probe` | 真实 AMV 出 17 张 BMP + 两个真实 AVI 指名报告 + 合成演示全链路通过 |
+| worktree 根 `python check_dependency_direction.py` | **13/13**（G13 未改：ADPCM 表为常量、零新依赖，白名单原样覆盖） |
+| `cargo run --release --example avi_probe` | 真实 AMV 出 17 张 BMP + **amv_audio.wav（282.2s，可直接播放）** + 两个真实 AVI 指名报告 + 合成演示全链路通过 |
 
-改动面：`nes-media/src/amv.rs`（新增，demux + JPEG 合成 + 模块文档 +
-5 用例）、`nes-media/src/avi.rs`（`VideoCodec::Amv` 变体 + frame 防御
-臂）、`nes-media/src/lib.rs`（挂模块 + 重导出 + 覆盖面文档更新）、
-`nes-media/examples/avi_probe.rs`（AMV 探针分流 + 文档头）、
-`nes-media/Cargo.lock`（无新依赖）。守卫脚本一行未动。
+改动面（第 2 期音频增量）：`nes-audio/src/adpcm.rs`（新增，IMA ADPCM
+解码 + 两张 FFmpeg 同源常量表 + 模块文档 + 9 用例）、`nes-audio/src/
+lib.rs`（挂模块 + 重导出 + 管线文档更新）、`nes-media/src/amv.rs`
+（`audio()` 从跳过改为真解码 + 模块文档音频节重写 + 夹具改造 + 1 新
+用例与真文件契约升级）、`nes-media/src/lib.rs`（覆盖面文档同步）、
+`nes-media/examples/avi_probe.rs`（AMV 音轨写 amv_audio.wav + 文档头）。
+守卫脚本一行未动；`avi_probe_out/` 在 .gitignore，产物不入库。
 
 ---
 
 ## §5 遗留（下一轮输入）
 
-1. **ADPCM 音频（第 2 期正题）**：'01wb' 实际载荷 IMA ADPCM
-   （FFmpeg `adpcm.c` 的 `ADPCM_IMA_AMV` 分支是参照；块结构 4 字节头 +
-   半字节 nibble 流）。`audio_chunks` 区间已留位，`audio()` 签名不动，
-   补解码即出 `nes_audio::Wav`；
+1. ~~**ADPCM 音频（第 2 期正题）**~~ **已完成**（见 §1.3）：解码落位
+   nes-audio `adpcm` 模块，真文件全轨 282.2s 解出、时长与视频零偏差；
 2. **播放管线**：与 S14.2 同一条遗留 —— 本期是资源管线，逐帧推进/
    seek/时钟同步是后续（`frame(i)` 惰性接口已留好形状）；
 3. **AMV 变体鲁棒性**：本模块按"SP5X 家族固定表 + amvh 提供尺寸"的
