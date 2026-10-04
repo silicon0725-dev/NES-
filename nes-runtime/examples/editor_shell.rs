@@ -165,7 +165,10 @@ use nes_asset::AssetKind;
 use nes_audio::wav::write_wav;
 use nes_render_api::input::{InputEvent, Key, MouseButton};
 use nes_render_api::{FrameInfo, Vec2};
-use nes_render_extract::{PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_TEXTURE};
+use nes_render_extract::{
+    PROP_CONTROL_ANCHOR, PROP_CONTROL_OFFSET, PROP_CONTROL_SIZE, PROP_LABEL_TEXT, PROP_NS_B,
+    PROP_NS_L, PROP_NS_R, PROP_NS_T, PROP_NS_TEX, PROP_TEXTURE,
+};
 use nes_render_wgpu::window::inject_input;
 use nes_render_wgpu::ttf::TtfFont;
 use nes_render_wgpu::{bmp, FontParams};
@@ -174,8 +177,168 @@ use nes_scene::editor::{Hierarchy, Inspector, Selection};
 use nes_scene::transaction::{SubtreeSnapshot, TransactionLog};
 use nes_scene::{compile_script, NodeKind, NoObserver, ScriptVm, Transform2D, Value, Uid};
 
+/// S16.7 九宫格开关属性名（`ns_modulate` / `ns_tiling` —— 与
+/// nes-render-extract/src/extractor.rs L124/L126 的定义同源；提取层 crate
+/// 根未再导出这两个常量，壳层前向通道按 set_prop_raw 口径直写同名字符
+/// 串，不改 crate 面）。
+const PROP_NS_MODULATE: &str = "ns_modulate";
+const PROP_NS_TILING: &str = "ns_tiling";
+
+/// S18 编辑器换肤：**EditorTheme —— 色板 / 间距栅格 / 行高 / 面板宽的统一
+/// 出口**（DESIGN-NOTES §6.2，egui `Style`"视觉参数一处出"的最小对应物）。
+///
+/// 取舍（笔记 §6.1 结论）：色板**锚定 nes-scene 八槽位契约**，不扩槽位、
+/// 不外置色板系统 —— 八个槽位值以 `0xRRGGBBAA` 打包常量列全（P0 取值 =
+/// `ThemeColors::DEFAULT_DARK` 同值，观感零漂移），装配时写入一个 `Theme`
+/// 节点（"主题即场景节点"，nes-scene/ui.rs 既有机制）：将来换肤 =
+/// 改这一张表，提取/渲染层零改动。纹理皮肤（[`skin_rgba`]）承担可见观感。
+///
+/// 间距/行高/面板宽沿用 S12-4..S12-11 冻结值，从散落 const 收敛到本表；
+/// 表内常量经下方 `use` 别名保持原引用面不变（零行为语义，纯出口收敛）。
+mod editor_theme {
+    // ---- 色板：八槽位（序与 nes-scene `THEME_SLOTS` 一致）----
+    /// 窗口底。
+    pub const SLOT_BG: i64 = 0x14_16_1A_FF;
+    /// 面板。
+    pub const SLOT_PANEL: i64 = 0x1E_22_28_FF;
+    /// 边框。
+    pub const SLOT_BORDER: i64 = 0x3A_40_48_FF;
+    /// 正文。
+    pub const SLOT_TEXT: i64 = 0xD8_DC_E2_FF;
+    /// 次级文字。
+    pub const SLOT_TEXT_DIM: i64 = 0x7A_82_8C_FF;
+    /// 选中。
+    pub const SLOT_SELECTED: i64 = 0x2E_4A_6B_FF;
+    /// 强调。
+    pub const SLOT_ACCENT: i64 = 0x4A_9E_FF_FF;
+    /// 危险。
+    pub const SLOT_DANGER: i64 = 0xD2_4B_4B_FF;
+
+    /// 槽位名 + 色值（写 Theme 节点属性用，序同上）。
+    pub const PALETTE: &[(&str, i64)] = &[
+        ("bg", SLOT_BG),
+        ("panel", SLOT_PANEL),
+        ("border", SLOT_BORDER),
+        ("text", SLOT_TEXT),
+        ("text_dim", SLOT_TEXT_DIM),
+        ("selected", SLOT_SELECTED),
+        ("accent", SLOT_ACCENT),
+        ("danger", SLOT_DANGER),
+    ];
+
+    // ---- 槽位名引用（fill_slot / border_slot / color_slot 属性值）----
+    /// 面板填充槽。
+    pub const SLOT_PANEL_NAME: &str = "panel";
+    /// 边框槽。
+    pub const SLOT_BORDER_NAME: &str = "border";
+    /// 强调槽。
+    pub const SLOT_ACCENT_NAME: &str = "accent";
+    /// 次级文字槽。
+    pub const SLOT_TEXT_DIM_NAME: &str = "text_dim";
+
+    // ---- 间距栅格 ----
+    /// 外边距（S12-4 冻结）。
+    pub const MARGIN: f32 = 8.0;
+    /// 小缝 / 内衬（工具栏 4px 缝的统一值）。
+    pub const SPACE_S: f32 = 4.0;
+
+    // ---- 面板宽（恒定宽，S12-4 口径：最大化只扩中间视口）----
+    /// 左层级面板宽。
+    pub const LEFT_PANEL_W: f32 = 180.0;
+    /// 右检查器面板宽。
+    pub const INSPECTOR_W: f32 = 190.0;
+    /// 顶带高。
+    pub const TOP_BAND: f32 = 40.0;
+    /// 状态栏带高。
+    pub const STATUS_BAND: f32 = 24.0;
+    /// 底部 Output dock 高。
+    pub const DOCK_H: f32 = 96.0;
+    /// 视口工具栏高。
+    pub const TOOLBAR_H: f32 = 24.0;
+    /// 工具栏按钮尺寸与步进。
+    pub const TOOLBAR_BTN_W: f32 = 48.0;
+    pub const TOOLBAR_BTN_H: f32 = 20.0;
+    pub const TOOLBAR_BTN_STEP: f32 = 52.0;
+
+    // ---- 行高三档（位图标题行 / 列表行 / 真字体行，S12-11 口径）----
+    /// Inspector 真字体行步进。
+    pub const INS_ROW_H: f32 = 20.0;
+    /// dock / fs 列表行高（ListView row_h 同值）。
+    pub const DOCK_ROW_H: f32 = 18.0;
+    pub const FS_ROW_H: f32 = 18.0;
+    /// dock 标题行高（"Output" 一行）。
+    pub const DOCK_TITLE_H: f32 = 18.0;
+    /// fs 分隔条厚度。
+    pub const FS_SEP_H: f32 = 4.0;
+    /// fs 标题行高。
+    pub const FS_TITLE_H: f32 = 16.0;
+    /// 面板内容水平内衬。
+    pub const INSPECTOR_INSET: f32 = 6.0;
+    /// 2D 标尺条带厚度。
+    pub const RULER_W: f32 = 16.0;
+
+    // ---- 字号 ----
+    /// 编辑器 UI 统一字号（S12-11 壳层裁决：真字体 14px）。
+    pub const UI_FONT_SIZE: i64 = 14;
+
+    // ---- 九宫格皮肤纹理参数（DESIGN-NOTES §6.3）----
+    /// 面板皮肤边距（48×48 纹理，8px 边带）。
+    pub const SKIN_PANEL_MARGIN: i64 = 8;
+    /// 按钮皮肤边距（48×20 纹理，4px 边带）。
+    pub const SKIN_BTN_MARGIN: i64 = 4;
+}
+
+// 短名别名：既有引用面（MARGIN/LEFT_PANEL_W/...）逐字保留，定义单一出口。
+use editor_theme::{
+    DOCK_H, DOCK_ROW_H, DOCK_TITLE_H, FS_ROW_H, FS_SEP_H, FS_TITLE_H, INS_ROW_H, INSPECTOR_INSET,
+    INSPECTOR_W, LEFT_PANEL_W, MARGIN, PALETTE, RULER_W, SKIN_BTN_MARGIN, SKIN_PANEL_MARGIN,
+    SPACE_S, SLOT_ACCENT_NAME, SLOT_BORDER_NAME, SLOT_PANEL_NAME, SLOT_TEXT_DIM_NAME, STATUS_BAND,
+    TOOLBAR_BTN_H, TOOLBAR_BTN_STEP, TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
+};
+
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
+}
+
+/// 九宫格皮肤纹理（S18，DESIGN-NOTES.md §6.3）：深色主题**成品绝对色**
+/// —— 走 `ns_modulate=false` 路线（中性白 tint）。理由：乘法 tint 下
+/// 纹理亮度 ≤ fill 槽色，"亮边框比面板底亮"在 `fill_slot="panel"`（深
+/// 色）下乘不出来；S16.7 modulate 面向"灰阶纹理 × 面板色"的换色场景，
+/// 与"带亮边的成品皮肤"不同路。主题槽继续管文本/选中/强调。
+///
+/// 布局：最外 1px 边框（border 槽同系）→ 顶缘 1px 高光（bevel-up，按钮
+/// "浮起"直感；面板上退化为微妙亮线）→ `margin` px 边带内垂直微渐变
+///（贴边 +8 → 内缘 -4）→ 中心平坦（同微噪点）。
+///
+/// 噪点 = 确定性整数哈希（无浮点 RNG —— 代码生成确定性口径，与
+/// walk_sheet/beep 同一家法：缺了再写，仓库只背一份小文件）。
+fn skin_rgba(w: u32, h: u32, margin: u32, base: [u8; 3], border: [u8; 3], top_hi: [u8; 3]) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            // 距最近外缘的像素数（0 = 最外一圈）。
+            let edge = x.min(y).min(w - 1 - x).min(h - 1 - y);
+            // 确定性噪点：±3 的整数抖动（逐像素稳定，"微妙噪点"）。
+            let noise = ((x.wrapping_mul(73) ^ y.wrapping_mul(151)) % 7) as i32 - 3;
+            let [r, g, b] = if edge == 0 {
+                border
+            } else if edge == 1 && y == 1 {
+                // 顶缘高光行（边框内第一行）。
+                top_hi
+            } else {
+                // 边带内垂直微渐变：band = 0（贴边）..=margin（中心区），
+                // delta 从 +8 线性降到 -4（深色底上的克制落差）；中心区
+                // band 封顶在 margin。
+                let band = edge.min(margin);
+                let delta = 8 - (band as i32 * 12) / margin.max(1) as i32;
+                let mix = |c: u8| (c as i32 + delta + noise).clamp(0, 255) as u8;
+                [mix(base[0]), mix(base[1]), mix(base[2])]
+            };
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&[r, g, b, 255]);
+        }
+    }
+    rgba
 }
 
 /// 440Hz 蜂鸣样本（`duration_ms` 毫秒、单声道 16-bit；演示声音资产生成
@@ -255,26 +418,16 @@ fn load_user_music(
     }
 }
 
-/// 布局常量（S12-4 冻结、S12-6 扩底部 dock）：面板**恒定宽** —— 最大化
-/// 只扩中间世界视口，侧面板不跟着拉伸（消除"整个画面被拉长"观感的关键）。
+/// 布局常量补注（S12-4 冻结、S12-6 扩底部 dock；数值定义已收敛进
+/// [`EditorTheme`]）：面板**恒定宽** —— 最大化只扩中间世界视口，侧面板
+/// 不跟着拉伸（消除"整个画面被拉长"观感的关键）。
 /// - 左层级面板：x = 8..188（宽 180），y = 40..ch-dock 上缘；
 /// - 右检查器面板：x = cw-198..cw-8（宽 190），y = 8..ch-dock 上缘；
 /// - 底部 Output dock：高 96，y = ch-dock-状态栏..ch-状态栏，全宽；
 /// - 状态栏文本：y = ch-20（底部 16 文本 + 8 边距）；
 /// - 视口可编辑区 = 两面板之间再让出顶/左各 16px 标尺（标尺不属于
 ///   可编辑区，Godot 口径）：视口高 = ch - 40 - (dock 96 + 状态栏 24)。
-const MARGIN: f32 = 8.0;
-const LEFT_PANEL_W: f32 = 180.0;
-const INSPECTOR_W: f32 = 190.0;
-const TOP_BAND: f32 = 40.0;
-const STATUS_BAND: f32 = 24.0;
-
-/// 底部 Output dock 高度（Godot 底部"输出"面板观感）：标题行 + 日志
-/// 行列表；视口与状态栏让出这 96px。
-const DOCK_H: f32 = 96.0;
-/// dock 日志行行高（与 ListView `row_h` 同值；渲染器行 y = 矩形顶
-/// +4 + i*row_h，故可见行数 = (列表高-4) / 18 向下取整 = 4 行）。
-const DOCK_ROW_H: f32 = 18.0;
+///
 /// 编辑器日志环形保留行数（新行在下，满 N 丢最旧 —— Godot Output
 /// 的最小语义；可见窗只放最新能放下的几行，最新行永远可见）。S12-8
 /// 起 12 行、S12-9 起 20 行：冒烟钩子要同时断言 Enter 与 FileSystem
@@ -297,14 +450,10 @@ const DOCK_LINE_CHARS: usize = 40;
 /// - P0 布局裁决：**固定分割 + F9 两档** —— 不做拖拽，F9 在
 ///   "Scene 55% / FileSystem 40%" 与 "Scene 40% / FileSystem 55%"
 ///   两档间切换（焦点段占大头）；比例是编辑器会话态，不进树。
-const FS_SEP_H: f32 = 4.0;
-/// FileSystem 标题行高（"res:/" 一行 16px，与默认文本行高同口径）。
-const FS_TITLE_H: f32 = 16.0;
+///
 /// Scene / FileSystem 分割比（上段 = Scene；F9 切到 ALT 档）。
 const FS_SPLIT_TOP: f32 = 0.55;
 const FS_SPLIT_ALT: f32 = 0.40;
-/// fs 列表行高（与 dock 行高同值；行 y = 列表顶 +4 + i*row_h）。
-const FS_ROW_H: f32 = 18.0;
 /// 资产扫描深度（P0 两层条目：根一层 + 子目录一层）。
 const FS_SCAN_DEPTH: usize = 2;
 /// 资产白名单后缀（`.` 隐藏项与无后缀垃圾一律不进树）。S13 第 2 期起
@@ -324,8 +473,6 @@ const FS_EXT_WHITELIST: [&str; 17] = [
 /// 同一裁决口径）。
 const FS_DBLCLICK_FRAMES: u64 = 30;
 
-/// 2D 标尺条带厚度（Godot 2D 视口顶横/左竖刻度尺观感）。
-const RULER_W: f32 = 16.0;
 /// 标尺最小刻度间距（1px 细条）；数字标签每 2 格（=128px）一个。
 /// 密度复核（S12-11）：数字改真字体 14px 后 3 位数 ≈21px、4 位数
 /// ≈28px，128px 间距余量巨大；位图回退 3 位 48px 同样放得下 ——
@@ -340,14 +487,6 @@ const RULER_TICKS_V: usize = 32;
 /// 用 ≈19 个，超出少标（同上）。
 const RULER_LABELS_H: usize = 24;
 const RULER_LABELS_V: usize = 16;
-
-/// 视口工具栏高度（Godot 2D 视口顶部工具条观感）：标尺之上的一条
-/// 工具带，panel 槽铺底 + 底缘 1px border 槽分隔线。
-const TOOLBAR_H: f32 = 24.0;
-/// 工具栏按钮尺寸与步进（48px 宽按钮 + 4px 缝，20px 高贴 24px 带）。
-const TOOLBAR_BTN_W: f32 = 48.0;
-const TOOLBAR_BTN_H: f32 = 20.0;
-const TOOLBAR_BTN_STEP: f32 = 52.0;
 
 /// F5/F6/F7/F8/F9 的 Win32 虚拟键码。Key 契约未列举 F 键 —— 平台层把未列举
 /// 虚拟键原样保留为 `Key::Other(原码)`（vk_to_key 兜底分支），边缘
@@ -374,25 +513,6 @@ const SCRIPT_SCAN_EVERY: u64 = 60;
 /// 只会变少；截断值**保持 11** —— 真字体是可选增强（系统字体缺失时
 /// 回退位图），预算必须按两种模式都安全取界（位图 11×16=176 ≤ 178）。
 const INS_LINE_CHARS: usize = 11;
-/// 输入框/面板内容的水平内衬。
-const INSPECTOR_INSET: f32 = 6.0;
-
-/// 编辑器 UI 统一字号（S12-11 壳层裁决）：真字体 14px 的可读性优于
-/// 位图 16px 点阵（真字体小字号平滑、位图 16 是放大点阵）。适用面
-/// **逐处列出**：全部 Label（面板标题/Inspector 分区与属性行/状态栏/
-/// 标尺数字 —— 标尺数字 14 的观感理由：14px 行高 ≈18.5px 更贴 16px
-/// 条带，16px 会下探 5px 进视口）+ 改名输入框 + 工具栏六按钮（schema
-/// 无 font_size 键，走 set_prop_raw 前向通道；msyh 实测 16px 下
-/// "RESET" advance 和 ≈46px + 4px 内衬会越过 48px 按钮右缘，14px
-/// 实测 40.6px、墨迹 ≈39px 贴边装得下 —— 实测见 S12.11 文档 §2）。
-const UI_FONT_SIZE: i64 = 14;
-
-/// Inspector 竖向行步进（S12-11 从 16 放宽）：真字体 14px 的行高 =
-/// ascent+descent+lineGap，msyh/segoeui ≈1.32em ≈ 18.5px —— 16px 步
-/// 进下 Inspector 属性行会顶进改名输入框。20px 给足余量；位图回退
-/// 行高恒 16px，20px 步进只是行距略宽（回退模式降级观感，不破相）。
-const INS_ROW_H: f32 = 20.0;
-
 /// IME 组合窗锚点的框内内衬（像素，x/y 同值 —— 单行输入框的 P0 近似）。
 const IME_CARET_INSET: f32 = 4.0;
 
@@ -902,6 +1022,29 @@ fn main() {
             write_bmp_rgba(&tex.join(name), 16, 16, &solid_rgba(r, g, b)).expect("写纹理");
         }
     }
+    // S18 皮肤纹理（九宫格面板/按钮，DESIGN-NOTES §6.3）：代码生成、缺了
+    // 再写（walk_sheet/beep 同一家法）。panel 48×48 边距 8、button 48×20
+    // 边距 4；绝对色成品纹理（深色底 + 1px 亮边框 + 微渐变 + 噪点）。
+    let panel_skin = tex.join("panel_skin.bmp");
+    if !panel_skin.exists() {
+        write_bmp_rgba(
+            &panel_skin,
+            48,
+            48,
+            &skin_rgba(48, 48, 8, [30, 34, 40], [58, 64, 72], [66, 74, 84]),
+        )
+        .expect("写面板皮肤");
+    }
+    let button_skin = tex.join("button_skin.bmp");
+    if !button_skin.exists() {
+        write_bmp_rgba(
+            &button_skin,
+            48,
+            20,
+            &skin_rgba(48, 20, 4, [44, 50, 58], [58, 64, 72], [92, 102, 116]),
+        )
+        .expect("写按钮皮肤");
+    }
     // 演示声音资产（S13 第 2 期）：440Hz / 250ms，缺了再写（bmp 同口径）。
     let audio_dir = assets.join("Audio");
     std::fs::create_dir_all(&audio_dir).unwrap();
@@ -921,6 +1064,10 @@ fn main() {
     for t in ["player", "enemy", "bullet", "heart", "door"] {
         let _ = rt.declare_texture(&format!("Textures/{t}.bmp")).expect("声明纹理");
     }
+    // S18 皮肤纹理声明（资源 id 经返回值取用，不写死槽位号；面板/按钮
+    // 九宫格 ns_tex 引用这两个键，见装配段 skin_panel/skin_button）。
+    let panel_skin_id = rt.declare_texture("Textures/panel_skin.bmp").expect("声明面板皮肤");
+    let button_skin_id = rt.declare_texture("Textures/button_skin.bmp").expect("声明按钮皮肤");
     let _ = rt.declare_sound("Audio/beep.wav").expect("声明演示声音");
     // 演示视频资产（S15）：用户实测 AMV 不入库 —— 用户目录有就复制进
     // Media/（gitignore 覆盖）并声明；缺失即整段跳过（音乐同口径）。
@@ -937,14 +1084,14 @@ fn main() {
     } else {
         false
     };
-    let expected_loaded = if video_present { 7 } else { 6 };
+    let expected_loaded = if video_present { 9 } else { 8 };
     let report = rt.bind_assets();
     assert_eq!(
         report.loaded.len(),
         expected_loaded,
-        "5 纹理 + 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
+        "7 纹理（5 演示 + 2 皮肤，S18）+ 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
     );
-    assert_eq!(rt.upload_pending_textures().expect("上传"), 5);
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 7);
     if video_present {
         assert_eq!(rt.video_count(), 1, "演示视频解析入表（首帧已上 GPU）");
     }
@@ -990,9 +1137,41 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree) = {
         let tree = rt.tree_mut();
         let root = tree.root();
+        // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
+        // 提取层取前序序最后的 Theme 节点为当前色板）。八槽位值来自
+        // [`EditorTheme`] 色板表（P0 = DEFAULT_DARK 同值，观感零漂移；
+        // 换肤入口从此收敛到壳层常量表，提取/渲染层零改动）。纯数据
+        // 节点不渲染；层级树投影把它加进 skips（皮肤节点不是可编辑
+        // 对象，同 grid/ruler/dock 纪律，见下方 walk 的 skips 表）。
+        let theme_node = tree.add_node(root, "theme", NodeKind::Theme);
+        for (name, packed) in PALETTE {
+            let _ = tree.set_prop(theme_node, name, Value::I64(*packed));
+        }
+        // S18 皮肤九宫格属性写入器（裸 Control 专用 —— 提取层仅对
+        // Control 读 ns_*，Button/TextInput/List 等摊平类不读，S16.6
+        // 口径）。ns_* 非 schema 键，走 set_prop_raw 前向通道（z_index/
+        // border_w/font_size 先例）。modulate=false = 皮肤是成品绝对色
+        // （DESIGN-NOTES §6.3：乘法 tint 出不了"亮边框比底亮"）；
+        // tiling=false = 渐变拉伸（平铺留给未来噪点面板的选项）。
+        let skin_panel = |tree: &mut nes_scene::SceneTree, n: nes_scene::NodeId| {
+            tree.set_prop_raw(n, PROP_NS_TEX, Value::Resource(panel_skin_id.get() as u64));
+            for p in [PROP_NS_L, PROP_NS_T, PROP_NS_R, PROP_NS_B] {
+                tree.set_prop_raw(n, p, Value::I64(SKIN_PANEL_MARGIN));
+            }
+            tree.set_prop_raw(n, PROP_NS_MODULATE, Value::Bool(false));
+            tree.set_prop_raw(n, PROP_NS_TILING, Value::Bool(false));
+        };
+        let skin_button = |tree: &mut nes_scene::SceneTree, n: nes_scene::NodeId| {
+            tree.set_prop_raw(n, PROP_NS_TEX, Value::Resource(button_skin_id.get() as u64));
+            for p in [PROP_NS_L, PROP_NS_T, PROP_NS_R, PROP_NS_B] {
+                tree.set_prop_raw(n, p, Value::I64(SKIN_BTN_MARGIN));
+            }
+            tree.set_prop_raw(n, PROP_NS_MODULATE, Value::Bool(false));
+            tree.set_prop_raw(n, PROP_NS_TILING, Value::Bool(false));
+        };
         // 视口网格（S12-5 Godot 观感）：条带池 —— 竖条 1px 宽 × 视口高、
         // 横条 1px 高 × 视口宽，fill_slot="border" 吃边框槽色，visible=false
         // 备用（每帧投影按视口布线，见循环内网格段）。全部挂在 "grid" 容器
@@ -1008,7 +1187,7 @@ fn main() {
             let _ = tree.set_prop(bar, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
             let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
             let _ = tree.set_prop(bar, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 1.0)));
-            let _ = tree.set_prop(bar, "fill_slot", Value::Str("border".into()));
+            let _ = tree.set_prop(bar, "fill_slot", Value::Str(SLOT_BORDER_NAME.into()));
             let _ = tree.set_prop(bar, "visible", Value::Bool(false));
             tree.set_prop_raw(bar, "z_index", Value::I64(-100));
             grid_bars.push(bar);
@@ -1042,7 +1221,7 @@ fn main() {
             let _ = tree.set_prop(tick, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
             let _ = tree.set_prop(tick, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
             let _ = tree.set_prop(tick, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 1.0)));
-            let _ = tree.set_prop(tick, "fill_slot", Value::Str("border".into()));
+            let _ = tree.set_prop(tick, "fill_slot", Value::Str(SLOT_BORDER_NAME.into()));
             let _ = tree.set_prop(tick, "visible", Value::Bool(false));
             tree.set_prop_raw(tick, "z_index", Value::I64(-90));
             ruler_ticks.push(tick);
@@ -1071,7 +1250,10 @@ fn main() {
         let _ = tree.set_prop(dock_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(dock_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(dock_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 1.0)));
-        let _ = tree.set_prop(dock_bg, "fill_slot", Value::Str("panel".into()));
+        let _ = tree.set_prop(dock_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+        // S18 换肤：Output dock 面板换九宫格皮肤（纹理自带边 —— 九宫格
+        // 模式下 fill/border 条带不画，renderer.rs S16.6 分臂）。
+        skin_panel(tree, dock_bg);
         tree.set_prop_raw(dock_bg, "z_index", Value::I64(-80));
         let dock_title = tree.add_node(dock, "dock_title", NodeKind::Label);
         tree.set_local(dock_title, Transform2D::from_pos(MARGIN + 2.0, 320.0));
@@ -1081,7 +1263,7 @@ fn main() {
         let hud_dock = tree.add_node(dock, "hud_dock", NodeKind::ListView);
         let _ = tree.set_prop(hud_dock, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(hud_dock, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 320.0)));
-        let _ = tree.set_prop(hud_dock, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(600.0, DOCK_H - 18.0 - 2.0)));
+        let _ = tree.set_prop(hud_dock, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(600.0, DOCK_H - DOCK_TITLE_H - 2.0)));
         let _ = tree.set_prop(hud_dock, "rows", Value::Str(String::new()));
         let _ = tree.set_prop(hud_dock, "row_h", Value::I64(DOCK_ROW_H as i64));
         tree.set_prop_raw(hud_dock, "z_index", Value::I64(-80));
@@ -1100,7 +1282,9 @@ fn main() {
         let _ = tree.set_prop(fs_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(fs_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 240.0)));
         let _ = tree.set_prop(fs_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, 100.0)));
-        let _ = tree.set_prop(fs_bg, "fill_slot", Value::Str("panel".into()));
+        let _ = tree.set_prop(fs_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+        // S18 换肤：FileSystem 面板九宫格皮肤（同 dock_bg 口径）。
+        skin_panel(tree, fs_bg);
         tree.set_prop_raw(fs_bg, "z_index", Value::I64(-60));
         let fs_title = tree.add_node(fsdock, "fs_title", NodeKind::Label);
         tree.set_local(fs_title, Transform2D::from_pos(MARGIN + 2.0, 242.0));
@@ -1111,7 +1295,7 @@ fn main() {
         let _ = tree.set_prop(fs_sep, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(fs_sep, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 236.0)));
         let _ = tree.set_prop(fs_sep, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, FS_SEP_H)));
-        let _ = tree.set_prop(fs_sep, "fill_slot", Value::Str("border".into()));
+        let _ = tree.set_prop(fs_sep, "fill_slot", Value::Str(SLOT_BORDER_NAME.into()));
         tree.set_prop_raw(fs_sep, "z_index", Value::I64(-60));
         let fs_tree = tree.add_node(fsdock, "fs_tree", NodeKind::ListView);
         let _ = tree.set_prop(fs_tree, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
@@ -1132,14 +1316,38 @@ fn main() {
         let _ = tree.set_prop(tool_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(188.0, TOP_BAND)));
         let _ = tree.set_prop(tool_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(380.0, TOOLBAR_H)));
-        let _ = tree.set_prop(tool_bg, "fill_slot", Value::Str("panel".into()));
+        let _ = tree.set_prop(tool_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
         tree.set_prop_raw(tool_bg, "z_index", Value::I64(-70));
         let tool_sep = tree.add_node(toolbar, "tool_sep", NodeKind::Control);
         let _ = tree.set_prop(tool_sep, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_sep, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(188.0, TOP_BAND + TOOLBAR_H - 1.0)));
         let _ = tree.set_prop(tool_sep, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(380.0, 1.0)));
-        let _ = tree.set_prop(tool_sep, "fill_slot", Value::Str("border".into()));
+        let _ = tree.set_prop(tool_sep, "fill_slot", Value::Str(SLOT_BORDER_NAME.into()));
         tree.set_prop_raw(tool_sep, "z_index", Value::I64(-70));
+        // S18 换肤：按钮九宫格底板 × 6（与六按钮一一配对）。egui
+        // `weak_bg_fill`/`bg_fill` 区分（DESIGN-NOTES §1.4）的壳层版：
+        // 底板有底（按钮皮肤纹理，绝对色 bevel-up），按钮本体 fill 走
+        // 透明（fill_slot 置空串 —— themed/button 槽解析对空名不覆盖，
+        // ControlState 缺省透明），纹理从按钮矩形里透出；hover/pressed
+        // 的 accent 换档是提取层既有四态（按钮矩形画在底板之上，同 z
+        // 下前序序先画 —— 底板先建垫底），按下时 accent 填充盖过纹理
+        // = 强反馈。三态观感：正常 = 纹理 + border 槽框；悬停 = 纹理 +
+        // accent 框；按下 = accent 填充 + accent 框。offset 装配期占位，
+        // 每帧布局投影随按钮同步重写（见循环内 tool_btns/tool_plates）。
+        let mut tool_plates = Vec::with_capacity(6);
+        for i in 0..6 {
+            let plate = tree.add_node(toolbar, "tool_plate", NodeKind::Control);
+            let _ = tree.set_prop(plate, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(plate, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(
+                192.0 + i as f32 * TOOLBAR_BTN_STEP,
+                TOP_BAND + 2.0,
+            )));
+            let _ = tree.set_prop(plate, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
+            let _ = tree.set_prop(plate, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+            skin_button(tree, plate);
+            tree.set_prop_raw(plate, "z_index", Value::I64(-70));
+            tool_plates.push(plate);
+        }
         let tool_sel = tree.add_node(toolbar, "tool_sel", NodeKind::Button);
         let _ = tree.set_prop(tool_sel, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_sel, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0, TOP_BAND + 2.0)));
@@ -1147,6 +1355,11 @@ fn main() {
         let _ = tree.set_prop(tool_sel, "text", Value::Str("SEL".into()));
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_sel, "font_size", Value::I64(UI_FONT_SIZE));
+        // S18：fill_slot 置空 = 按钮本体透明底（槽解析对空名不覆盖，
+        // ControlState 缺省透明），九宫格底板纹理透出；hover/pressed 的
+        // accent 换档是提取层既有四态，照常叠加（按下填充盖过纹理）。
+        // 五键同款，注释唯一。
+        tree.set_prop_raw(tool_sel, "fill_slot", Value::Str(String::new()));
         let tool_snap = tree.add_node(toolbar, "tool_snap", NodeKind::Button);
         let _ = tree.set_prop(tool_snap, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_snap, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
@@ -1154,6 +1367,7 @@ fn main() {
         let _ = tree.set_prop(tool_snap, "text", Value::Str("SNAP".into()));
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_snap, "font_size", Value::I64(UI_FONT_SIZE));
+        tree.set_prop_raw(tool_snap, "fill_slot", Value::Str(String::new()));
         let tool_grid = tree.add_node(toolbar, "tool_grid", NodeKind::Button);
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_grid, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 2.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
@@ -1161,6 +1375,7 @@ fn main() {
         let _ = tree.set_prop(tool_grid, "text", Value::Str("GRID".into()));
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_grid, "font_size", Value::I64(UI_FONT_SIZE));
+        tree.set_prop_raw(tool_grid, "fill_slot", Value::Str(String::new()));
         // S12-9：PLAY / STOP / RESET（Godot 视口工具栏右上角的运行三键
         // 直感，P0 摆在编辑三键右侧同一工具带）。文本投影每帧重写
         //（PLAY 运行中带 * 后缀），offset 装配期占位、每帧布局投影重写。
@@ -1171,6 +1386,7 @@ fn main() {
         let _ = tree.set_prop(tool_play, "text", Value::Str("PLAY".into()));
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_play, "font_size", Value::I64(UI_FONT_SIZE));
+        tree.set_prop_raw(tool_play, "fill_slot", Value::Str(String::new()));
         let tool_stop = tree.add_node(toolbar, "tool_stop", NodeKind::Button);
         let _ = tree.set_prop(tool_stop, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_stop, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 4.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
@@ -1178,6 +1394,7 @@ fn main() {
         let _ = tree.set_prop(tool_stop, "text", Value::Str("STOP".into()));
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_stop, "font_size", Value::I64(UI_FONT_SIZE));
+        tree.set_prop_raw(tool_stop, "fill_slot", Value::Str(String::new()));
         let tool_reset = tree.add_node(toolbar, "tool_reset", NodeKind::Button);
         let _ = tree.set_prop(tool_reset, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_reset, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 5.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
@@ -1185,6 +1402,9 @@ fn main() {
         let _ = tree.set_prop(tool_reset, "text", Value::Str("RESET".into()));
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_reset, "font_size", Value::I64(UI_FONT_SIZE));
+        // S18：fill_slot 置空 = 按钮本体透明底（槽解析对空名不覆盖），
+        // 九宫格底板纹理透出（hover/pressed 的 accent 换档照常叠加）。
+        tree.set_prop_raw(tool_reset, "fill_slot", Value::Str(String::new()));
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
         tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
         let obj1 = tree.add_node(root, "obj1", NodeKind::Sprite2D);
@@ -1215,7 +1435,9 @@ fn main() {
         tree.set_prop(hud_ins_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
         tree.set_prop(hud_ins_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(570.0, 8.0))).unwrap();
         tree.set_prop(hud_ins_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, 400.0))).unwrap();
-        tree.set_prop(hud_ins_bg, "fill_slot", Value::Str("panel".into())).unwrap();
+        tree.set_prop(hud_ins_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into())).unwrap();
+        // S18 换肤：Inspector 面板九宫格皮肤（同 dock_bg 口径）。
+        skin_panel(tree, hud_ins_bg);
         // Inspector 标题 + 选中信息（短文本：标题一行 + 信息另起，
         // "(none)" = 无选中）。位置每帧投影（x = cw-190, y = 12，跟随
         // 右面板）—— 修 S12-4 ⑤"标题被表面边缘裁剪"。
@@ -1234,7 +1456,7 @@ fn main() {
         tree.set_prop(sel_box, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
         tree.set_prop(sel_box, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-100.0, -100.0))).unwrap();
         tree.set_prop(sel_box, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(20.0, 20.0))).unwrap();
-        tree.set_prop(sel_box, "border_slot", Value::Str("accent".into())).unwrap();
+        tree.set_prop(sel_box, "border_slot", Value::Str(SLOT_ACCENT_NAME.into())).unwrap();
         tree.set_prop_raw(sel_box, "border_w", Value::F32(2.0));
         tree.set_prop_raw(sel_box, "z_index", Value::I64(100));
 
@@ -1273,18 +1495,18 @@ fn main() {
         tree.set_local(ins_tf_title, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT, Value::Str("- Transform".into()));
         let _ = tree.set_prop(ins_tf_title, "font_size", Value::I64(UI_FONT_SIZE));
-        let _ = tree.set_prop(ins_tf_title, "color_slot", Value::Str("text_dim".into()));
+        let _ = tree.set_prop(ins_tf_title, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
         let ins_sc_title = tree.add_node(root, "ins_sc_title", NodeKind::Label);
         tree.set_local(ins_sc_title, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_sc_title, PROP_LABEL_TEXT, Value::Str("- Script".into()));
         let _ = tree.set_prop(ins_sc_title, "font_size", Value::I64(UI_FONT_SIZE));
-        let _ = tree.set_prop(ins_sc_title, "color_slot", Value::Str("text_dim".into()));
+        let _ = tree.set_prop(ins_sc_title, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
         let ins_script = tree.add_node(root, "ins_script", NodeKind::Label);
         tree.set_local(ins_script, Transform2D::from_pos(-1000.0, -1000.0));
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -2231,13 +2453,20 @@ fn main() {
                 (tool_reset, false, "RESET"),
             ];
             for (i, (b, on, name)) in tool_btns.iter().enumerate() {
+                let bx = gx0 + SPACE_S + i as f32 * TOOLBAR_BTN_STEP;
                 let _ = tree.set_prop(*b, PROP_CONTROL_OFFSET,
                     Value::Vec2(nes_scene::Vec2::new(
-                        gx0 + 4.0 + i as f32 * TOOLBAR_BTN_STEP,
+                        bx,
                         TOP_BAND + 2.0,
                     )));
                 let _ = tree.set_prop(*b, "text",
                     Value::Str(if *on { format!("{name}*") } else { (*name).to_string() }));
+                // S18：底板随按钮同步布线（同位同尺寸 —— 底板在按钮正
+                // 下方，纹理透出按钮透明底；投影无状态，每帧重写口径）。
+                if let Some(&p) = tool_plates.get(i) {
+                    let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(bx, TOP_BAND + 2.0)));
+                }
             }
             // 左栏两段布线（S12-8，Godot 左栏 Scene + res:// 两段）：
             // 可用高 = 顶带到 dock 上缘；上段 Scene（层级树）+ 4px
@@ -2444,9 +2673,9 @@ fn main() {
             let _ = tree.set_prop(dock_bg, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - 2.0 * MARGIN, DOCK_H)));
             tree.set_local(dock_title, Transform2D::from_pos(MARGIN + 2.0, dock_y + 1.0));
-            let dock_list_h = DOCK_H - 18.0 - 2.0;
+            let dock_list_h = DOCK_H - DOCK_TITLE_H - 2.0;
             let _ = tree.set_prop(hud_dock, PROP_CONTROL_OFFSET,
-                Value::Vec2(nes_scene::Vec2::new(MARGIN + 2.0, dock_y + 18.0)));
+                Value::Vec2(nes_scene::Vec2::new(MARGIN + 2.0, dock_y + DOCK_TITLE_H)));
             let _ = tree.set_prop(hud_dock, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - 2.0 * MARGIN - 4.0, dock_list_h)));
             let dock_fit = (((dock_list_h - 4.0) / DOCK_ROW_H).floor() as usize).max(1);
@@ -2498,7 +2727,9 @@ fn main() {
                     walk(tree, c, depth + 1, sel, out, map, skips);
                 }
             }
-            let skips = [grid, ruler, dock, toolbar, fsdock];
+            // S18 起 skips 加 theme_node：主题节点是皮肤数据不是可编辑
+            // 对象，不进层级树行列表（同 grid/ruler/dock 纪律）。
+            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node];
             walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, &skips);
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
@@ -3036,5 +3267,5 @@ fn main() {
         println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset 冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree);
 }
