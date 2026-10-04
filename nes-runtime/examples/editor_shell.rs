@@ -1343,6 +1343,40 @@ fn main() {
     let editor_log: Rc<RefCell<VecDeque<String>>> =
         Rc::new(RefCell::new(VecDeque::with_capacity(EDITOR_LOG_KEEP)));
     log_line(&editor_log, "editor ready".into());
+    // S17.4 宿主惯例（与 first_game/dungeon_game 同一款）：启动时全装载
+    // 资产根 `Extensions/*.js`（字典序 = 确定装载序）。编辑器里扩展照跑
+    // —— 生态面 = play-in-editor：update 推进只在运行态（见帧循环），
+    // 编辑态不推进（扩展写树属运行期改动；编辑期写会绕过事务污染编辑
+    // 会话）。装载失败只记一行不中断 —— 一个坏扩展不挡编辑器。
+    {
+        let ext_dir = assets.join("Extensions");
+        if let Ok(entries) = std::fs::read_dir(&ext_dir) {
+            let mut files: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("js"))
+                .collect();
+            files.sort();
+            for f in files {
+                match rt.load_extension_file(&f) {
+                    Ok(id) => {
+                        println!("[扩展] 已装载 {id} <- {}", f.display());
+                        log_line(&editor_log, format!("ext loaded {id}"));
+                    }
+                    Err(e) => {
+                        eprintln!("[扩展] 装载失败（{}）：{e} —— 跳过", f.display());
+                        log_line(
+                            &editor_log,
+                            format!(
+                                "ext load failed: {}",
+                                base_name(&f.to_string_lossy())
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // 真字体默认字体装载（S12-11 壳层①，见模块头与 FONT_CANDIDATES 注）：
     // 按优先级探测，第一个可读且可解析的经 `set_ttf_default` 装载 —— 此后
     // font==NIL 文本（全部 Label/输入框/按钮）自动走真字体动态字形图集排
@@ -1523,18 +1557,19 @@ fn main() {
                 // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
                 // spin.nes 行（768x432 客户区）。S15 起 res:// 树多出
                 // Media/（演示视频目录 + 条目两行）—— 默认 55% 档的
-                // fs 列表（~5.8 行可见）装不下 spin.nes（第 6 行）：先
-                // F9 切 files 档（fs 面板变高，spin.nes 落在 y≈289），
-                // 再双击；两次点击沿间隔 10 帧 < 30（双击裁决窗），挂载
+                // fs 列表（~5.8 行可见）装不下 spin.nes：先 F9 切
+                // files 档再双击。S17.4 起 Extensions/ 多出 shake.js
+                //（真扩展实战入库）—— 字典序在 Scripts/ 之上，spin.nes
+                // 整体再下移一行（行高 18）：files 档 y≈307 / 默认档
+                // y≈310。两次点击沿间隔 10 帧 < 30（双击裁决窗），挂载
                 // 后 U 卸载回空 registry_key（树形态断言兼容）。Media/
-                // 缺席的机器保持 S14 布局（默认档 spin.nes 在 y=292，
-                // 无需 F9）—— 断言面（fs open / mount 行）两种形态都
-                // 成立。
+                // 缺席的机器保持默认档布局 —— 断言面（fs open / mount
+                // 行）两种形态都成立。
                 74 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: true }),
                 76 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: false }),
                 80 => inject_input(InputEvent::MouseMove {
                     x: 60.0,
-                    y: if video_present { 289.0 } else { 292.0 },
+                    y: if video_present { 307.0 } else { 310.0 },
                 }),
                 82 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 84 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
@@ -2732,6 +2767,14 @@ fn main() {
                 if transient >= TRANSIENT_LIMIT {
                     std::process::exit(1);
                 }
+            }
+        }
+        // S17.4 帧序契约（simulate 之后）：扩展 update 只在运行态推进
+        //（play-in-editor 的生态面 —— 编辑态扩展不写树）。诊断逐行上
+        // 控制台，不静默。
+        if play.playing {
+            for line in rt.update_extensions() {
+                println!("[帧 {index}] [扩展] {line}");
             }
         }
         // 重命名提交（帧后落账 —— UiVm 钩子回调在帧内只传值）：

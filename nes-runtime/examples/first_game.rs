@@ -2,7 +2,9 @@
 //!
 //! 这是"用真实项目压 Runtime"的窗口宿主：场景与行为全部在
 //! `examples/assets/first_game.ron`（手写场景文件，非代码搭场景），
-//! 宿主只做四件事：装配、装载、逐帧（输入 → `input/*` 信号 → `tick`
+//! 宿主只做五件事：装配、装载、**扩展装载**（S17.4：启动时全装载
+//! `Extensions/*.js`，帧循环 simulate 后 `update_extensions`，诊断逐行
+//! 上控制台）、逐帧（输入 → `input/*` 信号 → `tick`
 //! 节拍 → 渲染）、瞬态容忍。确定性验证走 headless CLI：
 //!
 //! ```text
@@ -24,6 +26,31 @@ use nes_scene::ScriptVm;
 /// 单色 16x16 纹理。
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
     [r, g, b, 255].repeat(16 * 16)
+}
+
+/// S17.4 宿主惯例：启动时全装载资产根 `Extensions/*.js`（字典序 = 确定
+/// 装载序）。装载失败只打日志继续 —— **一个坏扩展不挡游戏**（S17.1 隔离
+/// 纪律的宿主半边：装载期失败 = 该扩展缺席，其余扩展与游戏照常）。
+/// 目录不存在 = 无扩展（如实为空，不报错）。
+fn load_extensions(rt: &mut NesRuntime, root: &Path) {
+    let dir = root.join("Extensions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("js"))
+        .collect();
+    files.sort();
+    for f in files {
+        match rt.load_extension_file(&f) {
+            Ok(id) => println!("[扩展] 已装载 {id} <- {}", f.display()),
+            Err(e) => {
+                eprintln!("[扩展] 装载失败（{}）：{e} —— 跳过，游戏照常", f.display())
+            }
+        }
+    }
 }
 
 fn main() {
@@ -101,6 +128,9 @@ fn main() {
     }
     rt.mount_input_view(&mut vm);
 
+    // S17.4：装配后（attach 之后、帧循环之前）全装载扩展目录。
+    load_extensions(&mut rt, &root);
+
     let total: u64 = std::env::var("NES_GAME_FRAMES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -135,6 +165,12 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        // S17.4 帧序契约：扩展 update 在 simulate 之后（当 tick 后状态；
+        // 写队列当帧落地、下一帧呈现）。诊断逐行上控制台 —— 扩展错误
+        // 在游戏控制台可见，不静默。
+        for line in rt.update_extensions() {
+            println!("[帧 {index}] [扩展] {line}");
         }
         std::thread::sleep(Duration::from_millis(16));
     }
