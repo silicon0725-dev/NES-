@@ -153,6 +153,25 @@ pub enum RenderCommand {
         /// 视口空间裁剪矩形；`None` = 清除裁剪。
         rect: Option<Rect>,
     },
+    /// 着色（S16.1 alpha 通道的契约扩展）：RGBA8 直 alpha 相乘色。
+    ///
+    /// 与 E-1 的 ControlState/LabelState 颜色字段同一相乘语义（采样色 x tint，
+    /// 中性 `[255,255,255,255]` = 恒等），但作为**独立属性命令**存在：
+    /// 精灵（Sprite）没有自己的颜色字段，alpha 通道经本命令进入。
+    ///
+    /// - 属性动作、全量快照、同键覆写：`submit` 时对有 tint 簿记的条目按序
+    ///   重发当前值（漏推一帧不漂移）；条目销毁时随条目消亡；
+    /// - 输出序冻结在对应条目的 `SetRect` / `SetClip` 之后（同一渲染物的
+    ///   属性流序：… → SetRect → SetClip → SetTint —— null 与 wgpu 两处
+    ///   submit 严格同序）；
+    /// - 空句柄 / 未知句柄静默忽略（契约 I1 口径）。
+    SetTint {
+        /// 句柄。
+        handle: ItemHandle,
+        /// 相乘色（RGBA8 直 alpha；RGB 与 alpha 都参与相乘 —— 提取层
+        /// 的 alpha 通道只动 A：`[255, 255, 255, a]`）。
+        rgba: [u8; 4],
+    },
     /// 帧结束标记（**每条命令流都必须以它结尾**）。
     Submit {
         /// 本帧上下文。
@@ -173,7 +192,8 @@ impl RenderCommand {
             | Self::SetText { handle, .. }
             | Self::SetList { handle, .. }
             | Self::SetRect { handle, .. }
-            | Self::SetClip { handle, .. } => Some(*handle),
+            | Self::SetClip { handle, .. }
+            | Self::SetTint { handle, .. } => Some(*handle),
             Self::SetCamera { .. } | Self::Submit { .. } => None,
         }
     }

@@ -47,6 +47,9 @@ pub struct NullRenderServer {
     /// 裁剪簿记（E-2 / D1）：`Some(rect)` 存、`None`/销毁移除。
     /// 有裁剪的条目在 `submit_into` 输出序里于 `SetRect` 之后追加 `SetClip`。
     clips: BTreeMap<ItemHandle, Rect>,
+    /// 相乘色簿记（S16.1 alpha 通道）：`set_tint` 存（同键覆写）、销毁移除。
+    /// 有 tint 的条目在 `submit_into` 输出序里于 `SetClip` 之后追加 `SetTint`。
+    tints: BTreeMap<ItemHandle, [u8; 4]>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
     counters: ServerCounters,
@@ -98,6 +101,11 @@ impl NullRenderServer {
         self.clips.get(&handle)
     }
 
+    /// 取渲染物的相乘色（S16.1；未设置返回 `None` —— 无记录 = 中性恒等）。
+    pub fn tint_of(&self, handle: ItemHandle) -> Option<&[u8; 4]> {
+        self.tints.get(&handle)
+    }
+
     /// 当前相机。
     pub fn camera(&self) -> Option<&Camera2DState> {
         self.camera.as_ref()
@@ -136,6 +144,7 @@ impl RenderServer for NullRenderServer {
         self.lists.remove(&handle);
         self.rects.remove(&handle);
         self.clips.remove(&handle);
+        self.tints.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
         self.counters.destroyed += 1;
     }
@@ -216,6 +225,16 @@ impl RenderServer for NullRenderServer {
         }
     }
 
+    fn set_tint(&mut self, handle: ItemHandle, rgba: [u8; 4]) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1），计数器使其可观测。
+            self.counters.ignored_ops += 1;
+            return;
+        }
+        // 同键覆写（全量快照语义）。
+        self.tints.insert(handle, rgba);
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空：缓冲跨帧复用，绝不留上一帧的残留。
         out.clear();
@@ -274,6 +293,14 @@ impl RenderServer for NullRenderServer {
                 out.push(RenderCommand::SetClip {
                     handle: item.handle,
                     rect: Some(*clip),
+                });
+            }
+            // 相乘色（S16.1）：恒在 SetClip 之后（契约 I5 顺序冻结；
+            // 与 wgpu 后端严格同序）。仅当该条目存在 tint 簿记时追加。
+            if let Some(rgba) = self.tints.get(&item.handle) {
+                out.push(RenderCommand::SetTint {
+                    handle: item.handle,
+                    rgba: *rgba,
                 });
             }
         }

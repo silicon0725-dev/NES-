@@ -1,8 +1,11 @@
-// S16 动画补间第 1 期 harness：tween_demo。
+// S16/S16.1 动画补间 harness：tween_demo。
 //
-// 左侧蓝色方块 = 引擎位置补间（tween_pos，脚本只在到站时换程）；
-// 红色标记 = 手写逐帧步进对照（on "tick" 里累加，真实项目旧写法）。
-// 方向键/WASD 移动红色标记。
+// 第一行蓝色方块 = 引擎位置补间（tween_pos linear/once，脚本只在到站时
+// 换程）；第二行蓝色方块 = S16.1 对照：ease_out + yoyo（往返补间，到站
+// 信号 tween_done 到达才重新起程）；第一行方块同时叠加 alpha 呼吸
+//（tween_alpha smoothstep + loop —— 永不到站，永不移除）；红色标记 =
+// 手写逐帧步进对照（on "tick" 里累加，真实项目旧写法）。方向键/WASD 移动
+// 红色标记。
 Scene(
     version: 1,
     resources: [
@@ -27,6 +30,13 @@ Scene(
                 children: [],
             ),
             Node(
+                name: "box2",
+                kind: "Sprite2D",
+                local: (x: 8.0, y: 88.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "texture": Resource(1), },
+                children: [],
+            ),
+            Node(
                 name: "tri",
                 kind: "Sprite2D",
                 local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
@@ -35,10 +45,28 @@ Scene(
             ),
             // 方块脑（process 入口）：到站才换程 —— 每帧重发会被 last-wins
             // 替换成"从当前位置重走全程"，永不进站（语义见 S16 文档 §1）。
+            // 末尾的 alpha 呼吸 = S16.1：smoothstep + loop（透明度通道，
+            // 永不移除、永不到站 —— 停用才走 tween_stop）。
             Node(
                 name: "box_brain",
                 kind: "Script",
-                props: { "source": "init { dir = 0 }\nevery { if dir < 1 { dir = 1; tween_pos \"box\" 360.0 40.0 1500 }; if dir == 1 { if node(\"box\").pos.x > 354.0 { dir = 2; tween_pos \"box\" 8.0 40.0 1500 } }; if dir == 2 { if node(\"box\").pos.x < 10.0 { dir = 1; tween_pos \"box\" 360.0 40.0 1500 } } }" },
+                props: { "source": "init { dir = 0 }\nevery { if dir < 1 { dir = 1; tween_pos \"box\" 360.0 40.0 1500; tween_alpha \"box\" 0.25 1200 \"smoothstep\" \"loop\" }; if dir == 1 { if node(\"box\").pos.x > 354.0 { dir = 2; tween_pos \"box\" 8.0 40.0 1500 } }; if dir == 2 { if node(\"box\").pos.x < 10.0 { dir = 1; tween_pos \"box\" 360.0 40.0 1500 } } }" },
+                children: [],
+            ),
+            // 第二行方块脑（S16.1）：ease_out + yoyo —— 一次登记自动往返
+            //（去程 1.5s + 回程 1.5s），回零落位发 tween_done；到站信号
+            // 入口直接再起程（信号入口可发补间 —— 两入口同权；一个脚本
+            // 只有一个入口：on 或 every，语法冻结见 S6 文本脚本语法）。
+            Node(
+                name: "box2_arm",
+                kind: "Script",
+                props: { "source": "init { armed = 0 }\nevery { if armed < 1 { armed = 1; tween_pos \"box2\" 360.0 88.0 1500 \"ease_out\" \"yoyo\" } }" },
+                children: [],
+            ),
+            Node(
+                name: "box2_rearm",
+                kind: "Script",
+                props: { "source": "on \"tween_done\" { tween_pos \"box2\" 360.0 88.0 1500 \"ease_out\" \"yoyo\" }" },
                 children: [],
             ),
             // 标记脑（信号入口）：手写逐帧步进对照（真实项目旧写法）——

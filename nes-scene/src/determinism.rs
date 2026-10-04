@@ -5,9 +5,9 @@
 //! 进哈希的只有**语义状态**：树级（帧号/暂停/时间缩放）、按**前序**的
 //! 节点序列（名字/类型/父（前序下标）/本地变换（逐字段 f32 位形）/
 //! process_mode/生命周期位/属性表（BTreeMap 名序））、脚本局部
-//!（按节点前序、局部名 BTree 序）、以及**位置补间登记表**（S16 起，
-//! 条件混入：登记表非空才摺进 —— 目标 uid + from/to/elapsed/duration
-//! 位形；无补间场景的指纹与旧口径逐位相同）。
+//!（按节点前序、局部名 BTree 序）、以及**补间登记表**（S16 起，条件
+//! 混入：登记表非空才摺进 —— 目标 uid + 通道/from/to/缓动/模式/
+//! elapsed/duration 位形；无补间场景的指纹与旧口径逐位相同）。
 //!
 //! **绝不进**：GPU 句柄、指针、分配地址、HashMap 迭代布局、HWND、
 //! 时间戳 —— 那些是"机器一样才相同"的伪确定性。世界变换缓存不进
@@ -186,14 +186,15 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
         h = mix(h, b"|"); // 节点分隔
     }
 
-    // 补间登记表（S16 第 1 期）—— **条件混入**：补间是游戏可见状态
-    //（每 tick 直写节点 local），登记表本身必须可复现、进指纹；但采样
-    // 面做成"有补间才摺进" —— 无补间的场景（登记表空）零混入，既有
-    // 基线指纹逐位不变（S16 冻结：基线漂移即为实现错误）。
+    // 补间登记表（S16 第 1 期；S16.1 起三通道 + 缓动/模式）—— **条件混入**：
+    // 补间是游戏可见状态（每 tick 直写节点 local/属性），登记表本身必须可
+    // 复现、进指纹；但采样面做成"有补间才摺进" —— 无补间的场景（登记表空）
+    // 零混入，既有基线指纹逐位不变（S16 冻结：基线漂移即为实现错误）。
     // 字段口径：目标锚定 **uid**（与节点身份同源 —— 句柄位形/gen 是
     // allocator 历史不进指纹；死目标按全 1 位形规范 Dead 态如实混入，
-    // 推进阶段理应已自动清，这里是防御口径）；from/to/elapsed/duration
-    // 取位形（f32/f64 逐位 —— 与本地变换同一口径）。
+    // 推进阶段理应已自动清，这里是防御口径）；通道标签 + from/to 位形
+    //（f32 逐位 —— 与本地变换同一口径）+ 缓动/模式稳定名 + elapsed/
+    // duration 位形（f64 逐位）。
     let tweens = tree.tweens();
     if !tweens.is_empty() {
         h = mix(h, b"tweens");
@@ -204,10 +205,22 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
                 .map(|u| u.bits())
                 .unwrap_or([0xFF; 16]);
             h = mix(h, &target_uid);
-            h = mix(h, &tw.from.x.to_bits().to_le_bytes());
-            h = mix(h, &tw.from.y.to_bits().to_le_bytes());
-            h = mix(h, &tw.to.x.to_bits().to_le_bytes());
-            h = mix(h, &tw.to.y.to_bits().to_le_bytes());
+            h = mix(h, tw.channel.kind().as_bytes());
+            match &tw.channel {
+                crate::tree::TweenChannel::Pos { from, to }
+                | crate::tree::TweenChannel::Scale { from, to } => {
+                    h = mix(h, &from.x.to_bits().to_le_bytes());
+                    h = mix(h, &from.y.to_bits().to_le_bytes());
+                    h = mix(h, &to.x.to_bits().to_le_bytes());
+                    h = mix(h, &to.y.to_bits().to_le_bytes());
+                }
+                crate::tree::TweenChannel::Alpha { from, to } => {
+                    h = mix(h, &from.to_bits().to_le_bytes());
+                    h = mix(h, &to.to_bits().to_le_bytes());
+                }
+            }
+            h = mix(h, tw.easing.as_str().as_bytes());
+            h = mix(h, tw.mode.as_str().as_bytes());
             h = mix(h, &tw.elapsed_ms.to_bits().to_le_bytes());
             h = mix(h, &tw.duration_ms.to_bits().to_le_bytes());
         }

@@ -19,7 +19,7 @@
 //! tick(delta)
 //!   ├─ 1.    apply_pending     结构变更统一落地（上一帧累积的全部 TreeOp）
 //!   ├─ 1.5  timer 递减        每节点倒计时（S10-1）
-//!   ├─ 1.75 tween 推进        位置补间直写 local（S16；先于一切脚本）
+//!   ├─ 1.75 tween 推进        补间（pos/scale/alpha）直写树状态（S16/S16.1；先于一切脚本）
 //!   ├─ 2.    enter_tree        自顶向下，仅新入树节点
 //!   ├─ 3.    ready             自底向上（逆前序），仅新就绪节点
 //!   ├─ 4.    process           自顶向下，全树
@@ -463,8 +463,8 @@ pub enum Cmd {
         /// 视频键。
         key: String,
     },
-    /// 请求对目标节点发起一次位置补间（S16 第 1 期；`tween_pos "name" x y ms`
-    /// 的编译产物）。
+    /// 请求对目标节点发起一次位置补间（S16 第 1 期；`tween_pos "name" x y ms
+    /// ["easing"] ["mode"]` 的编译产物）。
     ///
     /// 与 PlaySound/VideoPlay 的"树无法解释才外送"不同：补间登记表本来
     /// 就是树状态 —— 本命令**直接操作登记表**（不走单帧取走缓冲）。
@@ -480,9 +480,46 @@ pub enum Cmd {
         /// 时长毫秒（<= 0 的请求落地处拒收：非法请求不落地，不编造
         /// "瞬时移动"语义 —— 解析期字面量已报错，这里是运行时兜底）。
         duration_ms: f64,
+        /// 缓动函数（S16.1；解析期缺省 = linear）。
+        easing: TweenEasing,
+        /// 播放模式（S16.1；解析期缺省 = once）。
+        mode: TweenMode,
     },
-    /// 请求移除目标节点的位置补间（S16；`tween_stop "name"` 的编译产物）。
-    /// 位置停在当前值（登记丢弃，local 不动）。
+    /// 请求对目标节点发起一次缩放补间（S16.1；`tween_scale "name" sx sy ms
+    /// ["easing"] ["mode"]` 的编译产物）。写 `Transform2D.scale`（x/y 各自
+    /// 按同一插值量推进）；`from` = 落地时该节点当前实际 scale。
+    /// last-wins 按（节点，scale 通道）二元组 —— 与 pos 通道互不干扰。
+    TweenScale {
+        /// 目标节点。
+        node: NodeId,
+        /// 终点（local scale，x/y 两轴）。
+        to: Vec2,
+        /// 时长毫秒（同 [`Cmd::TweenPos`] 的拒收口径）。
+        duration_ms: f64,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
+    /// 请求对目标节点发起一次透明度补间（S16.1；`tween_alpha "name" a ms
+    /// ["easing"] ["mode"]` 的编译产物）。写 Sprite2D 的 `alpha` 属性
+    ///（0..1，经既有属性写路径 —— alpha 是真实树状态，进语义指纹）。
+    /// 目标不是 Sprite2D 时登记照常、写入静默无效（与属性写错同家法）。
+    TweenAlpha {
+        /// 目标节点。
+        node: NodeId,
+        /// 终点（alpha；非有限值落地处拒收，越界值夹到 0..1）。
+        to: f32,
+        /// 时长毫秒（同 [`Cmd::TweenPos`] 的拒收口径）。
+        duration_ms: f64,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
+    /// 请求移除目标节点的**全部通道**补间（S16 第 1 期起；`tween_stop
+    /// "name"` 的编译产物）。S16.1 起通道有 pos/scale/alpha 三种 ——
+    /// 停 = 三通道登记一并丢弃，各通道停在当前值（local/属性不动）。
     TweenStop {
         /// 目标节点。
         node: NodeId,
@@ -646,16 +683,66 @@ impl<'a> NodeCtx<'a> {
     ///（[`Cmd::TweenPos`]）。补间不写树形状、只推 local —— 与"process
     /// 入口只写自身"的 SetT 纪律不同权：本命令走登记表（树状态），
     /// 两入口同权（照 play/emit 口径）。`from` 在 Cmd 落地时采样。
-    pub fn tween_pos(&mut self, node: NodeId, to: Vec2, duration_ms: f64) {
+    pub fn tween_pos(
+        &mut self,
+        node: NodeId,
+        to: Vec2,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
         self.cmds.push(Cmd::TweenPos {
             node,
             to,
             duration_ms,
+            easing,
+            mode,
         });
     }
 
-    /// 移除任意节点的位置补间（S16）：入既有 Cmd 流（[`Cmd::TweenStop`]），
-    /// 位置停在当前值。两入口同权。
+    /// 对任意节点发起一次缩放补间（S16.1）：入既有 Cmd 流
+    ///（[`Cmd::TweenScale`]），写 `Transform2D.scale`。与 pos 通道并存
+    /// 互不干扰（last-wins 按（节点，通道）二元组）。两入口同权。
+    pub fn tween_scale(
+        &mut self,
+        node: NodeId,
+        sx: f32,
+        sy: f32,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        self.cmds.push(Cmd::TweenScale {
+            node,
+            to: Vec2::new(sx, sy),
+            duration_ms,
+            easing,
+            mode,
+        });
+    }
+
+    /// 对任意节点发起一次透明度补间（S16.1）：入既有 Cmd 流
+    ///（[`Cmd::TweenAlpha`]），写 Sprite2D 的 `alpha` 属性（经既有属性
+    /// 写路径，进语义指纹）。两入口同权。
+    pub fn tween_alpha(
+        &mut self,
+        node: NodeId,
+        a: f32,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        self.cmds.push(Cmd::TweenAlpha {
+            node,
+            to: a,
+            duration_ms,
+            easing,
+            mode,
+        });
+    }
+
+    /// 移除任意节点的补间（S16；S16.1 起 = **全部通道**）：入既有 Cmd 流
+    ///（[`Cmd::TweenStop`]），各通道停在当前值。两入口同权。
     pub fn tween_stop(&mut self, node: NodeId) {
         self.cmds.push(Cmd::TweenStop { node });
     }
@@ -954,15 +1041,64 @@ impl<'a> SignalCtx<'a> {
 
     /// 对任意节点发起一次位置补间（S16 第 1 期；与 [`NodeCtx::tween_pos`]
     /// 同一条 Cmd 通道 —— 信号入口照发不误）。
-    pub fn tween_pos(&mut self, node: NodeId, to: Vec2, duration_ms: f64) {
+    pub fn tween_pos(
+        &mut self,
+        node: NodeId,
+        to: Vec2,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
         self.cmds.push(Cmd::TweenPos {
             node,
             to,
             duration_ms,
+            easing,
+            mode,
         });
     }
 
-    /// 移除任意节点的位置补间（S16；与 [`NodeCtx::tween_stop`] 同通道）。
+    /// 对任意节点发起一次缩放补间（S16.1；与 [`NodeCtx::tween_scale`]
+    /// 同通道）。
+    pub fn tween_scale(
+        &mut self,
+        node: NodeId,
+        sx: f32,
+        sy: f32,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        self.cmds.push(Cmd::TweenScale {
+            node,
+            to: Vec2::new(sx, sy),
+            duration_ms,
+            easing,
+            mode,
+        });
+    }
+
+    /// 对任意节点发起一次透明度补间（S16.1；与 [`NodeCtx::tween_alpha`]
+    /// 同通道）。
+    pub fn tween_alpha(
+        &mut self,
+        node: NodeId,
+        a: f32,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        self.cmds.push(Cmd::TweenAlpha {
+            node,
+            to: a,
+            duration_ms,
+            easing,
+            mode,
+        });
+    }
+
+    /// 移除任意节点的补间（S16；S16.1 起 = 全部通道；与
+    /// [`NodeCtx::tween_stop`] 同通道）。
     pub fn tween_stop(&mut self, node: NodeId) {
         self.cmds.push(Cmd::TweenStop { node });
     }
@@ -1144,13 +1280,15 @@ pub struct SceneTree {
     /// [`Self::take_video_cmds`] 取走转交渲染侧播放状态机。不进语义
     /// 指纹；无人取走即自然蒸发。
     video_cmds: Vec<VideoCmd>,
-    /// 位置补间登记表（S16 第 1 期）：按登记序的 [`Tween`] 列表。
+    /// 补间登记表（S16 第 1 期 = 位置；S16.1 起三通道）：按登记序的
+    /// [`Tween`] 列表。
     ///
     /// 与 `played_sounds`/`video_cmds` 的取走缓冲**不同家**：补间是
-    /// **游戏可见状态**（每 tick 直写节点 local），登记表本身是树状态
-    /// —— 进语义指纹（条件混入：有补间才摺进哈希）、不进序列化
-    ///（会话态：保存时进行中的补间丢弃，位置字段已是最新，无损）。
-    /// last-wins：同一目标的重复登记前者被替换；目标死亡自动清。
+    /// **游戏可见状态**（每 tick 直写节点 local/属性），登记表本身是树
+    /// 状态 —— 进语义指纹（条件混入：有补间才摺进哈希）、不进序列化
+    ///（会话态：保存时进行中的补间丢弃，各通道字段已是最新，无损）。
+    /// last-wins 按（节点，通道）二元组：同目标同通道的重复登记前者被
+    /// 替换（不同通道并存）；目标死亡自动清。
     tweens: Vec<Tween>,
 }
 
@@ -1170,35 +1308,207 @@ pub enum VideoCmd {
     },
 }
 
-/// 一次进行中的**位置补间**（S16 第 1 期）：把 `target` 的本地平移从
-/// `from` 线性推向 `to`，时长 `duration_ms`。
+/// 补间缓动函数（S16.1）：推进阶段把线性进度 t（0..1）先过一遍形状函数
+/// 得 te，插值用 te。**纯函数、单点实现**（[`TweenEasing::apply`]）；
+/// 集合冻结 5 个 —— linear 与 S16 第 1 期逐位相同（恒等），其余四个是
+/// 加性成员。自定义贝塞尔归后续里程碑（S16.1 §5）。
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TweenEasing {
+    /// 线性（缺省；S16 第 1 期既有行为，恒等函数）。
+    Linear,
+    /// 平滑步进：t*t*(3-2t)。
+    Smoothstep,
+    /// 缓入：t²。
+    EaseIn,
+    /// 缓出：1-(1-t)²。
+    EaseOut,
+    /// 缓入缓出：t<0.5 ? 2t² : 1-2(1-t)²。
+    EaseInOut,
+}
+
+impl TweenEasing {
+    /// 稳定字符串名（脚本面拼写，**不得**随重构改名）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Smoothstep => "smoothstep",
+            Self::EaseIn => "ease_in",
+            Self::EaseOut => "ease_out",
+            Self::EaseInOut => "ease_in_out",
+        }
+    }
+
+    /// 从稳定字符串名还原；未知值返回 `None`（解析层如实报错并附合法名单）。
+    pub fn from_str_exact(s: &str) -> Option<Self> {
+        match s {
+            "linear" => Some(Self::Linear),
+            "smoothstep" => Some(Self::Smoothstep),
+            "ease_in" => Some(Self::EaseIn),
+            "ease_out" => Some(Self::EaseOut),
+            "ease_in_out" => Some(Self::EaseInOut),
+            _ => None,
+        }
+    }
+
+    /// 合法名单（解析期报错文案 + 文档口径同源）。
+    pub const LEGAL: &'static [&'static str] = &[
+        "linear",
+        "smoothstep",
+        "ease_in",
+        "ease_out",
+        "ease_in_out",
+    ];
+
+    /// 形状函数：t（0..1）-> te（0..1）。f64 域计算、调用点转 f32 插值
+    /// —— linear 恒等返回，既有补间轨迹逐位不变。
+    pub fn apply(self, t: f64) -> f64 {
+        match self {
+            Self::Linear => t,
+            Self::Smoothstep => t * t * (3.0 - 2.0 * t),
+            Self::EaseIn => t * t,
+            Self::EaseOut => {
+                let u = 1.0 - t;
+                1.0 - u * u
+            }
+            Self::EaseInOut => {
+                if t < 0.5 {
+                    2.0 * t * t
+                } else {
+                    let u = 1.0 - t;
+                    1.0 - 2.0 * u * u
+                }
+            }
+        }
+    }
+}
+
+/// 补间播放模式（S16.1）：once（缺省）/ yoyo / loop。
 ///
-/// # 语义冻结（S16 §1）
+/// - **once**：单程（S16 第 1 期既有行为）；t 到 1 落位 to、移除、发到站信号；
+/// - **yoyo**：t 到 1 后反向播放回 from；回到 0 才落位 from 并移除
+///   （总时长 = 2×duration）；完成时发到站信号；
+/// - **loop**：无限循环（进度对 duration 取模）——**永不自动移除**、
+///   **永不完成**（到站信号不发；停用走 `tween_stop`，停在当前值）。
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TweenMode {
+    /// 单程（缺省）。
+    Once,
+    /// 往返：去程 to、回程 from，回零才移除。
+    Yoyo,
+    /// 无限循环（永不移除、永不到站）。
+    Loop,
+}
+
+impl TweenMode {
+    /// 稳定字符串名（脚本面拼写，**不得**随重构改名）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Yoyo => "yoyo",
+            Self::Loop => "loop",
+        }
+    }
+
+    /// 从稳定字符串名还原；未知值返回 `None`（解析层如实报错并附合法名单）。
+    pub fn from_str_exact(s: &str) -> Option<Self> {
+        match s {
+            "once" => Some(Self::Once),
+            "yoyo" => Some(Self::Yoyo),
+            "loop" => Some(Self::Loop),
+            _ => None,
+        }
+    }
+
+    /// 合法名单。
+    pub const LEGAL: &'static [&'static str] = &["once", "yoyo", "loop"];
+}
+
+/// 补间通道（S16.1）：一个补间登记推**一个**通道；同一目标节点的三个
+/// 通道可并存互不干扰 —— last-wins 按（节点，通道）二元组裁决。
+#[derive(Clone, Debug, PartialEq)]
+pub enum TweenChannel {
+    /// 本地平移（S16 第 1 期的正主）：写 `Transform2D.pos`。
+    Pos {
+        /// 起点（登记落地时该节点的当前 local pos）。
+        from: Vec2,
+        /// 终点。
+        to: Vec2,
+    },
+    /// 本地缩放（S16.1）：写 `Transform2D.scale`（x/y 按同一插值量各自推进）。
+    Scale {
+        /// 起点（登记落地时的当前 scale）。
+        from: Vec2,
+        /// 终点。
+        to: Vec2,
+    },
+    /// 透明度（S16.1）：写 Sprite2D 的 `alpha` 属性（0..1，经既有属性
+    /// 写路径 —— alpha 是真实树状态，进语义指纹）。
+    Alpha {
+        /// 起点（登记落地时的当前 alpha，缺省 1.0）。
+        from: f32,
+        /// 终点（落地处已夹到 0..1）。
+        to: f32,
+    },
+}
+
+impl TweenChannel {
+    /// 通道稳定名（指纹混入 + 诊断用）。
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Pos { .. } => "pos",
+            Self::Scale { .. } => "scale",
+            Self::Alpha { .. } => "alpha",
+        }
+    }
+
+    /// 通道种类是否相同（last-wins 的二元组裁决项；起终点不参与）。
+    fn same_kind(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Pos { .. }, Self::Pos { .. })
+                | (Self::Scale { .. }, Self::Scale { .. })
+                | (Self::Alpha { .. }, Self::Alpha { .. })
+        )
+    }
+}
+
+/// 一次进行中的**补间**（S16 第 1 期 = 位置补间；S16.1 起带通道/缓动/模式）：
+/// 把 `target` 的通道值从 `from` 按缓动曲线推向 `to`，时长 `duration_ms`。
+///
+/// # 语义冻结（S16 §1 + S16.1 §1/§2）
 ///
 /// - **游戏可见状态**：补间登记表是树状态（与音频/视频的"渲染侧、
 ///   不进指纹"不同）—— 推进发生在 [`SceneTree::tick`] 的专属阶段
-///   （结构落地后、`enter` 前），每 tick 直写节点 local（经
-///   [`SceneTree::set_local`] 脏标记路径，世界矩阵照常冲洗），并
-///   **全程进语义指纹**（同 tick 同轨迹必同结果）；
-/// - **last-wins**：同一目标节点的已有位置补间被新补间替换，新起点
-///   = 落地时该节点的**当前实际位置**（不跳变）；
+///   （结构落地后、`enter` 前），每 tick 直写目标节点（pos/scale 经
+///   [`SceneTree::set_local`] 脏标记路径，alpha 经既有属性写路径），
+///   并**全程进语义指纹**（同 tick 同轨迹必同结果）；
+/// - **last-wins 按（节点，通道）二元组**：同目标同通道的已有补间被
+///   新补间替换，新起点 = 落地时该节点的**当前实际值**（不跳变）；
+///   不同通道并存互不干扰；
+/// - **缓动**：线性进度 t 先过 [`TweenEasing::apply`] 得 te，插值用 te
+///   （linear 恒等 —— 既有轨迹逐位不变）；
+/// - **模式**：once 单程；yoyo 总时长 = 2×duration（回零才落 from 并
+///   移除）；loop 永不移除、永不到站（停用走 `tween_stop`）；
+/// - **到站信号**：once/yoyo 完成时引擎发 `tween_done`（载荷 =
+///   [`Value::Str`] 节点名），每通道完成各发一条、次序 = 注册序；
+///   推进阶段在泵前 —— 同 tick 阶段 5 送达；
 /// - `target` 是 [`NodeHandle`]（临时句柄）：结构变更后每 tick resolve，
 ///   失败即移除 —— 死节点的补间自动清，不悬挂；
-/// - 时满（`t >= 1`）落位 `to` 并移除登记 —— 同帧脚本可读到终值
-///   （推进阶段在 process 之前）；
-/// - **会话态**：不进 RON 往返（保存时进行中的补间丢弃；位置字段
+/// - **会话态**：不进 RON 往返（保存时进行中的补间丢弃；各通道字段
 ///   已是最新值，无损）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tween {
     /// 目标节点（句柄形态：每 tick 经 arena resolve，失败自动清）。
     pub target: NodeHandle,
-    /// 起点（登记落地时该节点的当前 local pos）。
-    pub from: Vec2,
-    /// 终点。
-    pub to: Vec2,
+    /// 通道与起终点（S16.1：pos / scale / alpha 三选一）。
+    pub channel: TweenChannel,
+    /// 缓动函数（S16.1；缺省 linear = 既有行为）。
+    pub easing: TweenEasing,
+    /// 播放模式（S16.1；缺省 once = 既有行为）。
+    pub mode: TweenMode,
     /// 已推进毫秒数。
     pub elapsed_ms: f64,
-    /// 总时长毫秒数（<= 0 的请求在落地处拒收，不会出现在登记表里）。
+    /// 单程时长毫秒数（<= 0 的请求在落地处拒收，不会出现在登记表里）。
     pub duration_ms: f64,
 }
 
@@ -1346,8 +1656,9 @@ impl SceneTree {
         self.pending.len()
     }
 
-    /// 位置补间登记表（只读视图，登记序）。语义指纹按此采样；宿主/
-    /// 编辑器检视同入口。会话态：不进序列化（见 [`Tween`] 文档）。
+    /// 补间登记表（只读视图，登记序；S16.1 起含 pos/scale/alpha 三通道）。
+    /// 语义指纹按此采样；宿主/编辑器检视同入口。会话态：不进序列化
+    ///（见 [`Tween`] 文档）。
     pub fn tweens(&self) -> &[Tween] {
         &self.tweens
     }
@@ -2044,13 +2355,21 @@ impl SceneTree {
         // 同一口径；补间的"游戏时间"也走这条缩放，确定性与语义都一致）。
         let scaled_delta = delta * self.time_scale;
 
-        // 1.75 位置补间推进（S16 第 1 期，专属阶段：结构落地后、enter/process
-        //     之前）。补间是游戏可见状态：每 tick 直写目标节点 local（经
-        //     [`Self::set_local`] 脏标记路径，世界矩阵照常在阶段 6 冲洗），
-        //     并全程进语义指纹 —— 同 tick 同轨迹必同结果。
+        // 1.75 补间推进（S16 第 1 期，专属阶段：结构落地后、enter/process
+        //     之前；S16.1 起带缓动/模式/通道）。补间是游戏可见状态：每 tick
+        //     直写目标节点（pos/scale 经 [`Self::set_local`] 脏标记路径，
+        //     alpha 经既有属性写路径，世界矩阵照常在阶段 6 冲洗），并全程
+        //     进语义指纹 —— 同 tick 同轨迹必同结果。
         //     - 死目标（arena 查无/代际失效）：resolve 失败即移除（自动清）；
-        //     - t >= 1：落位 `to` 并移除登记 —— 本帧 process/信号读到的
-        //       就是终值（推进先于脚本）；
+        //     - 线性进度 t 算出后先过缓动（te = ease(t)），插值用 te；
+        //     - once：t >= 1 落位 `to` 并移除登记 —— 本帧 process/信号读到
+        //       的就是终值（推进先于脚本）；
+        //     - yoyo（S16.1）：p = elapsed/duration，位置 = p<1 ? ease(p) :
+        //       ease(2-p)，p >= 2 落位 from 并移除（总时长 = 2×duration）；
+        //     - loop（S16.1）：p 对 1 取模 —— 永不移除、永不到站；
+        //     - 到站信号：once/yoyo 完成时发 `tween_done`（载荷 = 节点名
+        //       Str），每通道完成各发一条、次序 = 注册序；泵前发出 ——
+        //       同 tick 阶段 5 送达；
         //     - 时间口径：`elapsed += delta * time_scale * 1000`（毫秒）；
         //       v1 冻结面不受暂停门控（补间不是 process 派发，是引擎推进
         //       阶段；暂停交互归后续里程碑 —— S16 文档 §5）。
@@ -2058,9 +2377,16 @@ impl SceneTree {
             let dt_ms = scaled_delta as f64 * 1000.0;
             let mut i = 0usize;
             while i < self.tweens.len() {
-                let (target, from, to, elapsed_ms, duration_ms) = {
+                let (target, channel, easing, mode, elapsed_ms, duration_ms) = {
                     let tw = &self.tweens[i];
-                    (tw.target, tw.from, tw.to, tw.elapsed_ms, tw.duration_ms)
+                    (
+                        tw.target,
+                        tw.channel.clone(),
+                        tw.easing,
+                        tw.mode,
+                        tw.elapsed_ms,
+                        tw.duration_ms,
+                    )
                 };
                 let id = target.to_id();
                 // 死节点补间自动清（NodeHandle resolve 失败）。
@@ -2069,24 +2395,45 @@ impl SceneTree {
                     continue;
                 }
                 let elapsed_ms = elapsed_ms + dt_ms;
-                let t = (elapsed_ms / duration_ms).clamp(0.0, 1.0);
-                let mut local = self.nodes.get(id).map(|n| n.local).unwrap_or_default();
-                if t >= 1.0 {
-                    // 时满落位终值并移除（同帧脚本可读终值）。
-                    local.pos = to;
-                    self.set_local(id, local);
-                    self.tweens.remove(i);
-                    continue;
+                match mode {
+                    TweenMode::Once => {
+                        let t = (elapsed_ms / duration_ms).clamp(0.0, 1.0);
+                        if t >= 1.0 {
+                            // 时满落位终值并移除（同帧脚本可读终值）+ 到站信号。
+                            self.land_tween(id, &channel, false);
+                            self.tweens.remove(i);
+                            self.emit_tween_done(id);
+                            continue;
+                        }
+                        let te = easing.apply(t) as f32;
+                        self.apply_tween(id, &channel, te);
+                        self.tweens[i].elapsed_ms = elapsed_ms;
+                        i += 1;
+                    }
+                    TweenMode::Yoyo => {
+                        let p = elapsed_ms / duration_ms;
+                        if p >= 2.0 {
+                            // 回零落位 from 并移除 + 到站信号。
+                            self.land_tween(id, &channel, true);
+                            self.tweens.remove(i);
+                            self.emit_tween_done(id);
+                            continue;
+                        }
+                        let shape = if p < 1.0 { p } else { 2.0 - p };
+                        let te = easing.apply(shape) as f32;
+                        self.apply_tween(id, &channel, te);
+                        self.tweens[i].elapsed_ms = elapsed_ms;
+                        i += 1;
+                    }
+                    TweenMode::Loop => {
+                        // 无限循环：进度对 1 取模；永不移除、永不到站。
+                        let p = (elapsed_ms / duration_ms) % 1.0;
+                        let te = easing.apply(p) as f32;
+                        self.apply_tween(id, &channel, te);
+                        self.tweens[i].elapsed_ms = elapsed_ms;
+                        i += 1;
+                    }
                 }
-                // 位置 = lerp(from, to, t)（f32 域，与 local 同精度）。
-                let tf = t as f32;
-                local.pos = Vec2::new(
-                    from.x + (to.x - from.x) * tf,
-                    from.y + (to.y - from.y) * tf,
-                );
-                self.set_local(id, local);
-                self.tweens[i].elapsed_ms = elapsed_ms;
-                i += 1;
             }
         }
 
@@ -2354,6 +2701,115 @@ impl SceneTree {
 
     // ---------- 内部：不变式维护 ----------
 
+    /// 到站信号（S16.1）：`tween_done`，载荷 = 节点名（[`Value::Str`]）。
+    /// 推进阶段发（泵前）—— 同 tick 阶段 5 送达；loop 永不到站不发。
+    /// `src = None`（引擎源，照 `tree/*` 桥信号口径）。
+    fn emit_tween_done(&mut self, id: NodeId) {
+        let name = self.name(id).unwrap_or_default().to_string();
+        self.emit_signal("tween_done", Value::Str(name));
+    }
+
+    /// 把通道值按插值量 `te`（缓动后的进度，f32 域）写到目标节点。
+    /// pos/scale 走 [`Self::set_local`]（脏标记路径）；alpha 走既有属性
+    /// 写路径（schema 校验 + 夹取 —— alpha 是真实树状态，进语义指纹）。
+    /// 目标没有 alpha 属性（非 Sprite2D）时写入静默无效（照 SetProp 口径）。
+    fn apply_tween(&mut self, id: NodeId, channel: &TweenChannel, te: f32) {
+        match channel {
+            TweenChannel::Pos { from, to } => {
+                let mut local = self.nodes.get(id).map(|n| n.local).unwrap_or_default();
+                local.pos = Vec2::new(
+                    from.x + (to.x - from.x) * te,
+                    from.y + (to.y - from.y) * te,
+                );
+                self.set_local(id, local);
+            }
+            TweenChannel::Scale { from, to } => {
+                let mut local = self.nodes.get(id).map(|n| n.local).unwrap_or_default();
+                local.scale = Vec2::new(
+                    from.x + (to.x - from.x) * te,
+                    from.y + (to.y - from.y) * te,
+                );
+                self.set_local(id, local);
+            }
+            TweenChannel::Alpha { from, to } => {
+                let v = from + (to - from) * te;
+                let _ = self.set_prop(id, "alpha", Value::F32(v));
+            }
+        }
+    }
+
+    /// 完成落位：once 落 `to`（`from_side = false`）、yoyo 回零落 `from`
+    ///（`from_side = true`）—— 精确写终值（不经插值，f32 乘法不引入误差，
+    /// 与 S16 第 1 期"时满落位"同一口径）。
+    fn land_tween(&mut self, id: NodeId, channel: &TweenChannel, from_side: bool) {
+        match channel {
+            TweenChannel::Pos { from, to } => {
+                let end = if from_side { *from } else { *to };
+                let mut local = self.nodes.get(id).map(|n| n.local).unwrap_or_default();
+                local.pos = end;
+                self.set_local(id, local);
+            }
+            TweenChannel::Scale { from, to } => {
+                let end = if from_side { *from } else { *to };
+                let mut local = self.nodes.get(id).map(|n| n.local).unwrap_or_default();
+                local.scale = end;
+                self.set_local(id, local);
+            }
+            TweenChannel::Alpha { from, to } => {
+                let end = if from_side { *from } else { *to };
+                let _ = self.set_prop(id, "alpha", Value::F32(end));
+            }
+        }
+    }
+
+    /// 补间登记（S16 第 1 期；S16.1 起三通道共用一条路径）：`from` 在
+    /// **落地时**采样、last-wins 按（节点，通道）二元组替换、非法请求
+    /// 拒收不落地。返回 `true` = 已登记。
+    fn register_tween(
+        &mut self,
+        node: NodeId,
+        channel: TweenChannel,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) -> bool {
+        // 非法请求不落地（解析期字面量已报错，这里兜底运行时非法值 ——
+        // 不编造"瞬时补间"语义；与属性写错静默同家法）。
+        if duration_ms <= 0.0 || !duration_ms.is_finite() {
+            return false;
+        }
+        if !self.nodes.contains(node) {
+            return false;
+        }
+        // alpha 终点越界夹到 0..1（schema 口径）；非有限值拒收。
+        let channel = match channel {
+            TweenChannel::Alpha { to, from } => {
+                if !to.is_finite() {
+                    return false;
+                }
+                TweenChannel::Alpha {
+                    from,
+                    to: to.clamp(0.0, 1.0),
+                }
+            }
+            other => other,
+        };
+        // last-wins：同目标**同通道**先移除，再按登记序追加（不同通道并存）。
+        let target = NodeHandle::of(node);
+        let kind = channel.clone();
+        self.tweens
+            .retain(|tw| !(tw.target == target && tw.channel.same_kind(&kind)));
+        self.tweens.push(Tween {
+            target,
+            channel,
+            easing,
+            mode,
+            elapsed_ms: 0.0,
+            duration_ms,
+        });
+        true
+    }
+
     fn next_order(&mut self) -> u64 {
         self.order_seq = self.order_seq.wrapping_add(1);
         self.order_seq
@@ -2400,6 +2856,8 @@ impl SceneTree {
                 node,
                 to,
                 duration_ms,
+                easing,
+                mode,
             } => {
                 // 补间登记（S16 第 1 期）：登记表是树状态，Cmd 直接操作 ——
                 // 不走单帧取走缓冲（与 PlaySound/VideoPlay 的"树无法解释才
@@ -2408,28 +2866,72 @@ impl SceneTree {
                 //   命令发射后的当下（回调 Cmd 即刻落地），此时该节点的 local
                 //   含本帧补间推进（推进阶段 1.75 先于 process/信号泵）——
                 //   last-wins 换程从当前实际位置起算，不跳变；
-                // - 死节点：静默丢弃（与 SetLocal 同口径）；
-                // - duration <= 0：拒收（解析期字面量已报错，这里兜底运行时
-                //   非法值 —— 非法请求不落地，不编造"瞬时移动"）。
-                if duration_ms <= 0.0 || !duration_ms.is_finite() {
-                    return;
-                }
-                let Some(nd) = self.nodes.get(node) else {
-                    return;
-                };
-                let from = Vec2::new(nd.local.pos.x, nd.local.pos.y);
-                // last-wins：同目标已有补间先移除，再按登记序追加。
-                self.tweens.retain(|tw| tw.target != NodeHandle::of(node));
-                self.tweens.push(Tween {
-                    target: NodeHandle::of(node),
-                    from,
-                    to,
-                    elapsed_ms: 0.0,
+                // - 死节点 / duration <= 0：静默丢弃（登记路径统一兜底，
+                //   见 [`Self::register_tween`]）。
+                let from = self
+                    .nodes
+                    .get(node)
+                    .map(|nd| Vec2::new(nd.local.pos.x, nd.local.pos.y))
+                    .unwrap_or_default();
+                self.register_tween(
+                    node,
+                    TweenChannel::Pos { from, to },
                     duration_ms,
-                });
+                    easing,
+                    mode,
+                );
+            }
+            Cmd::TweenScale {
+                node,
+                to,
+                duration_ms,
+                easing,
+                mode,
+            } => {
+                // 缩放通道（S16.1）：与 pos 同一登记纪律 —— from = 落地时
+                // 当前实际 scale；last-wins 只替换同通道（pos 并存不冲突）。
+                let from = self
+                    .nodes
+                    .get(node)
+                    .map(|nd| Vec2::new(nd.local.scale.x, nd.local.scale.y))
+                    .unwrap_or_default();
+                self.register_tween(
+                    node,
+                    TweenChannel::Scale { from, to },
+                    duration_ms,
+                    easing,
+                    mode,
+                );
+            }
+            Cmd::TweenAlpha {
+                node,
+                to,
+                duration_ms,
+                easing,
+                mode,
+            } => {
+                // 透明度通道（S16.1）：from = 落地时当前 alpha 属性（缺失/
+                // 非有限按缺省 1.0 —— 与 schema 缺省及渲染中性 tint 同口径）。
+                let from = self
+                    .prop(node, "alpha")
+                    .and_then(|v| match v {
+                        Value::F32(f) => Some(*f),
+                        Value::I64(i) => Some(*i as f32),
+                        _ => None,
+                    })
+                    .map(|f| if f.is_finite() { f } else { 1.0 })
+                    .unwrap_or(1.0);
+                self.register_tween(
+                    node,
+                    TweenChannel::Alpha { from, to },
+                    duration_ms,
+                    easing,
+                    mode,
+                );
             }
             Cmd::TweenStop { node } => {
-                // 停补间：登记丢弃，位置停在当前值（local 不动）。
+                // 停补间（S16.1 起语义 = 全部通道）：登记丢弃，各通道停在
+                // 当前值（local/属性不动）。
                 self.tweens.retain(|tw| tw.target != NodeHandle::of(node));
             }
         }

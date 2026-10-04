@@ -215,6 +215,9 @@ fn kind_of(cmd: &RenderCommand) -> &'static str {
         // 计数/定位（任务 4 起 Button/TextInput/ListView/Tabs 恒下发，
         // 本文件断言只按种类计数/定位，不受影响）。
         RenderCommand::SetClip { .. } => "set_clip",
+        // S16.1（alpha 通道）新增的 SetTint：同上 —— 只补枚举臂恢复可编译，
+        // 精灵恒推（criterion_extract 的 alpha 用例专钉）。
+        RenderCommand::SetTint { .. } => "set_tint",
     }
 }
 

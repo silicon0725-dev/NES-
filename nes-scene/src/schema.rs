@@ -299,6 +299,15 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 H::None,
                 "垂直翻转。",
             ),
+            PropDesc::new(
+                "alpha",
+                ValueType::F32,
+                Value::F32(1.0),
+                H::Number { min: 0.0, max: 1.0, step: 0.01 },
+                "不透明度（0 透明 .. 1 不透明）。S16.1 加性 schema：缺省 1.0 \
+                 —— 渲染侧 tint 乘 255/255 = 恒等，无补间场景的观感与指纹外的\
+                 语义逐位不变（指纹采样面含本键，见 S16.1 文档 §2 基线重录）。",
+            ),
         ],
         NodeKindTag::Camera2D => vec![
             PropDesc::new(
@@ -613,8 +622,19 @@ mod tests {
             ]
         );
         let names: Vec<&str> = s.props().iter().map(|p| p.name()).collect();
-        assert_eq!(names, vec!["visible", "timer", "z_index", "texture", "flip_h", "flip_v"]);
-        assert_eq!(s.len(), 6);
+        assert_eq!(
+            names,
+            vec![
+                "visible",
+                "timer",
+                "z_index",
+                "texture",
+                "flip_h",
+                "flip_v",
+                "alpha"
+            ]
+        );
+        assert_eq!(s.len(), 7);
     }
 
     #[test]

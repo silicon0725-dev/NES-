@@ -27,7 +27,8 @@ use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 /// 5. **顺序固定**：生命周期动作（按发生顺序）→ `SetCamera`（若有）→ 各渲染物
 ///    的 `SetTransform` / `SetFlip` / `SetZ` / `SetVisible` →（Label 则追加
 ///    `SetText`）→（List 则追加 `SetList`）→（Control 则追加 `SetRect`，随后
-///    **按需**追加 `SetClip` —— 裁剪恒在 `SetRect` 之后）→ `Submit`；
+///    **按需**追加 `SetClip` —— 裁剪恒在 `SetRect` 之后）→（有 tint 簿记则
+///    追加 `SetTint`，S16.1 —— 恒在 `SetClip` 之后）→ `Submit`；
 /// 6. **属性流是全量快照**：不做"仅变化时推送"的增量省略，后端无需维护跨帧 diff。
 ///
 /// # 对象安全
@@ -80,6 +81,15 @@ pub trait RenderServer {
     /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
     /// - 本属性恒在对应条目的 `set_rect` 之后推送。
     fn set_clip(&mut self, handle: ItemHandle, rect: Option<Rect>);
+
+    /// 设置相乘色（S16.1 alpha 通道的契约扩展；RGBA8 直 alpha）。
+    ///
+    /// - 语义 = E-1 相乘色（采样色 x tint），但作为独立属性命令：精灵没有
+    ///   自己的颜色字段，alpha 通道经此进入；
+    /// - 同键覆写（全量快照/跨帧幂等）；条目销毁时随条目消亡；
+    /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
+    /// - 输出序恒在对应条目的 `set_clip` 之后。
+    fn set_tint(&mut self, handle: ItemHandle, rgba: [u8; 4]);
 
     /// 生成本帧命令序列写入 `out`（**先清空** `out`）。
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>);

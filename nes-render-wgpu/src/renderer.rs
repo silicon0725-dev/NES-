@@ -229,6 +229,9 @@ pub struct WgpuRenderServer {
     /// 裁剪簿记（E-2 / D1，与 `NullRenderServer` 同构）：`Some(rect)` 存、
     /// `None`/销毁移除；`submit_into` 在对应条目的 `SetRect` 之后追加 `SetClip`。
     clips: BTreeMap<ItemHandle, Rect>,
+    /// 相乘色簿记（S16.1 alpha 通道，与 `NullRenderServer` 同构）：同键覆写、
+    /// 销毁移除；`submit_into` 在对应条目的 `SetClip` 之后追加 `SetTint`。
+    tints: BTreeMap<ItemHandle, [u8; 4]>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
 }
@@ -287,6 +290,7 @@ impl RenderServer for WgpuRenderServer {
         self.lists.remove(&handle);
         self.rects.remove(&handle);
         self.clips.remove(&handle);
+        self.tints.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
     }
 
@@ -353,6 +357,15 @@ impl RenderServer for WgpuRenderServer {
         }
     }
 
+    fn set_tint(&mut self, handle: ItemHandle, rgba: [u8; 4]) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1 口径）。
+            return;
+        }
+        // 同键覆写（全量快照语义，S16.1 alpha 通道）。
+        self.tints.insert(handle, rgba);
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空（契约 I3：缓冲跨帧复用，不留上一帧残留）。
         out.clear();
@@ -413,6 +426,15 @@ impl RenderServer for WgpuRenderServer {
                     rect: Some(*clip),
                 });
             }
+            // 相乘色（S16.1 alpha 通道）：恒在 SetClip 之后（契约 I5 顺序
+            // 冻结；与 `NullRenderServer` 严格同序）。仅当该条目存在 tint
+            // 簿记时追加。
+            if let Some(rgba) = self.tints.get(&item.handle) {
+                out.push(RenderCommand::SetTint {
+                    handle: item.handle,
+                    rgba: *rgba,
+                });
+            }
         }
 
         // 5) 帧结束标记（契约 I3：末条必为 Submit）。
@@ -432,7 +454,8 @@ pub struct FrameStats {
     /// `DestroyItem` 命中数。
     pub destroys: u64,
     /// 命中已知句柄的属性命令数（`SetTransform` / `SetFlip` / `SetZ` /
-    /// `SetVisible` / `SetText` / `SetList` / `SetRect` / `SetClip`）。
+    /// `SetVisible` / `SetText` / `SetList` / `SetRect` / `SetClip` /
+    /// `SetTint`）。
     pub updates: u64,
     /// 因空句柄 / 未知句柄被静默忽略的命令数（契约 I1 的可观测计数）。
     pub ignored: u64,
@@ -1131,6 +1154,10 @@ pub struct CommandConsumer {
     /// 有 `SetList` 状态的渲染物按行/页签展开成字形序列（笔起点 = 矩形
     /// 左上 + 4 内衬，行 y 随 `ListState::scroll` 平移）。
     lists: BTreeMap<ItemHandle, ListState>,
+    /// 跨帧相乘色登记表（`SetTint` 建/覆写、`DestroyItem` 删；S16.1 alpha
+    /// 通道）。精灵实例的 tint 从中性改查此表 —— 无记录 = 中性恒等
+    ///（与 E-1 之前的像素逐位相同）。
+    tints: BTreeMap<ItemHandle, [u8; 4]>,
     /// 字体登记表：资源键 -> 排版参数（字形表本体作为纹理住在注册表里）。
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
@@ -1227,6 +1254,7 @@ impl CommandConsumer {
             rects: BTreeMap::new(),
             texts: BTreeMap::new(),
             lists: BTreeMap::new(),
+            tints: BTreeMap::new(),
             fonts: BTreeMap::new(),
             ttf: None,
             glyph_atlas: GlyphAtlas::default(),
@@ -1616,6 +1644,16 @@ impl CommandConsumer {
         Ok(FrameOutcome { image, stats })
     }
 
+    /// 精灵实例的相乘色（S16.1 alpha 通道）：查跨帧 tint 簿记，无记录 =
+    /// 中性恒等 —— 与 E-1 之前的像素逐位相同。字形/控件实例不查此表
+    ///（颜色各走契约字段 `LabelState::color` / `ControlState::fill` 等）。
+    fn sprite_tint(&self, handle: ItemHandle) -> [f32; 4] {
+        match self.tints.get(&handle) {
+            Some(rgba) => SpriteInstance::tint_of(*rgba),
+            None => [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+
     /// 把一整条命令流绘制到一个渲染目标视图上（离屏与表面路径共用）。
     ///
     /// `viewport_size` 是相机缺位/禁用时的回退视口（像素）。条目表跨帧持有，
@@ -1650,6 +1688,7 @@ impl CommandConsumer {
                         self.rects.remove(handle);
                         self.texts.remove(handle);
                         self.lists.remove(handle);
+                        self.tints.remove(handle);
                         stats.destroys += 1;
                     } else {
                         stats.ignored += 1;
@@ -1732,6 +1771,17 @@ impl CommandConsumer {
                 RenderCommand::SetList { handle, rows } => {
                     if self.items.contains_key(handle) {
                         self.lists.insert(*handle, rows.clone());
+                        stats.updates += 1;
+                    } else {
+                        stats.ignored += 1;
+                    }
+                }
+                // SetTint：登记相乘色（S16.1 alpha 通道）。精灵实例的 tint
+                // 按此覆写（无记录 = 中性恒等）；已知句柄同键覆写，未知句柄
+                // 静默忽略（契约 I1 口径）。
+                RenderCommand::SetTint { handle, rgba } => {
+                    if self.items.contains_key(handle) {
+                        self.tints.insert(*handle, *rgba);
                         stats.updates += 1;
                     } else {
                         stats.ignored += 1;
@@ -2100,7 +2150,8 @@ impl CommandConsumer {
                     world: item.world_transform().to_array(),
                     uv_rect,
                     source: [layer as f32, 1.0],
-                    tint: [1.0, 1.0, 1.0, 1.0],
+                    // S16.1：tint 查跨帧簿记（无记录 = 中性恒等，逐位不变）。
+                    tint: self.sprite_tint(item.handle),
                     clip: item_clip,
                 });
                 stats.from_registry += 1;
@@ -2110,7 +2161,8 @@ impl CommandConsumer {
                     world: item.world_transform().to_array(),
                     uv_rect: cell_uv_rect(item.key),
                     source: [0.0, 0.0],
-                    tint: [1.0, 1.0, 1.0, 1.0],
+                    // S16.1：同上 —— 图集格路径同样查 tint 簿记。
+                    tint: self.sprite_tint(item.handle),
                     clip: item_clip,
                 });
             }

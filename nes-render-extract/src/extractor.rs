@@ -80,6 +80,8 @@ pub const PROP_TEXTURE: &str = "texture";
 pub const PROP_FLIP_H: &str = "flip_h";
 /// `Sprite2D` 的垂直翻转属性名。
 pub const PROP_FLIP_V: &str = "flip_v";
+/// `Sprite2D` 的不透明度属性名（S16.1 alpha 通道；schema 缺省 1.0）。
+pub const PROP_ALPHA: &str = "alpha";
 /// `Node2D` 的层号属性名（已裁决：`set_z` 的 `z` 取此属性）。
 pub const PROP_Z_INDEX: &str = "z_index";
 /// 通用节点的可见性属性名。
@@ -417,11 +419,14 @@ impl RenderExtractor {
                 }
             }
 
-            // 类型专属属性：Label 的文本状态 / Control 的锚点状态 / List
-            // 的行状态。命令流里的输出序由服务端冻结（SetText → SetList
-            // → SetRect → SetClip），推送侧的调用次序不影响命令流。
+            // 类型专属属性：Sprite 的相乘色（S16.1 alpha 通道）/ Label 的
+            // 文本状态 / Control 的锚点状态 / List 的行状态。命令流里的输出
+            // 序由服务端冻结（SetText → SetList → SetRect → SetClip →
+            // SetTint），推送侧的调用次序不影响命令流。
             match &admission {
-                Admission::Sprite(_) => {}
+                // S16.1：精灵 alpha 属性乘进实例 tint（RGB 恒中性白，只动
+                // A —— 缺省 1.0 → 255/255 = 恒等，无 alpha 场景逐位不变）。
+                Admission::Sprite(_) => server.set_tint(handle, sprite_tint_rgba(tree, node)),
                 Admission::Label(_, text) => server.set_text(handle, text),
                 Admission::Control(_, layout) => server.set_rect(handle, layout),
                 // 按钮摊平（S12.0 §2.1）：单节点单渲染物，rect + text
@@ -511,7 +516,8 @@ fn is_camera(tree: &SceneTree, node: NodeId) -> bool {
 /// `Control` 的可迭代资源池是空的，身份由"路径 + 节点类型名"确定性导出）。
 /// 载荷在这里一次解析完，推送阶段直接原样交给后端，不重复读属性。
 enum Admission {
-    /// 精灵：键来自纹理资源槽位；无类型专属推送项（变换 / flip 走通用路径）。
+    /// 精灵：键来自纹理资源槽位；类型专属推送项 = 相乘色（S16.1 alpha
+    /// 通道 —— `alpha` 属性乘进 tint 的 A，缺省恒等）。
     Sprite(RenderAssetKey),
     /// 文字：键由节点身份派生；载荷是备齐的排版参数。
     Label(RenderAssetKey, LabelState),
@@ -943,6 +949,18 @@ fn tuple2_prop(tree: &SceneTree, node: NodeId, name: &str, default: (f32, f32)) 
 fn texture_res(tree: &SceneTree, node: NodeId) -> Option<ResId> {
     tree.prop(node, PROP_TEXTURE)
         .and_then(ResId::from_value)
+}
+
+/// 精灵相乘色（S16.1 alpha 通道）：alpha 属性乘进 tint 的 A 通道
+///（RGB 恒中性白 —— 提取层不改采样色，只动不透明度）。
+///
+/// 缺省/非有限按 1.0 处理、越界夹到 0..1（与 schema 的 clamp 同口径）；
+/// `rgba = [255, 255, 255, (alpha * 255) as u8]` —— alpha = 1.0 时
+/// 255/255 = 恒等，无 alpha 场景的像素逐位不变（S16.1 基线论证的根）。
+fn sprite_tint_rgba(tree: &SceneTree, node: NodeId) -> [u8; 4] {
+    let a = f32_prop(tree, node, PROP_ALPHA, 1.0);
+    let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
+    [255, 255, 255, (a * 255.0) as u8]
 }
 
 /// 取布尔属性（缺失 → `default`）。

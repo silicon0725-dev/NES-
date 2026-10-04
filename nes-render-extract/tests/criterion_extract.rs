@@ -1016,10 +1016,10 @@ mod bookkeeping {
         let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 1);
         assert_synced(&ex, &srv, &stats);
 
-        // 3 条 CreateItem + 3×4 条属性 + 1 条 Submit。
+        // 3 条 CreateItem + 3×5 条属性（4 通用 + S16.1 SetTint）+ 1 条 Submit。
         assert_eq!(count_creates(&out), 3);
         assert_eq!(count_transforms(&out), 3);
-        assert_eq!(out.len(), 3 + 3 * 4 + 1);
+        assert_eq!(out.len(), 3 + 3 * 5 + 1);
         assert!(
             matches!(out.last(), Some(RenderCommand::Submit { .. })),
             "命令流必须以 Submit 收尾"
@@ -1167,4 +1167,69 @@ mod bookkeeping {
         assert_eq!(stats.pushed, 0);
         assert_eq!((stats.created, stats.destroyed), (0, 0));
     }
+}
+
+// ---------------------------------------------------------------- S16.1 alpha 通道
+
+/// T-A-01（渲染侧簿记）：Sprite2D 的 `alpha` 属性乘进实例 tint（extractor
+/// 推 `SetTint`；RGB 恒中性白只动 A）——缺省 1.0 = 255/255 恒等；条目销毁
+/// 随之清理（无悬垂）。输出序冻结：SetTint 在 SetClip 同段之后。
+#[test]
+fn alpha_channel_pushes_set_tint() {
+    let keys = KeyMap::new();
+    keys.set(ResId::new(1), key(1, 1));
+
+    let mut tree = SceneTree::new("root");
+    let sprite = add_root_sprite(&mut tree, "s1", ResId::new(1));
+
+    let mut ex = RenderExtractor::new();
+    let mut srv = NullRenderServer::new();
+    let mut out = Vec::new();
+
+    // 缺省 alpha = 1.0：SetTint = [255,255,255,255]（恒等 —— 无 alpha 场景
+    // 像素逐位不变的根）。
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 1);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(stats.pushed, 1);
+    let handle = ex.handle_of(sprite).expect("已建条目");
+    let tint_cmd = out.iter().find(|c| matches!(c, RenderCommand::SetTint { .. }))
+        .expect("精灵每帧必推 SetTint");
+    assert_eq!(
+        tint_cmd,
+        &RenderCommand::SetTint { handle, rgba: [255, 255, 255, 255] },
+        "缺省 alpha = 恒等 tint"
+    );
+    assert_eq!(srv.tint_of(handle), Some(&[255u8, 255, 255, 255]));
+
+    // alpha = 0.5：A = (0.5 * 255) as u8 = 127；RGB 不动。输出序：本条目
+    // SetTint 在 SetClip 段之后（无裁剪物 = 全帧唯一 SetTint 尾随属性）。
+    set_prop(&mut tree, sprite, "alpha", Value::F32(0.5));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 2);
+    assert_synced(&ex, &srv, &stats);
+    let tint_cmd = out.iter().find(|c| matches!(c, RenderCommand::SetTint { .. }))
+        .expect("alpha 变更帧仍推 SetTint");
+    assert_eq!(
+        tint_cmd,
+        &RenderCommand::SetTint { handle, rgba: [255, 255, 255, 127] },
+        "alpha 0.5 乘进 A 通道"
+    );
+    // 越界夹取（schema 0..1）：2.0 -> 255。
+    set_prop(&mut tree, sprite, "alpha", Value::F32(2.0));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 3);
+    assert_synced(&ex, &srv, &stats);
+    let tint_cmd = out.iter().find(|c| matches!(c, RenderCommand::SetTint { .. }))
+        .expect("夹取帧仍推 SetTint");
+    assert_eq!(
+        tint_cmd,
+        &RenderCommand::SetTint { handle, rgba: [255, 255, 255, 255] },
+        "alpha 越界夹到 1.0 = 恒等"
+    );
+
+    // 资源消失 -> 条目销毁 -> tint 簿记随之清理（不悬垂）。
+    keys.remove(ResId::new(1));
+    advance(&mut tree);
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 4);
+    assert_synced(&ex, &srv, &stats);
+    assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetTint { .. })));
+    assert_eq!(srv.tint_of(handle), None, "销毁随条目清理");
 }

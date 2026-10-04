@@ -36,7 +36,7 @@ use std::rc::Rc;
 use crate::identity::{NodeHandle, NodeId};
 use crate::node::NodeKindTag;
 use crate::transform::Vec2;
-use crate::tree::{NodeCtx, SceneObserver, SceneTree, Signal, SignalCtx};
+use crate::tree::{NodeCtx, SceneObserver, SceneTree, Signal, SignalCtx, TweenEasing, TweenMode};
 use crate::value::Value;
 
 /// 单次运行的最大指令步数（Jump 循环保护：停机并记 `__halt`，不挂帧）。
@@ -177,24 +177,54 @@ pub enum Op {
         /// 视频键。
         key: String,
     },
-    /// 位置补间（S16 第 1 期）：`tween_pos "name" x y ms` 的编译产物。
+    /// 位置补间（S16 第 1 期；S16.1 起带缓动/模式）：`tween_pos "name" x y ms
+    /// ["easing"] ["mode"]` 的编译产物。
     ///
     /// 栈交互：先压 x、y、ms 三个表达式（各自独立求值，编译序 = 源序），
     /// 本指令按**弹序 ms、y、x** 消费（须全为数值）；目标 `name` 是编译期
     /// 常量，运行时按 NodeByName 语义解析（找不到 = 停机记录，照既有纪律）。
-    /// 执行 = 经 [`VmCtx::tween_pos`] 发 [`crate::tree::Cmd::TweenPos`] 入
-    /// 既有 Cmd 流 —— 登记表是树状态，Cmd 直接落地（不走单帧取走缓冲）；
+    /// ms 后可跟 0-2 个可选字符串字面量（第一 = 缓动名、第二 = 模式名，
+    /// 解析期校验 —— 未知名报错附合法名单；缺省 linear / once）。执行 =
+    /// 经 [`VmCtx::tween_pos`] 发 [`crate::tree::Cmd::TweenPos`] 入既有
+    /// Cmd 流 —— 登记表是树状态，Cmd 直接落地（不走单帧取走缓冲）；
     /// `from` 在 Cmd 落地时采样该节点当前 local pos（S16 §1 冻结）。
     /// 字面量 `ms <= 0` 在**解析期**报错（T-TW-04）；运行时算出的非法值由
     /// 树侧拒收（不落地、不停机 —— 与属性写错静默同家法）。
     TweenPos {
         /// 目标节点名（NodeByName 语义）。
         name: String,
+        /// 缓动函数（S16.1；缺省 linear）。
+        easing: TweenEasing,
+        /// 播放模式（S16.1；缺省 once）。
+        mode: TweenMode,
     },
-    /// 停止位置补间（S16）：`tween_stop "name"` 的编译产物。**零栈交互**
-    ///（照 `play` 形态）；执行 = 经 [`VmCtx::tween_stop`] 发
-    /// [`crate::tree::Cmd::TweenStop`]，位置停在当前值。目标解析同上
-    ///（找不到 = 停机记录 —— 目标名写错应如实暴露，与 tween_pos 一致）。
+    /// 缩放补间（S16.1）：`tween_scale "name" sx sy ms ["easing"] ["mode"]`
+    /// 的编译产物。栈交互与 [`Op::TweenPos`] 同构（弹序 ms、sy、sx）；
+    /// 写 `Transform2D.scale`，与 pos 通道并存互不干扰。
+    TweenScale {
+        /// 目标节点名。
+        name: String,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
+    /// 透明度补间（S16.1）：`tween_alpha "name" a ms ["easing"] ["mode"]`
+    /// 的编译产物。栈交互同构（弹序 ms、a）；写 Sprite2D 的 `alpha`
+    /// 属性（0..1，经既有属性写路径 —— 进语义指纹）。
+    TweenAlpha {
+        /// 目标节点名。
+        name: String,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
+    /// 停止补间（S16；S16.1 起 = 该节点**全部通道**）：`tween_stop "name"`
+    /// 的编译产物。**零栈交互**（照 `play` 形态）；执行 = 经
+    /// [`VmCtx::tween_stop`] 发 [`crate::tree::Cmd::TweenStop`]，各通道
+    /// 停在当前值。目标解析同上（找不到 = 停机记录 —— 目标名写错应
+    /// 如实暴露，与 tween_pos 一致）。
     TweenStop {
         /// 目标节点名（NodeByName 语义）。
         name: String,
@@ -315,16 +345,54 @@ impl VmCtx<'_, '_> {
         }
     }
 
-    /// 位置补间（S16 第 1 期）：两入口同权（照 `play_sound` 的口径 ——
-    /// 补间走树侧登记表，不碰"process 只写自身"纪律的形状面）。
-    fn tween_pos(&mut self, node: NodeId, to: Vec2, duration_ms: f64) {
+    /// 位置补间（S16 第 1 期；S16.1 起带缓动/模式）：两入口同权（照
+    /// `play_sound` 的口径 —— 补间走树侧登记表，不碰"process 只写自身"
+    /// 纪律的形状面）。
+    fn tween_pos(
+        &mut self,
+        node: NodeId,
+        to: Vec2,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
         match self {
-            VmCtx::Node(c) => c.tween_pos(node, to, duration_ms),
-            VmCtx::Signal(c) => c.tween_pos(node, to, duration_ms),
+            VmCtx::Node(c) => c.tween_pos(node, to, duration_ms, easing, mode),
+            VmCtx::Signal(c) => c.tween_pos(node, to, duration_ms, easing, mode),
         }
     }
 
-    /// 停止位置补间（S16）：两入口同权。
+    /// 缩放补间（S16.1）：两入口同权。
+    fn tween_scale(
+        &mut self,
+        node: NodeId,
+        to: Vec2,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        match self {
+            VmCtx::Node(c) => c.tween_scale(node, to.x, to.y, duration_ms, easing, mode),
+            VmCtx::Signal(c) => c.tween_scale(node, to.x, to.y, duration_ms, easing, mode),
+        }
+    }
+
+    /// 透明度补间（S16.1）：两入口同权。
+    fn tween_alpha(
+        &mut self,
+        node: NodeId,
+        a: f32,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        match self {
+            VmCtx::Node(c) => c.tween_alpha(node, a, duration_ms, easing, mode),
+            VmCtx::Signal(c) => c.tween_alpha(node, a, duration_ms, easing, mode),
+        }
+    }
+
+    /// 停止补间（S16；S16.1 起 = 全部通道）：两入口同权。
     fn tween_stop(&mut self, node: NodeId) {
         match self {
             VmCtx::Node(c) => c.tween_stop(node),
@@ -878,12 +946,13 @@ fn run<'a, 'b>(
             Op::VideoStop { key } => {
                 ctx.video_stop(key);
             }
-            Op::TweenPos { name } => {
-                // tween_pos "name" x y ms（S16 第 1 期）：弹序 ms、y、x
-                //（压序 x、y、ms —— 编译序 = 源序）。三个分量都须数值
-                //（I64/F32 提升）；目标按 NodeByName 语义解析，找不到
-                // 停机记录（照既有纪律）。duration 的非法值（<= 0/非有限）
-                // 由树侧落地处拒收（不停机 —— 与属性写错静默同家法）。
+            Op::TweenPos { name, easing, mode } => {
+                // tween_pos "name" x y ms ["easing"] ["mode"]（S16；S16.1 缓动/
+                // 模式）：弹序 ms、y、x（压序 x、y、ms —— 编译序 = 源序）。
+                // 三个分量都须数值（I64/F32 提升）；目标按 NodeByName 语义
+                // 解析，找不到停机记录（照既有纪律）。duration 的非法值
+                //（<= 0/非有限）由树侧落地处拒收（不停机 —— 与属性写错
+                // 静默同家法）。缓动/模式是编译期常量（解析期校验）。
                 let ms = pop_val!();
                 let yv = pop_val!();
                 let xv = pop_val!();
@@ -894,10 +963,39 @@ fn run<'a, 'b>(
                 let Some(node) = ctx.tree().find_by_name(name) else {
                     halt!(format!("tween_pos(\"{name}\") 找不到该名节点"));
                 };
-                ctx.tween_pos(node, Vec2::new(x, y), ms as f64);
+                ctx.tween_pos(node, Vec2::new(x, y), ms as f64, *easing, *mode);
+            }
+            Op::TweenScale { name, easing, mode } => {
+                // tween_scale "name" sx sy ms ["easing"] ["mode"]（S16.1）：
+                // 与 TweenPos 同构 —— 弹序 ms、sy、sx；写 Transform2D.scale。
+                let ms = pop_val!();
+                let syv = pop_val!();
+                let sxv = pop_val!();
+                let (Some(sx), Some(sy), Some(ms)) = (num_of(&sxv), num_of(&syv), num_of(&ms))
+                else {
+                    halt!("tween_scale 需要数值 sx sy ms");
+                };
+                let Some(node) = ctx.tree().find_by_name(name) else {
+                    halt!(format!("tween_scale(\"{name}\") 找不到该名节点"));
+                };
+                ctx.tween_scale(node, Vec2::new(sx, sy), ms as f64, *easing, *mode);
+            }
+            Op::TweenAlpha { name, easing, mode } => {
+                // tween_alpha "name" a ms ["easing"] ["mode"]（S16.1）：弹序
+                // ms、a；写 Sprite2D 的 alpha 属性（越界由树侧落地处夹取）。
+                let ms = pop_val!();
+                let av = pop_val!();
+                let (Some(a), Some(ms)) = (num_of(&av), num_of(&ms)) else {
+                    halt!("tween_alpha 需要数值 a ms");
+                };
+                let Some(node) = ctx.tree().find_by_name(name) else {
+                    halt!(format!("tween_alpha(\"{name}\") 找不到该名节点"));
+                };
+                ctx.tween_alpha(node, a, ms as f64, *easing, *mode);
             }
             Op::TweenStop { name } => {
-                // tween_stop "name"（S16）：零栈交互，目标解析同 TweenPos。
+                // tween_stop "name"（S16；S16.1 起 = 全部通道）：零栈交互，
+                // 目标解析同 TweenPos。
                 let Some(node) = ctx.tree().find_by_name(name) else {
                     halt!(format!("tween_stop(\"{name}\") 找不到该名节点"));
                 };
@@ -1431,7 +1529,10 @@ impl SceneObserver for ScriptVm {
 //     emit "tick" (1.0, 0.0)         // 发射（名 + 载荷；Vec2 字面量仅数字）
 //     play "boom"                    // 播放声音（S13 第 2 期；语句级，无载荷）
 //     tween_pos "box" 360 40 1500    // 位置补间（S16；x/y/ms 各一表达式）
-//     tween_stop "box"               // 停止补间（位置停在当前值）
+//     tween_pos "b" 8 40 1500 "ease_out" "yoyo"   // S16.1：可选缓动 + 模式
+//     tween_scale "b" 2.0 2.0 800    // 缩放补间（S16.1；与 pos 通道并存）
+//     tween_alpha "b" 0.5 600        // 透明度补间（S16.1；写 Sprite2D.alpha）
+//     tween_stop "box"               // 停止补间（S16.1 起 = 该节点全部通道）
 // }
 // ```
 //
@@ -1713,9 +1814,10 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 20] = [
+const RESERVED: [&str; 22] = [
     "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
     "arg", "this", "true", "false", "play", "video_play", "video_stop", "tween_pos", "tween_stop",
+    "tween_scale", "tween_alpha",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -1786,6 +1888,41 @@ impl TextParser {
             Tok::Str(s) => Ok(s),
             _ => Err(self.err_here("期望字符串字面量")),
         }
+    }
+
+    /// 补间语句的可选尾缀（S16.1）：ms 表达式之后至多两个字符串字面量
+    ///（第一 = 缓动名、第二 = 模式名）。缺省 linear / once；未知名解析期
+    /// 如实报错并附合法名单（拼写错误不该静默降级成 linear）。
+    fn opt_easing_mode(&mut self) -> Result<(TweenEasing, TweenMode), ParseError> {
+        let mut easing = TweenEasing::Linear;
+        let mut mode = TweenMode::Once;
+        for slot in 0..2 {
+            if !matches!(self.peek().tok, Tok::Str(_)) {
+                break;
+            }
+            let s = self.expect_str()?;
+            match slot {
+                0 => match TweenEasing::from_str_exact(&s) {
+                    Some(e) => easing = e,
+                    None => {
+                        return Err(self.err_here(format!(
+                            "未知缓动名 \"{s}\"（合法名单：{}）",
+                            TweenEasing::LEGAL.join(", ")
+                        )))
+                    }
+                },
+                _ => match TweenMode::from_str_exact(&s) {
+                    Some(m) => mode = m,
+                    None => {
+                        return Err(self.err_here(format!(
+                            "未知模式名 \"{s}\"（合法名单：{}）",
+                            TweenMode::LEGAL.join(", ")
+                        )))
+                    }
+                },
+            }
+        }
+        Ok((easing, mode))
     }
 
     /// script := ["init" "{" stmts "}"] ("on" STRING | "every") "{" stmts "}"
@@ -2257,11 +2394,13 @@ impl TextParser {
                 ops.push(Op::VideoStop { key });
                 Ok(())
             }
-            // tween_pos 语句（S16 第 1 期）：`tween_pos "name" x y ms` ——
-            // 目标名是编译期常量（照 play 的解析样式）；x/y/ms 各是独立
-            // 表达式（运行时求值，arg/局部都可用），压序 = 源序。字面量
-            // ms <= 0（含一元负号形态）在**解析期**如实报错（T-TW-04）；
-            // 非字面量的非法值由树侧落地处拒收（运行时兜底）。
+            // tween_pos 语句（S16 第 1 期；S16.1 起带可选缓动/模式）：
+            // `tween_pos "name" x y ms ["easing"] ["mode"]` —— 目标名与
+            // 缓动/模式是编译期常量（照 play 的解析样式；两个可选尾缀是
+            // 字符串字面量，未知名解析期如实报错并附合法名单）；x/y/ms
+            // 各是独立表达式（运行时求值，arg/局部都可用），压序 = 源序。
+            // 字面量 ms <= 0（含一元负号形态）在**解析期**如实报错
+            //（T-TW-04）；非字面量的非法值由树侧落地处拒收（运行时兜底）。
             Tok::Ident(k) if k == "tween_pos" => {
                 self.pos += 1;
                 let name = self.expect_str()?;
@@ -2286,11 +2425,75 @@ impl TextParser {
                         return Err(self.err_here(format!("tween_pos 的 ms 必须 > 0（得到 {ms}）")));
                     }
                 }
-                ops.push(Op::TweenPos { name });
+                let (easing, mode) = self.opt_easing_mode()?;
+                ops.push(Op::TweenPos { name, easing, mode });
                 Ok(())
             }
-            // tween_stop 语句（S16）：`tween_stop "name"` —— 与 play 同一
-            // 解析样式（语句级关键字 + 字符串字面量；零栈交互）。
+            // tween_scale 语句（S16.1）：`tween_scale "name" sx sy ms
+            // ["easing"] ["mode"]` —— 与 tween_pos 同构（弹序 ms、sy、sx；
+            // 写 Transform2D.scale，与 pos 通道并存互不干扰）。
+            Tok::Ident(k) if k == "tween_scale" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                self.expr(ops)?; // sx
+                self.expr(ops)?; // sy
+                let ms_at = ops.len();
+                self.expr(ops)?; // ms
+                let lit_ms = match &ops[ms_at..] {
+                    [Op::Const(Value::I64(i))] => Some(*i as f64),
+                    [Op::Const(Value::F32(f))] => Some(*f as f64),
+                    [Op::Const(Value::I64(0)), Op::Const(Value::I64(n)), Op::Sub] => {
+                        Some(-(*n as f64))
+                    }
+                    [Op::Const(Value::I64(0)), Op::Const(Value::F32(f)), Op::Sub] => {
+                        Some(-(*f as f64))
+                    }
+                    _ => None,
+                };
+                if let Some(ms) = lit_ms {
+                    if ms <= 0.0 {
+                        return Err(
+                            self.err_here(format!("tween_scale 的 ms 必须 > 0（得到 {ms}）"))
+                        );
+                    }
+                }
+                let (easing, mode) = self.opt_easing_mode()?;
+                ops.push(Op::TweenScale { name, easing, mode });
+                Ok(())
+            }
+            // tween_alpha 语句（S16.1）：`tween_alpha "name" a ms ["easing"]
+            // ["mode"]` —— 栈交互同构（弹序 ms、a；写 Sprite2D 的 alpha
+            // 属性，0..1 越界由树侧夹取）。
+            Tok::Ident(k) if k == "tween_alpha" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                self.expr(ops)?; // a
+                let ms_at = ops.len();
+                self.expr(ops)?; // ms
+                let lit_ms = match &ops[ms_at..] {
+                    [Op::Const(Value::I64(i))] => Some(*i as f64),
+                    [Op::Const(Value::F32(f))] => Some(*f as f64),
+                    [Op::Const(Value::I64(0)), Op::Const(Value::I64(n)), Op::Sub] => {
+                        Some(-(*n as f64))
+                    }
+                    [Op::Const(Value::I64(0)), Op::Const(Value::F32(f)), Op::Sub] => {
+                        Some(-(*f as f64))
+                    }
+                    _ => None,
+                };
+                if let Some(ms) = lit_ms {
+                    if ms <= 0.0 {
+                        return Err(
+                            self.err_here(format!("tween_alpha 的 ms 必须 > 0（得到 {ms}）"))
+                        );
+                    }
+                }
+                let (easing, mode) = self.opt_easing_mode()?;
+                ops.push(Op::TweenAlpha { name, easing, mode });
+                Ok(())
+            }
+            // tween_stop 语句（S16；S16.1 起 = 全部通道）：`tween_stop "name"`
+            // —— 与 play 同一解析样式（语句级关键字 + 字符串字面量；零栈交互）。
             Tok::Ident(k) if k == "tween_stop" => {
                 self.pos += 1;
                 let name = self.expect_str()?;
