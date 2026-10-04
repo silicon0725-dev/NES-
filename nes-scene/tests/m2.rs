@@ -101,7 +101,12 @@ fn criterion_1_properties_are_reflectable() {
             "texture",
             "flip_h",
             "flip_v",
-            "alpha"
+            "alpha",
+            // S16.2 加性 schema（图集帧动画）：三键缺省全 0 = 整图现状
+            //（协议内枚举面扩展，同 S16.1 alpha 先例）。
+            "sheet_cols",
+            "sheet_rows",
+            "frame"
         ]
     );
 

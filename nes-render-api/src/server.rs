@@ -28,7 +28,8 @@ use crate::state::{Camera2DState, ControlState, Flip, LabelState, ListState};
 ///    的 `SetTransform` / `SetFlip` / `SetZ` / `SetVisible` →（Label 则追加
 ///    `SetText`）→（List 则追加 `SetList`）→（Control 则追加 `SetRect`，随后
 ///    **按需**追加 `SetClip` —— 裁剪恒在 `SetRect` 之后）→（有 tint 簿记则
-///    追加 `SetTint`，S16.1 —— 恒在 `SetClip` 之后）→ `Submit`；
+///    追加 `SetTint`，S16.1 —— 恒在 `SetClip` 之后）→（有 uv 簿记则追加
+///    `SetUv`，S16.2 —— 恒在 `SetTint` 之后）→ `Submit`；
 /// 6. **属性流是全量快照**：不做"仅变化时推送"的增量省略，后端无需维护跨帧 diff。
 ///
 /// # 对象安全
@@ -90,6 +91,16 @@ pub trait RenderServer {
     /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
     /// - 输出序恒在对应条目的 `set_clip` 之后。
     fn set_tint(&mut self, handle: ItemHandle, rgba: [u8; 4]);
+
+    /// 设置子矩形采样（S16.2 图集帧动画；归一化 UV 矩形 `[u0, v0, us, vs]`）。
+    ///
+    /// - 语义 = 注册表纹理的归一化子矩形（`[0, 0, 1, 1]` = 恒等 =
+    ///   既有整瓦片采样），后端拿注册表实际尺寸折算成采样坐标；
+    /// - 同键覆写（全量快照/跨帧幂等）；条目销毁时随条目消亡；
+    /// - 空句柄 / 未知句柄被静默忽略（契约 I1 口径）；
+    /// - 输出序恒在对应条目的 `set_tint` 之后；
+    /// - 后端只在注册表精灵分支消费（图集格 / 字形 / 控件路径不受影响）。
+    fn set_uv(&mut self, handle: ItemHandle, rect: [f32; 4]);
 
     /// 生成本帧命令序列写入 `out`（**先清空** `out`）。
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>);

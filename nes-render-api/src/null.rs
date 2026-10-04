@@ -3,7 +3,8 @@
 //! 它做三件事，都是后端契约的可执行参照：
 //!
 //! 1. 按 [`RenderServer`] 的不变式生成**确定性命令流**（可当"后端该怎么接"的样例）；
-//! 2. 把副作用真的落在内存里（`items` / `labels` / `rects` / `clips` / `camera`），
+//! 2. 把副作用真的落在内存里（`items` / `labels` / `rects` / `clips` /
+//!    `tints` / `uvs` / `camera`），
 //!    让测试能断言"推送被正确保存"，而不只是"没 panic"；
 //! 3. 记计数器（创建/销毁/被忽略的操作/帧数/命令数），把"空句柄被忽略"
 //!    这类静默行为变成**可观测**的事实 —— 静默而不可观测的吞错最难查。
@@ -50,6 +51,9 @@ pub struct NullRenderServer {
     /// 相乘色簿记（S16.1 alpha 通道）：`set_tint` 存（同键覆写）、销毁移除。
     /// 有 tint 的条目在 `submit_into` 输出序里于 `SetClip` 之后追加 `SetTint`。
     tints: BTreeMap<ItemHandle, [u8; 4]>,
+    /// 子矩形采样簿记（S16.2 图集帧动画）：`set_uv` 存（同键覆写）、销毁移除。
+    /// 有 uv 的条目在 `submit_into` 输出序里于 `SetTint` 之后追加 `SetUv`。
+    uvs: BTreeMap<ItemHandle, [f32; 4]>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
     counters: ServerCounters,
@@ -106,6 +110,11 @@ impl NullRenderServer {
         self.tints.get(&handle)
     }
 
+    /// 取渲染物的子矩形采样（S16.2；未设置返回 `None` —— 无记录 = 整瓦片）。
+    pub fn uv_of(&self, handle: ItemHandle) -> Option<&[f32; 4]> {
+        self.uvs.get(&handle)
+    }
+
     /// 当前相机。
     pub fn camera(&self) -> Option<&Camera2DState> {
         self.camera.as_ref()
@@ -145,6 +154,7 @@ impl RenderServer for NullRenderServer {
         self.rects.remove(&handle);
         self.clips.remove(&handle);
         self.tints.remove(&handle);
+        self.uvs.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
         self.counters.destroyed += 1;
     }
@@ -235,6 +245,16 @@ impl RenderServer for NullRenderServer {
         self.tints.insert(handle, rgba);
     }
 
+    fn set_uv(&mut self, handle: ItemHandle, rect: [f32; 4]) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1），计数器使其可观测。
+            self.counters.ignored_ops += 1;
+            return;
+        }
+        // 同键覆写（全量快照语义）。
+        self.uvs.insert(handle, rect);
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空：缓冲跨帧复用，绝不留上一帧的残留。
         out.clear();
@@ -301,6 +321,15 @@ impl RenderServer for NullRenderServer {
                 out.push(RenderCommand::SetTint {
                     handle: item.handle,
                     rgba: *rgba,
+                });
+            }
+            // 子矩形采样（S16.2）：恒在 SetTint 之后（契约 I5 顺序冻结；
+            // 与 wgpu 后端严格同序）。仅当该条目存在 uv 簿记时追加 ——
+            // 无记录 = 整瓦片采样，命令流与既有路径逐条相同。
+            if let Some(rect) = self.uvs.get(&item.handle) {
+                out.push(RenderCommand::SetUv {
+                    handle: item.handle,
+                    rect: *rect,
                 });
             }
         }

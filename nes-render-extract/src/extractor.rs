@@ -20,7 +20,8 @@
 //!        │
 //!        ▼
 //!   set_transform / set_flip / set_z / set_visible          全量属性快照
-//!   （Label 追加 set_text、Control 追加 set_rect；Sprite2D 无追加项）
+//!   （Label 追加 set_text、Control 追加 set_rect；Sprite2D 追加
+//!   set_tint（S16.1 alpha）与图集帧激活时的 set_uv（S16.2））
 //!        │
 //!        ▼
 //!   retain_seen()：本帧没见过的条目全部 destroy_item          ← 节点删除 / 子树摘除
@@ -82,6 +83,12 @@ pub const PROP_FLIP_H: &str = "flip_h";
 pub const PROP_FLIP_V: &str = "flip_v";
 /// `Sprite2D` 的不透明度属性名（S16.1 alpha 通道；schema 缺省 1.0）。
 pub const PROP_ALPHA: &str = "alpha";
+/// `Sprite2D` 的图集列数属性名（S16.2 图集帧动画；0 = 整图模式）。
+pub const PROP_SHEET_COLS: &str = "sheet_cols";
+/// `Sprite2D` 的图集行数属性名（S16.2；0 = 正方形网格，行数 = 列数）。
+pub const PROP_SHEET_ROWS: &str = "sheet_rows";
+/// `Sprite2D` 的图集帧索引属性名（S16.2；行主序，越界模运算回绕）。
+pub const PROP_FRAME: &str = "frame";
 /// `Node2D` 的层号属性名（已裁决：`set_z` 的 `z` 取此属性）。
 pub const PROP_Z_INDEX: &str = "z_index";
 /// 通用节点的可见性属性名。
@@ -422,7 +429,7 @@ impl RenderExtractor {
             // 类型专属属性：Sprite 的相乘色（S16.1 alpha 通道）/ Label 的
             // 文本状态 / Control 的锚点状态 / List 的行状态。命令流里的输出
             // 序由服务端冻结（SetText → SetList → SetRect → SetClip →
-            // SetTint），推送侧的调用次序不影响命令流。
+            // SetTint → SetUv），推送侧的调用次序不影响命令流。
             match &admission {
                 // S16.1：精灵 alpha 属性乘进实例 tint（RGB 恒中性白，只动
                 // A —— 缺省 1.0 → 255/255 = 恒等，无 alpha 场景逐位不变）。
@@ -459,6 +466,22 @@ impl RenderExtractor {
             }
             if self.map.take_clipped(node, wants_clip) == Some(true) && !wants_clip {
                 server.set_clip(handle, None);
+            }
+            // —— S16.2 图集帧动画：Sprite 的子矩形采样（同帧只对 Sprite 生效
+            //    —— sheet 属性是 Sprite2D 独有；与 tint 同一"全量快照"口径，
+            //    仅图集模式激活时逐帧重发，非激活帧不发命令）。uv 簿记跨帧
+            //    持久，**激活 → 整图迁移帧补推一次恒等矩形**（`[0,0,1,1]` =
+            //    整瓦片，渲染侧折算逐位还原）—— 与上面裁剪的 Some→None 补推
+            //    同一条生产者侧义务。
+            if matches!(admission, Admission::Sprite(_)) {
+                let sheet = sprite_sheet_uv_rect(tree, node);
+                let wants_uv = sheet.is_some();
+                if let Some(rect) = sheet {
+                    server.set_uv(handle, rect);
+                }
+                if self.map.take_uv_active(node, wants_uv) == Some(true) && !wants_uv {
+                    server.set_uv(handle, [0.0, 0.0, 1.0, 1.0]);
+                }
             }
             stats.pushed += 1;
         }
@@ -915,11 +938,19 @@ pub fn compose_flip(world: Affine2, flip: Flip) -> Affine2 {
 /// 取数值属性（缺失 / 类型不对 → `default`），`F32` 与 `I64` 都认。
 ///
 /// 两种都要认不是宽容，是场景层的实情：`font_size` 在 schema 里声明为 `I64`
-/// （编辑器给的是整数步进），`zoom` 声明为 `F32`。只认 `F32` 会让"用户在
+///（编辑器给的是整数步进），`zoom` 声明为 `F32`。只认 `F32` 会让"用户在
 /// 场景里把字号改成 32"被静默忽略成缺省 16 —— 属性读不到就是属性丢失。
 fn f32_prop(tree: &SceneTree, node: NodeId, name: &str, default: f32) -> f32 {
     tree.prop(node, name)
         .and_then(|value| value.as_f32().or_else(|| value.as_i64().map(|v| v as f32)))
+        .unwrap_or(default)
+}
+
+/// 取整数属性（缺失 / 类型不对 → `default`；`I64` 直读、`F32` 截断 ——
+/// 与 [`f32_prop`] 的双向兼容同一实情：编辑器整数步进 + 前向兼容写入面）。
+fn i64_prop(tree: &SceneTree, node: NodeId, name: &str, default: i64) -> i64 {
+    tree.prop(node, name)
+        .and_then(|value| value.as_i64().or_else(|| value.as_f32().map(|v| v as i64)))
         .unwrap_or(default)
 }
 
@@ -961,6 +992,41 @@ fn sprite_tint_rgba(tree: &SceneTree, node: NodeId) -> [u8; 4] {
     let a = f32_prop(tree, node, PROP_ALPHA, 1.0);
     let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
     [255, 255, 255, (a * 255.0) as u8]
+}
+
+/// Sprite2D 的图集子矩形（S16.2 图集帧动画）：`sheet_cols > 0` 时按
+/// `frame` 算出该帧的**归一化 UV 矩形** `[u0, v0, us, vs]`；整图模式
+///（`sheet_cols <= 0`）返回 `None` —— 不推 `SetUv`，既有整瓦片采样
+/// 逐位不变。
+///
+/// # 折算方案（选型：归一化网格分数，渲染侧折算像素）
+///
+/// 帧矩形是均匀网格的**纯分数**：`u0 = col/cols`、`us = 1/cols`（v 同理）
+/// —— 全程不需要纹理像素尺寸（提取层对注册表尺寸**不可见**，G6 纪律下
+/// `RenderKeySource` 只给键；upload 时的尺寸登记在渲染侧）。后端拿
+/// `sample_info` 的全瓦片矩形一折即得采样坐标（wgpu 精灵分支单处实现），
+/// 恒等矩形 `[0,0,1,1]` 折算结果与全瓦片逐位相同。
+///
+/// # 网格与回绕（schema 文档同口径）
+///
+/// - 网格 = 纹理宽高 ÷ cols/rows；`sheet_rows` 为 0 时 = cols 正方形网格
+///   （实现简洁取舍）；负值按 0 处理（= 缺省语义，不另造行为）；
+/// - 帧索引 = 行主序：`col = frame % cols`、`row = frame / cols`；
+/// - `frame` 越出 `cols*rows` 时模运算回绕（`rem_euclid`，负值同样回绕
+///   —— 补间 loop 到末帧后回 0 的正主通道；schema 对 frame 不设钳制）。
+fn sprite_sheet_uv_rect(tree: &SceneTree, node: NodeId) -> Option<[f32; 4]> {
+    let cols = i64_prop(tree, node, PROP_SHEET_COLS, 0).max(0);
+    if cols == 0 {
+        return None;
+    }
+    let rows = i64_prop(tree, node, PROP_SHEET_ROWS, 0).max(0);
+    let rows = if rows == 0 { cols } else { rows };
+    let frame = i64_prop(tree, node, PROP_FRAME, 0);
+    let f = frame.rem_euclid(cols.saturating_mul(rows));
+    let col = (f % cols) as f32;
+    let row = (f / cols) as f32;
+    let (fc, fr) = (cols as f32, rows as f32);
+    Some([col / fc, row / fr, 1.0 / fc, 1.0 / fr])
 }
 
 /// 取布尔属性（缺失 → `default`）。

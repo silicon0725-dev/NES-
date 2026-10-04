@@ -37,6 +37,11 @@ pub struct ItemSlot {
     /// Some→None 迁移帧据此补推一次 `set_clip(None)` —— 跨帧簿记的
     /// 陈旧裁剪必须显式清除，否则 undo 移出 ScrollView 后旧裁剪残留）。
     pub clipped: bool,
+    /// 上一提取帧是否对该条目推送过 `SetUv`（S16.2：图集帧动画的
+    /// 激活→整图迁移帧据此补推一次恒等矩形 `[0,0,1,1]` —— uv 簿记跨帧
+    /// 持久且"无记录 = 整瓦片"，停用图集后陈旧子矩形同样必须显式清除；
+    /// 与 clipped 同一条"全量快照的生产者侧义务"）。
+    pub uv_active: bool,
 }
 
 impl ItemSlot {
@@ -114,6 +119,7 @@ impl NodeItemMap {
                 created_frame: frame,
                 seen_frame: frame,
                 clipped: false,
+                uv_active: false,
             },
         );
     }
@@ -128,6 +134,15 @@ impl NodeItemMap {
         self.slots.get_mut(&node).map(|slot| {
             let was = slot.clipped;
             slot.clipped = now;
+            was
+        })
+    }
+
+    /// 读写条目的 uv 推送标记（S16.2 激活→整图迁移检测用；`None` = 无条目）。
+    pub fn take_uv_active(&mut self, node: NodeId, now: bool) -> Option<bool> {
+        self.slots.get_mut(&node).map(|slot| {
+            let was = slot.uv_active;
+            slot.uv_active = now;
             was
         })
     }

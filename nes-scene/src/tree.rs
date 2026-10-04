@@ -517,6 +517,26 @@ pub enum Cmd {
         /// 播放模式。
         mode: TweenMode,
     },
+    /// 请求对目标节点发起一次图集帧补间（S16.2；`tween_frame "name" from to
+    /// ms ["easing"] ["mode"]` 的编译产物）。写 Sprite2D 的 `frame` 属性
+    ///（推进按线性插值取整 floor；经既有属性写路径 —— 进语义指纹）。
+    /// 目标不是 Sprite2D 时登记照常、写入静默无效（与属性写错同家法）。
+    /// `from`/`to` 都是语句字面量（帧循环的起终格由作者指定 —— 与
+    /// pos/scale/alpha 的"from 落地采样"不同：帧序是创作意图的一部分）。
+    TweenFrame {
+        /// 目标节点。
+        node: NodeId,
+        /// 起点帧索引。
+        from: i64,
+        /// 终点帧索引（越界由渲染侧回绕，本层不钳制）。
+        to: i64,
+        /// 时长毫秒（同 [`Cmd::TweenPos`] 的拒收口径）。
+        duration_ms: f64,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
     /// 请求移除目标节点的**全部通道**补间（S16 第 1 期起；`tween_stop
     /// "name"` 的编译产物）。S16.1 起通道有 pos/scale/alpha 三种 ——
     /// 停 = 三通道登记一并丢弃，各通道停在当前值（local/属性不动）。
@@ -735,6 +755,30 @@ impl<'a> NodeCtx<'a> {
         self.cmds.push(Cmd::TweenAlpha {
             node,
             to: a,
+            duration_ms,
+            easing,
+            mode,
+        });
+    }
+
+    /// 对任意节点发起一次图集帧补间（S16.2）：入既有 Cmd 流
+    ///（[`Cmd::TweenFrame`]），写 Sprite2D 的 `frame` 属性（推进按线性
+    /// 插值取整 floor；经既有属性写路径，进语义指纹）。与 pos/scale/
+    /// alpha 通道并存互不干扰（last-wins 按（节点，通道）二元组）。
+    /// 两入口同权。
+    pub fn tween_frame(
+        &mut self,
+        node: NodeId,
+        from: i64,
+        to: i64,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        self.cmds.push(Cmd::TweenFrame {
+            node,
+            from,
+            to,
             duration_ms,
             easing,
             mode,
@@ -1097,6 +1141,27 @@ impl<'a> SignalCtx<'a> {
         });
     }
 
+    /// 对任意节点发起一次图集帧补间（S16.2；与 [`NodeCtx::tween_frame`]
+    /// 同通道 —— 信号入口照发不误）。
+    pub fn tween_frame(
+        &mut self,
+        node: NodeId,
+        from: i64,
+        to: i64,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        self.cmds.push(Cmd::TweenFrame {
+            node,
+            from,
+            to,
+            duration_ms,
+            easing,
+            mode,
+        });
+    }
+
     /// 移除任意节点的补间（S16；S16.1 起 = 全部通道；与
     /// [`NodeCtx::tween_stop`] 同通道）。
     pub fn tween_stop(&mut self, node: NodeId) {
@@ -1449,6 +1514,17 @@ pub enum TweenChannel {
         /// 终点（落地处已夹到 0..1）。
         to: f32,
     },
+    /// 图集帧索引（S16.2）：写 Sprite2D 的 `frame` 属性（经既有属性写路径
+    /// —— frame 是真实树状态，进语义指纹；与 alpha 同口径）。推进按线性
+    /// 插值取整（floor）到帧索引 —— 帧是离散量，插值只用来定"走到哪一格"。
+    /// 配合 `sheet_cols/rows` 的模运算回绕：`tween_frame 0 → cols*rows +
+    /// loop` 即无缝走路循环。
+    Frame {
+        /// 起点帧索引（语句字面量；yoyo 回程落回它）。
+        from: i64,
+        /// 终点帧索引（语句字面量；越界由渲染侧回绕，本层不钳制）。
+        to: i64,
+    },
 }
 
 impl TweenChannel {
@@ -1458,6 +1534,7 @@ impl TweenChannel {
             Self::Pos { .. } => "pos",
             Self::Scale { .. } => "scale",
             Self::Alpha { .. } => "alpha",
+            Self::Frame { .. } => "frame",
         }
     }
 
@@ -1468,6 +1545,7 @@ impl TweenChannel {
             (Self::Pos { .. }, Self::Pos { .. })
                 | (Self::Scale { .. }, Self::Scale { .. })
                 | (Self::Alpha { .. }, Self::Alpha { .. })
+                | (Self::Frame { .. }, Self::Frame { .. })
         )
     }
 }
@@ -2735,6 +2813,14 @@ impl SceneTree {
                 let v = from + (to - from) * te;
                 let _ = self.set_prop(id, "alpha", Value::F32(v));
             }
+            TweenChannel::Frame { from, to } => {
+                // 帧是离散量：线性插值在 f64 域推进，floor 取整到帧索引
+                //（S16.2）。f64 域计算避免 te 的小数误差在整数域抖动；
+                // 写 `frame` 属性 = 真实树状态（进语义指纹，与 alpha 同
+                // 口径）；目标没有 frame 属性（非 Sprite2D）时静默无效。
+                let v = *from as f64 + (*to - *from) as f64 * te as f64;
+                let _ = self.set_prop(id, "frame", Value::I64(v.floor() as i64));
+            }
         }
     }
 
@@ -2758,6 +2844,10 @@ impl SceneTree {
             TweenChannel::Alpha { from, to } => {
                 let end = if from_side { *from } else { *to };
                 let _ = self.set_prop(id, "alpha", Value::F32(end));
+            }
+            TweenChannel::Frame { from, to } => {
+                let end = if from_side { *from } else { *to };
+                let _ = self.set_prop(id, "frame", Value::I64(end));
             }
         }
     }
@@ -2924,6 +3014,28 @@ impl SceneTree {
                 self.register_tween(
                     node,
                     TweenChannel::Alpha { from, to },
+                    duration_ms,
+                    easing,
+                    mode,
+                );
+            }
+            Cmd::TweenFrame {
+                node,
+                from,
+                to,
+                duration_ms,
+                easing,
+                mode,
+            } => {
+                // 图集帧通道（S16.2）：登记纪律与 alpha 同（last-wins 按
+                // （节点，frame 通道）二元组；duration 非法树侧拒收）。
+                // from/to 都是语句字面量（帧序是创作意图的一部分，不落地
+                // 采样 —— 与 alpha 的"from = 落地时当前值"刻意不同）；写入
+                // 面每 tick 经既有属性写路径直写 `frame`，越界回绕归渲染侧
+                //（提取层 rem_euclid），本层不钳制。
+                self.register_tween(
+                    node,
+                    TweenChannel::Frame { from, to },
                     duration_ms,
                     easing,
                     mode,

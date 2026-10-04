@@ -232,6 +232,10 @@ pub struct WgpuRenderServer {
     /// 相乘色簿记（S16.1 alpha 通道，与 `NullRenderServer` 同构）：同键覆写、
     /// 销毁移除；`submit_into` 在对应条目的 `SetClip` 之后追加 `SetTint`。
     tints: BTreeMap<ItemHandle, [u8; 4]>,
+    /// 子矩形采样簿记（S16.2 图集帧动画，与 `NullRenderServer` 同构）：
+    /// 同键覆写、销毁移除；`submit_into` 在对应条目的 `SetTint` 之后追加
+    /// `SetUv`。无记录 = 整瓦片采样（既有行为逐位不变）。
+    uvs: BTreeMap<ItemHandle, [f32; 4]>,
     camera: Option<Camera2DState>,
     lifecycle: Vec<RenderCommand>,
 }
@@ -291,6 +295,7 @@ impl RenderServer for WgpuRenderServer {
         self.rects.remove(&handle);
         self.clips.remove(&handle);
         self.tints.remove(&handle);
+        self.uvs.remove(&handle);
         self.lifecycle.push(RenderCommand::DestroyItem { handle });
     }
 
@@ -366,6 +371,15 @@ impl RenderServer for WgpuRenderServer {
         self.tints.insert(handle, rgba);
     }
 
+    fn set_uv(&mut self, handle: ItemHandle, rect: [f32; 4]) {
+        if !self.items.contains_key(&handle) {
+            // 空句柄 / 未知句柄：静默忽略（契约 I1 口径）。
+            return;
+        }
+        // 同键覆写（全量快照语义，S16.2 图集帧动画）。
+        self.uvs.insert(handle, rect);
+    }
+
     fn submit_into(&mut self, frame: &FrameInfo, out: &mut Vec<RenderCommand>) {
         // 1) 先清空（契约 I3：缓冲跨帧复用，不留上一帧残留）。
         out.clear();
@@ -435,6 +449,16 @@ impl RenderServer for WgpuRenderServer {
                     rgba: *rgba,
                 });
             }
+            // 子矩形采样（S16.2 图集帧动画）：恒在 SetTint 之后（契约 I5
+            // 顺序冻结；与 `NullRenderServer` 严格同序）。仅当该条目存在
+            // uv 簿记时追加 —— 无记录 = 整瓦片采样，命令流与既有路径
+            // 逐条相同。
+            if let Some(rect) = self.uvs.get(&item.handle) {
+                out.push(RenderCommand::SetUv {
+                    handle: item.handle,
+                    rect: *rect,
+                });
+            }
         }
 
         // 5) 帧结束标记（契约 I3：末条必为 Submit）。
@@ -455,7 +479,7 @@ pub struct FrameStats {
     pub destroys: u64,
     /// 命中已知句柄的属性命令数（`SetTransform` / `SetFlip` / `SetZ` /
     /// `SetVisible` / `SetText` / `SetList` / `SetRect` / `SetClip` /
-    /// `SetTint`）。
+    /// `SetTint` / `SetUv`）。
     pub updates: u64,
     /// 因空句柄 / 未知句柄被静默忽略的命令数（契约 I1 的可观测计数）。
     pub ignored: u64,
@@ -1158,6 +1182,11 @@ pub struct CommandConsumer {
     /// 通道）。精灵实例的 tint 从中性改查此表 —— 无记录 = 中性恒等
     ///（与 E-1 之前的像素逐位相同）。
     tints: BTreeMap<ItemHandle, [u8; 4]>,
+    /// 跨帧子矩形采样登记表（`SetUv` 建/覆写、`DestroyItem` 删；S16.2 图集
+    /// 帧动画）。注册表精灵分支的 uv_rect 从全瓦片改查此表折算 —— 无记录
+    /// = 整瓦片采样（与既有路径逐位相同）。归一化矩形 `[u0, v0, us, vs]`
+    /// （相对整张注册纹理），消费点单处折算（见 draw_into 精灵分支）。
+    uvs: BTreeMap<ItemHandle, [f32; 4]>,
     /// 字体登记表：资源键 -> 排版参数（字形表本体作为纹理住在注册表里）。
     /// 默认字体住在保留键 [`DEFAULT_FONT_KEY`] 下；`LabelState.font` 按键解析，
     /// 未登记的键与 `NIL` 一样退回默认字体（S4.5 契约口径，T-Text-07/08 钉住）。
@@ -1255,6 +1284,7 @@ impl CommandConsumer {
             texts: BTreeMap::new(),
             lists: BTreeMap::new(),
             tints: BTreeMap::new(),
+            uvs: BTreeMap::new(),
             fonts: BTreeMap::new(),
             ttf: None,
             glyph_atlas: GlyphAtlas::default(),
@@ -1689,6 +1719,7 @@ impl CommandConsumer {
                         self.texts.remove(handle);
                         self.lists.remove(handle);
                         self.tints.remove(handle);
+                        self.uvs.remove(handle);
                         stats.destroys += 1;
                     } else {
                         stats.ignored += 1;
@@ -1782,6 +1813,17 @@ impl CommandConsumer {
                 RenderCommand::SetTint { handle, rgba } => {
                     if self.items.contains_key(handle) {
                         self.tints.insert(*handle, *rgba);
+                        stats.updates += 1;
+                    } else {
+                        stats.ignored += 1;
+                    }
+                }
+                // SetUv：登记子矩形采样（S16.2 图集帧动画）。注册表精灵分支
+                // 按此折算采样矩形（无记录 = 整瓦片，逐位不变）；已知句柄
+                // 同键覆写，未知句柄静默忽略（契约 I1 口径）。
+                RenderCommand::SetUv { handle, rect } => {
+                    if self.items.contains_key(handle) {
+                        self.uvs.insert(*handle, *rect);
                         stats.updates += 1;
                     } else {
                         stats.ignored += 1;
@@ -2145,6 +2187,20 @@ impl CommandConsumer {
                 }
             } else if let Some((layer, uv_rect)) = self.registry.sample_info(item.key) {
                 // 键已注册：采样注册表图层（纹理落在图层左上角，UV 按实际尺寸裁剪）。
+                // S16.2 图集帧动画：有 SetUv 簿记时按归一化子矩形折算 ——
+                // 最终采样坐标 = 瓦片左上 + 归一化偏移 x 瓦片宽高（单处折算，
+                // sample_info 的全瓦片矩形是唯一参照）。恒等矩形 `[0,0,1,1]`
+                // 折算结果与全瓦片逐位相同（0.0 偏移 + 1.0 比例都是精确浮点）；
+                // 无记录走原矩形 —— 既有路径逐位不变。
+                let uv_rect = match self.uvs.get(&item.handle) {
+                    Some(r) => [
+                        uv_rect[0] + r[0] * uv_rect[2],
+                        uv_rect[1] + r[1] * uv_rect[3],
+                        r[2] * uv_rect[2],
+                        r[3] * uv_rect[3],
+                    ],
+                    None => uv_rect,
+                };
                 sprites.push(SpriteInstance {
                     handle: item.handle,
                     world: item.world_transform().to_array(),

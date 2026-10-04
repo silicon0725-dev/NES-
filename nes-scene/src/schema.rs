@@ -308,6 +308,31 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                  —— 渲染侧 tint 乘 255/255 = 恒等，无补间场景的观感与指纹外的\
                  语义逐位不变（指纹采样面含本键，见 S16.1 文档 §2 基线重录）。",
             ),
+            PropDesc::new(
+                "sheet_cols",
+                ValueType::I64,
+                Value::I64(0),
+                H::Number { min: 0.0, max: 4096.0, step: 1.0 },
+                "图集列数（S16.2）。0 = 整图模式 —— 既有整瓦片采样逐位不变；\
+                 > 0 时按纹理宽 ÷ 本值切成网格，帧索引走行主序。",
+            ),
+            PropDesc::new(
+                "sheet_rows",
+                ValueType::I64,
+                Value::I64(0),
+                H::Number { min: 0.0, max: 4096.0, step: 1.0 },
+                "图集行数（S16.2）。0 = 正方形网格（行数 = 列数）—— 实现简洁\
+                 取舍，文档写明；> 0 时按纹理高 ÷ 本值切行。",
+            ),
+            PropDesc::new(
+                "frame",
+                ValueType::I64,
+                Value::I64(0),
+                H::None,
+                "图集帧索引（S16.2；行主序 col = frame % cols、row = frame / \
+                 cols）。越出 cols*rows 时模运算回绕（负值同样回绕）—— 补间\
+                 循环到末帧后回到 0 的正主通道，不设数值钳制。",
+            ),
         ],
         NodeKindTag::Camera2D => vec![
             PropDesc::new(
@@ -631,10 +656,17 @@ mod tests {
                 "texture",
                 "flip_h",
                 "flip_v",
-                "alpha"
+                "alpha",
+                "sheet_cols",
+                "sheet_rows",
+                "frame"
             ]
         );
-        assert_eq!(s.len(), 7);
+        assert_eq!(s.len(), 10);
+        // S16.2 加性缺省 = 整图现状：三键缺省全 0。
+        assert_eq!(s.default_value("sheet_cols"), Some(&Value::I64(0)));
+        assert_eq!(s.default_value("sheet_rows"), Some(&Value::I64(0)));
+        assert_eq!(s.default_value("frame"), Some(&Value::I64(0)));
     }
 
     #[test]

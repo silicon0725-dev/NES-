@@ -218,6 +218,12 @@ pub fn scene_fingerprint(tree: &SceneTree, vm: Option<&ScriptVm>) -> u64 {
                     h = mix(h, &from.to_bits().to_le_bytes());
                     h = mix(h, &to.to_bits().to_le_bytes());
                 }
+                // 帧通道（S16.2）：from/to 是 i64 字面量，位形混入（与
+                // f32 位形同一口径 —— 精确、无浮点歧义）。
+                crate::tree::TweenChannel::Frame { from, to } => {
+                    h = mix(h, &from.to_le_bytes());
+                    h = mix(h, &to.to_le_bytes());
+                }
             }
             h = mix(h, tw.easing.as_str().as_bytes());
             h = mix(h, tw.mode.as_str().as_bytes());

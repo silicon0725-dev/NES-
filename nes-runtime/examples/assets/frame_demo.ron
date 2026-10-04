@@ -1,0 +1,59 @@
+// S16.2 图集帧动画 harness：frame_demo —— 走路循环。
+//
+// walker = 2x4 图集（Textures/walk_sheet.bmp，32x64、16px 帧格）的
+// Sprite2D：sheet_cols=2 / sheet_rows=4 打开图集模式（子矩形采样），
+// brain 在 init 里登记 `tween_frame 0 -> 4 / 600ms / linear / loop`
+// —— 终点 4 越出 cols*rows=4，渲染侧模运算回绕到 0，无缝走路循环
+//（loop 永不移除登记、永不到站 —— 停用才走 tween_stop）。
+// 4 倍放大显示（16px 帧格 -> 64px 四边形）；方向键/WASD 无绑定
+//（纯观察 demo）。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Textures/walk_sheet.bmp", kind: "Texture"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(
+                name: "cam",
+                kind: "Camera2D",
+                local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                children: [],
+            ),
+            Node(
+                name: "walker",
+                kind: "Sprite2D",
+                local: (x: 24.0, y: 76.0, rot: 0.0, sx: 4.0, sy: 4.0, skew: 0.0),
+                props: { "texture": Resource(1), "sheet_cols": 2, "sheet_rows": 4, "frame": 0, },
+                children: [],
+            ),
+            // 第二个观察位：同图集不同相位（frame 起 1），对照回绕边界。
+            Node(
+                name: "walker_b",
+                kind: "Sprite2D",
+                local: (x: 240.0, y: 76.0, rot: 0.0, sx: 4.0, sy: 4.0, skew: 0.0),
+                props: { "texture": Resource(1), "sheet_cols": 2, "sheet_rows": 4, "frame": 1, },
+                children: [],
+            ),
+            // 走路循环登记：init 恰一次（挂载后首次派发前）；入口块留空
+            //（语法冻结：脚本必须有 on/every 入口，init 只是前缀）。
+            // b 角色错开两帧起跑（2 -> 6，同样回绕）—— 相位差恒定，
+            // 循环节奏肉眼可对齐。
+            Node(
+                name: "walker_brain",
+                kind: "Script",
+                props: { "source": "init { tween_frame \"walker\" 0 4 600 \"linear\" \"loop\"; tween_frame \"walker_b\" 2 6 600 \"linear\" \"loop\" }\nevery { }" },
+                children: [],
+            ),
+            Node(
+                name: "caption",
+                kind: "Label",
+                local: (x: 8.0, y: 8.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0),
+                props: { "text": "S16.2 walk cycle: sheet 2x4 + tween_frame 0->4 loop 600ms", },
+                children: [],
+            ),
+        ],
+    ),
+)

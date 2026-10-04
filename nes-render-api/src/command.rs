@@ -172,6 +172,30 @@ pub enum RenderCommand {
         /// 的 alpha 通道只动 A：`[255, 255, 255, a]`）。
         rgba: [u8; 4],
     },
+    /// 子矩形采样（S16.2 图集帧动画的契约扩展）：注册表纹理的**归一化
+    /// UV 矩形** `[u0, v0, us, vs]`（0..1，相对整张注册纹理）。
+    ///
+    /// 与 [`RenderCommand::SetTint`] 同一性质与同一条纪律：
+    ///
+    /// - 属性动作、全量快照、同键覆写：`submit` 时对有 uv 簿记的条目按序
+    ///   重发当前值（漏推一帧不漂移）；条目销毁时随条目消亡；
+    /// - 输出序冻结在对应条目的 `SetTint` 之后（同一渲染物的属性流序：
+    ///   … → SetRect → SetClip → SetTint → SetUv —— null 与 wgpu 两处
+    ///   submit 严格同序）；
+    /// - 空句柄 / 未知句柄静默忽略（契约 I1 口径）；
+    /// - **无记录 = 整瓦片采样**（既有行为逐位不变）：后端只在注册表
+    ///   精灵分支消费本命令 —— `[0, 0, 1, 1]`（恒等矩形）折算后与
+    ///   sample_info 的全瓦片矩形逐位相同，因此"清除"恒等矩形即可表达；
+    /// - 提取层把 Sprite2D 的 `sheet_cols` / `sheet_rows` / `frame` 三属性
+    ///   折成网格分数（col/cols 等纯分数运算 —— **不需要**纹理像素尺寸，
+    ///   提取层也不可见），后端拿注册表实际尺寸一折即得采样矩形。
+    SetUv {
+        /// 句柄。
+        handle: ItemHandle,
+        /// 归一化 UV 矩形 `[u0, v0, us, vs]`（相对整张注册纹理；负值/
+        /// 越界不在此钳制 —— 采样取舍的权威在后端单处折算）。
+        rect: [f32; 4],
+    },
     /// 帧结束标记（**每条命令流都必须以它结尾**）。
     Submit {
         /// 本帧上下文。
@@ -193,7 +217,8 @@ impl RenderCommand {
             | Self::SetList { handle, .. }
             | Self::SetRect { handle, .. }
             | Self::SetClip { handle, .. }
-            | Self::SetTint { handle, .. } => Some(*handle),
+            | Self::SetTint { handle, .. }
+            | Self::SetUv { handle, .. } => Some(*handle),
             Self::SetCamera { .. } | Self::Submit { .. } => None,
         }
     }

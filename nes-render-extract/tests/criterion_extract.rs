@@ -1233,3 +1233,109 @@ fn alpha_channel_pushes_set_tint() {
     assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetTint { .. })));
     assert_eq!(srv.tint_of(handle), None, "销毁随条目清理");
 }
+
+/// S16.2（图集帧动画）：`sheet_cols` / `sheet_rows` / `frame` 三属性 ->
+/// `SetUv` 的簿记 —— 归一化网格分数、模运算回绕、正方形网格缺省、
+/// 激活→整图迁移补推恒等矩形、销毁随条目清理、输出序恒在 SetTint 之后。
+#[test]
+fn sheet_props_push_set_uv() {
+    let keys = KeyMap::new();
+    keys.set(ResId::new(1), key(1, 1));
+
+    let mut tree = SceneTree::new("root");
+    let sprite = add_root_sprite(&mut tree, "s1", ResId::new(1));
+
+    let mut ex = RenderExtractor::new();
+    let mut srv = NullRenderServer::new();
+    let mut out = Vec::new();
+
+    // 缺省（cols = 0 = 整图模式）：命令流没有任何 SetUv —— 既有路径
+    // 逐位不变（加性缺省的根）。
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 1);
+    assert_synced(&ex, &srv, &stats);
+    assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetUv { .. })));
+    let handle = ex.handle_of(sprite).expect("已建条目");
+
+    // 2x2 sheet + frame=1（行主序 -> col=1, row=0）-> 右上象限。
+    set_prop(&mut tree, sprite, "sheet_cols", Value::I64(2));
+    set_prop(&mut tree, sprite, "sheet_rows", Value::I64(2));
+    set_prop(&mut tree, sprite, "frame", Value::I64(1));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 2);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.uv_of(handle),
+        Some(&[0.5, 0.0, 0.5, 0.5]),
+        "行主序 frame=1 -> 右上象限（归一化网格分数，无需纹理像素尺寸）"
+    );
+
+    // 越界回绕：frame=5（5 % 4 = 1）-> 同一象限。
+    set_prop(&mut tree, sprite, "frame", Value::I64(5));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 3);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(srv.uv_of(handle), Some(&[0.5, 0.0, 0.5, 0.5]), "模运算回绕");
+
+    // 负值同样回绕：frame=-1（rem_euclid(4) = 3 -> col=1, row=1）-> 右下。
+    set_prop(&mut tree, sprite, "frame", Value::I64(-1));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 4);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(srv.uv_of(handle), Some(&[0.5, 0.5, 0.5, 0.5]), "负帧回绕");
+
+    // rows = 0 -> 正方形网格（rows = cols）：4 列缺省行，frame=3 ->
+    // col=3, row=0 -> 1/4 格。
+    set_prop(&mut tree, sprite, "sheet_cols", Value::I64(4));
+    set_prop(&mut tree, sprite, "sheet_rows", Value::I64(0));
+    set_prop(&mut tree, sprite, "frame", Value::I64(3));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 5);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.uv_of(handle),
+        Some(&[0.75, 0.0, 0.25, 0.25]),
+        "rows=0 = 正方形网格（实现简洁取舍，schema 文档同口径）"
+    );
+
+    // 输出序：同句柄同帧 SetUv 恒在 SetTint 之后（null 与 wgpu 两处
+    // submit 严格同序的推送侧事实）。
+    let tint_at = out
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetTint { handle: h, .. } if *h == handle));
+    let uv_at = out
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetUv { handle: h, .. } if *h == handle));
+    assert!(tint_at.is_some() && uv_at.is_some());
+    assert!(uv_at > tint_at, "SetUv 恒在 SetTint 之后");
+
+    // 停用（cols=0）：迁移帧补推**一次**恒等矩形（渲染侧折算 = 整瓦片
+    // 逐位还原），其后不再发任何 SetUv。
+    set_prop(&mut tree, sprite, "sheet_cols", Value::I64(0));
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 6);
+    assert_synced(&ex, &srv, &stats);
+    assert_eq!(
+        srv.uv_of(handle),
+        Some(&[0.0, 0.0, 1.0, 1.0]),
+        "迁移帧补推恒等矩形（渲染侧折算 = 整瓦片，像素意义上的清除）"
+    );
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 7);
+    assert_synced(&ex, &srv, &stats);
+    // 稳态：提取侧零新增（was = false 不再补推）；命令流里的唯一 SetUv
+    // 是服务端**全量快照**对已存恒等值的重发 —— 与 tint 恒等值逐帧重发
+    // 同一口径（渲染侧折算逐位还原，无害）。
+    let uv_cmds: Vec<&RenderCommand> = out
+        .iter()
+        .filter(|c| matches!(c, RenderCommand::SetUv { .. }))
+        .collect();
+    assert_eq!(uv_cmds.len(), 1, "稳态只剩快照重发");
+    assert_eq!(
+        uv_cmds[0],
+        &RenderCommand::SetUv { handle, rect: [0.0, 0.0, 1.0, 1.0] }
+    );
+
+    // 资源消失 -> 条目销毁 -> uv 簿记随之清理（不悬垂）。
+    set_prop(&mut tree, sprite, "sheet_cols", Value::I64(2));
+    let _ = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 8);
+    keys.remove(ResId::new(1));
+    advance(&mut tree);
+    let stats = step(&mut ex, &mut tree, &keys, &mut srv, &mut out, 9);
+    assert_synced(&ex, &srv, &stats);
+    assert!(out.iter().all(|c| !matches!(c, RenderCommand::SetUv { .. })));
+    assert_eq!(srv.uv_of(handle), None, "销毁随条目清理");
+}

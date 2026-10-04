@@ -670,3 +670,39 @@ fn criterion_contract_empty_frame_still_terminates_with_submit() {
     assert!(matches!(commands[0], RenderCommand::Submit { frame } if frame.frame_index == 0));
     assert_eq!(server.counters().frames, 1);
 }
+
+/// S16.2（图集帧动画）：`set_uv` 的 null 簿记 —— 同键覆写、未知句柄静默
+/// 忽略、销毁随条目清理、输出序恒在 `SetTint` 之后（与 wgpu 后端严格同序）。
+#[test]
+fn criterion_contract_set_uv_bookkeeping_and_order() {
+    let mut server = NullRenderServer::new();
+    let handle = server.create_item(RenderAssetKey::from_parts(7, 1));
+
+    // 同键覆写：后写者生效；未知句柄静默忽略（计数器可观测）。
+    server.set_uv(handle, [0.0, 0.0, 0.5, 0.5]);
+    server.set_uv(handle, [0.5, 0.5, 0.5, 0.5]);
+    server.set_uv(ItemHandle::from_raw(999), [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(server.uv_of(handle), Some(&[0.5, 0.5, 0.5, 0.5]));
+    assert!(server.uv_of(ItemHandle::from_raw(999)).is_none());
+
+    // 输出序：SetUv 恒在 SetTint 之后、Submit 之前（每渲染物属性流序）。
+    server.set_tint(handle, [255, 255, 255, 255]);
+    let commands = server.submit(&FrameInfo::default());
+    let tint_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetTint { .. }));
+    let uv_at = commands
+        .iter()
+        .position(|c| matches!(c, RenderCommand::SetUv { .. }));
+    assert!(tint_at.is_some() && uv_at.is_some());
+    assert!(uv_at > tint_at, "SetUv 恒在 SetTint 之后");
+
+    // 销毁：uv 随条目消亡（命令流里不再出现）。
+    server.destroy_item(handle);
+    let commands = server.submit(&FrameInfo::default());
+    assert!(
+        commands.iter().all(|c| !matches!(c, RenderCommand::SetUv { .. })),
+        "销毁后命令流不再出现 SetUv"
+    );
+    assert!(server.uv_of(handle).is_none());
+}

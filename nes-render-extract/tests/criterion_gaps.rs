@@ -218,6 +218,9 @@ fn kind_of(cmd: &RenderCommand) -> &'static str {
         // S16.1（alpha 通道）新增的 SetTint：同上 —— 只补枚举臂恢复可编译，
         // 精灵恒推（criterion_extract 的 alpha 用例专钉）。
         RenderCommand::SetTint { .. } => "set_tint",
+        // S16.2（图集帧动画）新增的 SetUv：同上 —— 只补枚举臂恢复可编译，
+        // 仅图集模式激活的精灵才推（criterion_extract 的 sheet 用例专钉）。
+        RenderCommand::SetUv { .. } => "set_uv",
     }
 }
 

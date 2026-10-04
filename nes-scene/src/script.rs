@@ -220,6 +220,20 @@ pub enum Op {
         /// 播放模式。
         mode: TweenMode,
     },
+    /// 图集帧补间（S16.2）：`tween_frame "name" from to ms ["easing"]
+    /// ["mode"]` 的编译产物。栈交互同构（弹序 ms、to、from —— 压序
+    /// from、to、ms = 源序）；写 Sprite2D 的 `frame` 属性（推进按线性
+    /// 插值取整 floor，经既有属性写路径 —— 进语义指纹）。from/to 都是
+    /// 语句字面量；终点越界由渲染侧回绕（`frame >= cols*rows` 模运算
+    /// 回到 0 —— `loop` 模式下即无缝走路循环）。
+    TweenFrame {
+        /// 目标节点名。
+        name: String,
+        /// 缓动函数。
+        easing: TweenEasing,
+        /// 播放模式。
+        mode: TweenMode,
+    },
     /// 停止补间（S16；S16.1 起 = 该节点**全部通道**）：`tween_stop "name"`
     /// 的编译产物。**零栈交互**（照 `play` 形态）；执行 = 经
     /// [`VmCtx::tween_stop`] 发 [`crate::tree::Cmd::TweenStop`]，各通道
@@ -389,6 +403,22 @@ impl VmCtx<'_, '_> {
         match self {
             VmCtx::Node(c) => c.tween_alpha(node, a, duration_ms, easing, mode),
             VmCtx::Signal(c) => c.tween_alpha(node, a, duration_ms, easing, mode),
+        }
+    }
+
+    /// 图集帧补间（S16.2）：两入口同权。
+    fn tween_frame(
+        &mut self,
+        node: NodeId,
+        from: i64,
+        to: i64,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) {
+        match self {
+            VmCtx::Node(c) => c.tween_frame(node, from, to, duration_ms, easing, mode),
+            VmCtx::Signal(c) => c.tween_frame(node, from, to, duration_ms, easing, mode),
         }
     }
 
@@ -993,6 +1023,33 @@ fn run<'a, 'b>(
                 };
                 ctx.tween_alpha(node, a, ms as f64, *easing, *mode);
             }
+            Op::TweenFrame { name, easing, mode } => {
+                // tween_frame "name" from to ms ["easing"] ["mode"]（S16.2）：
+                // 弹序 ms、to、from（压序 from、to、ms —— 编译序 = 源序）。
+                // 三个分量都须数值（I64/F32 提升，帧索引截断取整）；目标按
+                // NodeByName 语义解析，找不到停机记录。duration 非法值由树
+                // 侧落地处拒收；终点越界由渲染侧回绕（本层与树侧都不钳制
+                // —— 帧循环 0→N 的正主通道）。
+                let ms = pop_val!();
+                let tov = pop_val!();
+                let fromv = pop_val!();
+                let (Some(from), Some(to), Some(ms)) =
+                    (num_of(&fromv), num_of(&tov), num_of(&ms))
+                else {
+                    halt!("tween_frame 需要数值 from to ms");
+                };
+                let Some(node) = ctx.tree().find_by_name(name) else {
+                    halt!(format!("tween_frame(\"{name}\") 找不到该名节点"));
+                };
+                ctx.tween_frame(
+                    node,
+                    from as i64,
+                    to as i64,
+                    ms as f64,
+                    *easing,
+                    *mode,
+                );
+            }
             Op::TweenStop { name } => {
                 // tween_stop "name"（S16；S16.1 起 = 全部通道）：零栈交互，
                 // 目标解析同 TweenPos。
@@ -1532,6 +1589,9 @@ impl SceneObserver for ScriptVm {
 //     tween_pos "b" 8 40 1500 "ease_out" "yoyo"   // S16.1：可选缓动 + 模式
 //     tween_scale "b" 2.0 2.0 800    // 缩放补间（S16.1；与 pos 通道并存）
 //     tween_alpha "b" 0.5 600        // 透明度补间（S16.1；写 Sprite2D.alpha）
+//     tween_frame "b" 0 4 600 "linear" "loop"     // 图集帧补间（S16.2；写
+//                                                 // Sprite2D.frame，loop+回绕
+//                                                 // = 走路循环）
 //     tween_stop "box"               // 停止补间（S16.1 起 = 该节点全部通道）
 // }
 // ```
@@ -1814,10 +1874,10 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 22] = [
+const RESERVED: [&str; 23] = [
     "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
     "arg", "this", "true", "false", "play", "video_play", "video_stop", "tween_pos", "tween_stop",
-    "tween_scale", "tween_alpha",
+    "tween_scale", "tween_alpha", "tween_frame",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -2490,6 +2550,39 @@ impl TextParser {
                 }
                 let (easing, mode) = self.opt_easing_mode()?;
                 ops.push(Op::TweenAlpha { name, easing, mode });
+                Ok(())
+            }
+            // tween_frame 语句（S16.2）：`tween_frame "name" from to ms
+            // ["easing"] ["mode"]` —— 与 tween_scale 同构的三表达式语句
+            //（弹序 ms、to、from；写 Sprite2D 的 frame 属性，线性插值取整
+            // floor；终点越界由渲染侧回绕）。
+            Tok::Ident(k) if k == "tween_frame" => {
+                self.pos += 1;
+                let name = self.expect_str()?;
+                self.expr(ops)?; // from
+                self.expr(ops)?; // to
+                let ms_at = ops.len();
+                self.expr(ops)?; // ms
+                let lit_ms = match &ops[ms_at..] {
+                    [Op::Const(Value::I64(i))] => Some(*i as f64),
+                    [Op::Const(Value::F32(f))] => Some(*f as f64),
+                    [Op::Const(Value::I64(0)), Op::Const(Value::I64(n)), Op::Sub] => {
+                        Some(-(*n as f64))
+                    }
+                    [Op::Const(Value::I64(0)), Op::Const(Value::F32(f)), Op::Sub] => {
+                        Some(-(*f as f64))
+                    }
+                    _ => None,
+                };
+                if let Some(ms) = lit_ms {
+                    if ms <= 0.0 {
+                        return Err(
+                            self.err_here(format!("tween_frame 的 ms 必须 > 0（得到 {ms}）"))
+                        );
+                    }
+                }
+                let (easing, mode) = self.opt_easing_mode()?;
+                ops.push(Op::TweenFrame { name, easing, mode });
                 Ok(())
             }
             // tween_stop 语句（S16；S16.1 起 = 全部通道）：`tween_stop "name"`
