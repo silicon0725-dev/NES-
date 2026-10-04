@@ -179,11 +179,38 @@ impl AudioCapability for ExtCapsState {
 /// **不是** `NesRuntime` 的第二实例 —— 它只持 JS 侧（运行时/上下文/回调
 /// 槽）与快照/队列；树的真身仍在 [`NesRuntime`]，经 `update_extensions`
 /// 的字段级借用拆分桥接（见模块文档帧序契约）。
+///
+/// # 健壮性三道防线（S17.1）
+///
+/// 1. **异常隔离**（本模块）：扩展 update 抛错（JS 异常 / 预算中断 / 内存
+///    超限，三者同形态）不炸帧 —— 计数 + 写诊断，其余扩展与引擎照常；
+/// 2. **死循环中断**（`nes-extension-js` 的执行预算闸）：单次执行超
+///    [`nes_extension_js::EXEC_BUDGET`] 即被 QuickJS 中断处理器转成 JS
+///    异常，浮出形态与 1 相同；
+/// 3. **自动停用**（本模块）：连续失败满 [`FAULT_DISABLE_THRESHOLD`] 帧
+///    （60 帧 ≈ 60Hz 下 1 秒）不再调它的 update —— 失控扩展每帧只损耗
+///    一个日志槽，健康扩展不受牵连。
 pub struct ExtensionManager {
     runtime: Rc<RefCell<RquickjsRuntime>>,
     caps: Rc<RefCell<ExtCapsState>>,
-    extensions: Vec<JsExtension>,
+    extensions: Vec<ManagedExt>,
+    /// 故障累计计数（全部扩展、含已停用者；诊断面）。
+    total_faults: u64,
+    /// 最近一次故障（含扩展 id + JS 异常文本；诊断/Output 用）。
+    last_fault: Option<String>,
 }
+
+/// 一个已装载扩展 + 宿主侧的健壮性簿记。
+struct ManagedExt {
+    ext: JsExtension,
+    /// 连续失败计数（成功一帧即清零；满阈值停用）。
+    consecutive_faults: u32,
+    /// 停用后不再进帧（停用宣告只发一次）。
+    disabled: bool,
+}
+
+/// 连续失败自动停用阈值（帧数；60 帧 ≈ 60Hz 下 1 秒）。
+const FAULT_DISABLE_THRESHOLD: u32 = 60;
 
 impl ExtensionManager {
     /// 构造（QuickJS 运行时初始化失败即 Err）。
@@ -192,6 +219,8 @@ impl ExtensionManager {
             runtime: Rc::new(RefCell::new(RquickjsRuntime::new()?)),
             caps: Rc::new(RefCell::new(ExtCapsState::default())),
             extensions: Vec::new(),
+            total_faults: 0,
+            last_fault: None,
         })
     }
 
@@ -222,25 +251,68 @@ impl ExtensionManager {
         if let Some(e) = ext.take_last_error() {
             return Err(ExtError::CallFailed(e));
         }
-        self.extensions.push(ext);
+        self.extensions.push(ManagedExt { ext, consecutive_faults: 0, disabled: false });
         Ok(id)
     }
 
-    /// 逐扩展调 update 钩子；JS 异常以字符串收集（不炸帧，宿主决定处置）。
+    /// 逐扩展调 update 钩子（防线 1 + 3）。
+    ///
+    /// JS 异常（含预算中断 / 内存超限 —— 三者同形态）**不炸帧**：错误信息
+    /// （扩展 id + 异常文本）进返回清单与 [`Self::last_fault`]、故障计数
+    /// +1，循环继续跑其余扩展；连续失败满 [`FAULT_DISABLE_THRESHOLD`] 帧
+    /// 自动停用该扩展（停用宣告只发一次，此后不再调它的 update）。
     pub fn update(&mut self) -> Vec<String> {
-        let mut errors = Vec::new();
-        for ext in &mut self.extensions {
-            ext.update();
-            if let Some(e) = ext.take_last_error() {
-                errors.push(format!("[扩展 {}] {e}", ext.id()));
+        let mut messages = Vec::new();
+        for index in 0..self.extensions.len() {
+            let managed = &mut self.extensions[index];
+            if managed.disabled {
+                continue; // 已停用：不进帧（宣告早已发过）。
+            }
+            managed.ext.update();
+            let Some(err) = managed.ext.take_last_error() else {
+                managed.consecutive_faults = 0; // 成功一帧即清零（"连续"口径）。
+                continue;
+            };
+            // 失败簿记：累计 + 连续 + 最近一次（含扩展 id + JS 异常文本）。
+            self.total_faults += 1;
+            managed.consecutive_faults = managed.consecutive_faults.saturating_add(1);
+            let interrupted = err.contains(nes_extension_js::INTERRUPTED_MARK);
+            let reason = if interrupted {
+                format!(
+                    "执行超预算被中断（单次 {:?}）",
+                    nes_extension_js::EXEC_BUDGET
+                )
+            } else {
+                "JS 异常".to_string()
+            };
+            let fault = format!("[扩展 {}] {err}（{reason}）", managed.ext.id());
+            self.last_fault = Some(fault.clone());
+            messages.push(fault);
+            if managed.consecutive_faults >= FAULT_DISABLE_THRESHOLD {
+                managed.disabled = true;
+                let id = managed.ext.id().to_string();
+                messages.push(format!(
+                    "[扩展 {id}] 连续 {} 帧失败，已自动停用（其余扩展不受影响）",
+                    FAULT_DISABLE_THRESHOLD
+                ));
             }
         }
-        errors
+        messages
     }
 
-    /// 已装载扩展数。
+    /// 已装载扩展数（含已停用者 —— 停用不是卸载）。
     pub fn extension_count(&self) -> usize {
         self.extensions.len()
+    }
+
+    /// 扩展故障累计计数（诊断面；未开扩展 = 0）。
+    pub fn extension_faults(&self) -> u64 {
+        self.total_faults
+    }
+
+    /// 最近一次扩展故障（含扩展 id + JS 异常文本；诊断/Output 用）。
+    pub fn last_fault(&self) -> Option<String> {
+        self.last_fault.clone()
     }
 
     /// 能力桥共享句柄（宿主每帧刷新快照 / 落地写队列用）。
@@ -277,8 +349,10 @@ impl NesRuntime {
 
     /// 推进扩展一帧：快照（tick 后状态）-> update 钩子 -> 写队列落地。
     ///
-    /// 返回本帧 JS 异常清单（空 = 干净）。**在 simulate 之后调用**（帧序
-    /// 契约见模块文档）；写队列当帧落地、下一帧呈现。
+    /// 返回本帧诊断清单（扩展 JS 异常 / 预算中断 / 停用宣告；空 = 干净）。
+    /// 异常不炸帧 —— 引擎照常、其余扩展照常（防线口径见
+    /// [`ExtensionManager`] 文档）。**在 simulate 之后调用**（帧序契约见
+    /// 模块文档）；写队列当帧落地、下一帧呈现。
     pub fn update_extensions(&mut self) -> Vec<String> {
         let Some(mgr) = &mut self.extensions else {
             return Vec::new();
@@ -297,13 +371,13 @@ impl NesRuntime {
             mgr.caps.borrow_mut().refresh(&self.tree, &held, mixer);
         }
         // 2) JS update 钩子（只碰快照/队列/混音器 —— 引擎借用已全部归还）。
-        let errors = mgr.update();
+        let messages = mgr.update();
         // 3) 写队列落地（扩展写树 = 游戏状态，进指纹）。
         {
             let mut caps = mgr.caps.borrow_mut();
             caps.apply(&mut self.tree);
         }
-        errors
+        messages
     }
 
     /// 已装载扩展数（未开扩展 = 0）。
@@ -312,6 +386,20 @@ impl NesRuntime {
             .as_ref()
             .map(|m| m.extension_count())
             .unwrap_or(0)
+    }
+
+    /// 扩展故障累计计数（诊断面；未开扩展 = 0）。
+    pub fn extension_faults(&self) -> u64 {
+        self.extensions
+            .as_ref()
+            .map(|m| m.extension_faults())
+            .unwrap_or(0)
+    }
+
+    /// 最近一次扩展故障（含扩展 id + JS 异常文本；未开扩展或尚无故障 =
+    /// `None`）。
+    pub fn last_fault(&self) -> Option<String> {
+        self.extensions.as_ref().and_then(|m| m.last_fault())
     }
 }
 

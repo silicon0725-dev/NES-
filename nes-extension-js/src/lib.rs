@@ -19,6 +19,14 @@
 //! * [`JsExtension`] —— [`nes_extension_api::ExtensionLifecycle`] 的 JS
 //!   实现（update 钩子经全局蹦床转发到 JS 注册的回调）。
 //!
+//! # 失控脚本的闸门（S17.1）
+//!
+//! * [`EXEC_BUDGET`] —— 单次 JS 执行的墙钟预算（50ms；每次 load/call 入口
+//!   重新计时），超时经 QuickJS 中断处理器转成 JS 异常（[`INTERRUPTED_MARK`]，
+//!   不可被 JS try/catch 捕获）；引擎侧据此计数/停用（nes-runtime）。
+//! * 内存上限 64 MiB + 栈上限 1 MiB —— 超限是同一形态的 JS 异常
+//!   （"out of memory"），同一条隔离路径。
+//!
 //! # 与 backend 冻结面的关系
 //!
 //! 本 crate 的 Rust 面只有 nes-extension-api 的类型（+自身类型）；任何
@@ -32,5 +40,5 @@ mod runtime;
 mod value;
 
 pub use binding::{CapabilityBinding, JsExtension, NES_BOOTSTRAP_JS};
-pub use runtime::RquickjsRuntime;
+pub use runtime::{EXEC_BUDGET, INTERRUPTED_MARK, RquickjsRuntime};
 pub use value::{js_to_nes, nes_to_js};
