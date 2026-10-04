@@ -145,6 +145,14 @@
 //! 一行/曲，三态切换各记一行（ASCII 标签 —— 文件名是用户数据，不进
 //! 日志与断言）。
 //!
+//! S15（视频资产面接入）：① res:// 白名单再扩 amv/avi（只是**列出**；
+//! 装载/解析在场景声明 Video 资源之后走 runtime 的 declare_video 链）；
+//! ② **演示视频接入**：装配时若用户视频目录里有实测 AMV（不在仓库
+//! —— CI/他机安全跳过），复制进 assets/Media/ 并 declare_video 随
+//! bind 解析（首帧即上 GPU）。PLAY 会话自动起播（Output 记 "video on"，
+//! 音轨同步出声 —— P0 起点对齐）、STOP 停播（记 "video stopped"，
+//! stop_key 点名停音轨）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -196,6 +204,18 @@ const MUSIC_DIR: &str = "C:/Users/Administrator/Music/text";
 const MUSIC_FLAC_NAME: &str = "心似烟火.flac";
 /// 实测曲 2：MP3（有损）。键 = "music2"。
 const MUSIC_MP3_NAME: &str = "Montagem Nada.mp3";
+
+// ---- S15：演示视频（Video 资产面的真实交付物实测链路）----
+//
+// 与音乐同一条纪律：文件在用户机器上、不入库（.gitignore Media/*.amv）、
+// 缺失即整段跳过；打印与断言全 ASCII（"video on"/"video stopped"）。
+
+/// 用户视频目录（实测 AMV 所在）。
+const VIDEO_SOURCE: &str = "C:/Users/Administrator/Videos/text/spider_amv.amv";
+/// 演示视频在资产根内的路径（拷入后的形态；gitignore 覆盖）。
+const VIDEO_REL: &str = "Media/spider.amv";
+/// 派生键（= 路径去扩展名；PLAY 会话起播/停播按它引用）。
+const VIDEO_KEY: &str = "Media/spider";
 
 /// 装载一首用户音乐：读盘 -> nes-media 全量解码 -> 宿主直注混音器。
 /// 成功返回 `Some(信息行)`（ASCII：`music loaded (flac, 44100Hz stereo,
@@ -261,8 +281,11 @@ const DOCK_ROW_H: f32 = 18.0;
 /// 双击**两条挂载路径**、play/stop/reset 全链路日志（一轮流程约 17
 /// 行，早期行不再被新行挤出断言窗；dock 可见窗仍只显最新几行，显示
 /// 面不变）。S14 第 1 期起 26 行：音乐接入再加 2 行装载 + 3 行三态
-/// 切换，既有断言行的窗口余量照旧保住。
-const EDITOR_LOG_KEEP: usize = 26;
+/// 切换，既有断言行的窗口余量照旧保住。S15 起 29 行：视频接入再加
+/// 2 行（video on / video stopped）+ 1 行 F9 分割切换（Media/ 目录把
+/// spin.nes 挤出 fs 可见窗 —— 冒烟先切 files 档再加双击，见注入段），
+/// 余量口径不变。
+const EDITOR_LOG_KEEP: usize = 29;
 /// dock 行显示截宽（字符数）：Output dock 是 ListView 行（ListState
 /// **位图路径**，S12-11 壳层接入不改 —— 见模块头），等宽 advance=16
 /// 不随真字体装载变化，40 字 × 16px = 640px，最小窗 768 下 dock 内衬
@@ -288,11 +311,12 @@ const FS_SCAN_DEPTH: usize = 2;
 /// 含 `wav` —— 声音资产与纹理/脚本同为项目资产，res:// 树如实列出。
 /// S14 第 1 期起再扩外部交付格式：图片（jpg/jpeg/webp/gif —— 解码经
 /// nes-media 适配层，PNG/BMP 快路径在先）与音频（flac/mp3/ogg/m4a ——
-/// Sound 装载先试手写 WAV、失手回落 nes-media）。白名单只是**列出**：
+/// Sound 装载先试手写 WAV、失手回落 nes-media）。S15 起再扩视频
+///（amv/avi —— Video 资源装载链，见 declare_video）。白名单只是**列出**：
 /// 场景没声明它们就只是树里的一行，不产生解码成本。
-const FS_EXT_WHITELIST: [&str; 15] = [
+const FS_EXT_WHITELIST: [&str; 17] = [
     "nes", "bmp", "png", "ron", "ttf", "txt", "wav", //
-    "jpg", "jpeg", "webp", "gif", "flac", "mp3", "ogg", "m4a",
+    "jpg", "jpeg", "webp", "gif", "flac", "mp3", "ogg", "m4a", "amv", "avi",
 ];
 /// 双击裁决窗（帧）：同行两次行点击报告沿间隔 <30 帧 = 双击。UiVm
 /// 行回调只有单击 —— 双击是宿主会话态的边沿合成（60fps 下 <0.5s，
@@ -790,6 +814,16 @@ impl PlaySession {
                 Err(e) => log_line(ring, format!("audio: {e}")),
             }
         }
+        // S15：有视频资源则随 PLAY 起播（音轨同步出声 —— P0 起点对齐；
+        // 换页在帧路径推进 —— Sprite 引用它即播画面，本演示场景未挂
+        // Sprite，播放纯走渲染侧状态机 + 音轨）。失败报一行不中断。
+        if rt.video_count() > 0 {
+            if rt.play_video(VIDEO_KEY) {
+                log_line(ring, "video on".into());
+            } else {
+                log_line(ring, "video: key not declared".into());
+            }
+        }
         self.vm = Some(vm);
         self.playing = true;
         log_line(ring, format!("play ({attached} scripts)"));
@@ -797,12 +831,16 @@ impl PlaySession {
 
     /// STOP（Shift+F5 / 工具栏）：脚本停（drop VM）、事务历史不动、
     /// **不自动还原** —— Godot 语义：运行期改动就是真改；RESET 才回。
-    fn stop(&mut self, ring: &Rc<RefCell<VecDeque<String>>>) {
+    /// 视频随 STOP 停播（点名停音轨声部；记一行取证）。
+    fn stop(&mut self, rt: &mut NesRuntime, ring: &Rc<RefCell<VecDeque<String>>>) {
         if !self.playing {
             return;
         }
         self.vm = None;
         self.playing = false;
+        if rt.stop_video(VIDEO_KEY) {
+            log_line(ring, "video stopped".into());
+        }
         log_line(ring, "stop".into());
     }
 
@@ -884,9 +922,32 @@ fn main() {
         let _ = rt.declare_texture(&format!("Textures/{t}.bmp")).expect("声明纹理");
     }
     let _ = rt.declare_sound("Audio/beep.wav").expect("声明演示声音");
+    // 演示视频资产（S15）：用户实测 AMV 不入库 —— 用户目录有就复制进
+    // Media/（gitignore 覆盖）并声明；缺失即整段跳过（音乐同口径）。
+    let video_present = if Path::new(VIDEO_SOURCE).exists() || assets.join(VIDEO_REL).exists() {
+        let media_dir = assets.join("Media");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        if !assets.join(VIDEO_REL).exists() {
+            let bytes = std::fs::read(VIDEO_SOURCE).expect("读演示视频（存在性已判）");
+            std::fs::write(assets.join(VIDEO_REL), &bytes).expect("复制演示视频");
+        }
+        let id = rt.declare_video(VIDEO_REL).expect("声明演示视频");
+        let _ = id;
+        true
+    } else {
+        false
+    };
+    let expected_loaded = if video_present { 7 } else { 6 };
     let report = rt.bind_assets();
-    assert_eq!(report.loaded.len(), 6, "5 纹理 + 1 声音（S13）：{report:?}");
+    assert_eq!(
+        report.loaded.len(),
+        expected_loaded,
+        "5 纹理 + 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
+    );
     assert_eq!(rt.upload_pending_textures().expect("上传"), 5);
+    if video_present {
+        assert_eq!(rt.video_count(), 1, "演示视频解析入表（首帧已上 GPU）");
+    }
     // 位图默认字体的等宽 advance（IME 锚点在位图回退模式下的累加步进
     // —— 从 font_metrics 实读，不写死 16）。
     let bitmap_advance: f32;
@@ -1460,13 +1521,21 @@ fn main() {
                 70 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: true }),
                 72 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: false }),
                 // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
-                // spin.nes 行（768x432 客户区、默认 Scene 55% 档：S13 起
-                // 资产根多出 Audio/（演示声音）目录 —— 目录优先字典序，
-                // spin.nes 从第 2 行（y=256）下移两行到第 4 行（y=
-                // 256+2*18=292）），两次点击沿间隔 10 帧 < 30（双击
-                // 裁决窗），挂载后 U 卸载回空 registry_key（树形态
-                // 断言兼容）。
-                80 => inject_input(InputEvent::MouseMove { x: 60.0, y: 292.0 }),
+                // spin.nes 行（768x432 客户区）。S15 起 res:// 树多出
+                // Media/（演示视频目录 + 条目两行）—— 默认 55% 档的
+                // fs 列表（~5.8 行可见）装不下 spin.nes（第 6 行）：先
+                // F9 切 files 档（fs 面板变高，spin.nes 落在 y≈289），
+                // 再双击；两次点击沿间隔 10 帧 < 30（双击裁决窗），挂载
+                // 后 U 卸载回空 registry_key（树形态断言兼容）。Media/
+                // 缺席的机器保持 S14 布局（默认档 spin.nes 在 y=292，
+                // 无需 F9）—— 断言面（fs open / mount 行）两种形态都
+                // 成立。
+                74 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: true }),
+                76 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: false }),
+                80 => inject_input(InputEvent::MouseMove {
+                    x: 60.0,
+                    y: if video_present { 289.0 } else { 292.0 },
+                }),
                 82 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 84 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 90 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
@@ -1880,7 +1949,7 @@ fn main() {
             // 不变是 RESET 还原的正确性前提）。
             if f5_now {
                 if snap.is_down("LShift") {
-                    play.stop(&editor_log);
+                    play.stop(&mut rt, &editor_log);
                 } else {
                     drag_start = None;
                     gizmo = None;
@@ -2717,7 +2786,7 @@ fn main() {
                 }
                 "stop" => {
                     if play.playing {
-                        play.stop(&editor_log);
+                        play.stop(&mut rt, &editor_log);
                     } else {
                         log_line(&editor_log, "stop: not playing".into());
                     }
@@ -2842,6 +2911,17 @@ fn main() {
         );
         assert!(has("stop"), "stop log missing: {lines:?}");
         assert!(has("reset"), "reset log missing: {lines:?}");
+        // S15：视频接入取证（演示 AMV 在场时；用户机器资产，缺失整段
+        // 天然跳过）。PLAY 自动起播 + STOP 停播两行齐备，且无 "video:"
+        // 错误行（错误行约定 = audio: 同款）。
+        if video_present {
+            assert!(has("video on"), "video on log missing: {lines:?}");
+            assert!(has("video stopped"), "video stopped log missing: {lines:?}");
+            assert!(
+                !lines.iter().any(|l| l.starts_with("video:")),
+                "video error line leaked: {lines:?}"
+            );
+        }
         assert!(demo_spin_x > 0.0, "脚本未在运行态驱动（spin.x={demo_spin_x}）");
         assert_eq!(demo_play_text, "PLAY*", "运行中 PLAY 文本应为 PLAY*");
         // IME 第 1 期：Char(0x4E2D) 端到端 —— inject_input（WM_CHAR 口径）

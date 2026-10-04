@@ -45,6 +45,8 @@ impl NesRuntime {
     /// 音频面（S13 第 2 期）：tick 后照常取走 `play` 落地的声音键 ——
     /// headless 通常未开音频，取走即弃（缓冲不跨帧积压、不进指纹）；
     /// 开了音频则同一通道转混音器（headless 也能出声，同一运行时）。
+    /// 视频面（S15）：`video_play`/`video_stop` 的 Cmd 同一时点取走消费
+    /// —— headless 无 GPU，换页不做；播放状态在渲染侧，不进指纹。
     pub fn tick_headless(
         &mut self,
         delta: f32,
@@ -52,6 +54,7 @@ impl NesRuntime {
     ) -> TickStats {
         let stats = self.tree.tick(delta, obs);
         self.consume_played_sounds();
+        self.consume_video_cmds();
         stats
     }
 

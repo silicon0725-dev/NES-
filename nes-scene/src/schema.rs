@@ -35,6 +35,17 @@ pub enum EditorHint {
         /// 资源类别。
         kind: &'static str,
     },
+    /// 资源引用（多类别，S15）：属性可接受**其中任一**类别的资源。
+    ///
+    /// 只为"同一属性槽位天然承载多种交付格式"的场景存在 —— 现在只有
+    /// 一个使用者：`Sprite2D.texture`（纹理资源或视频资源，视频的当前
+    /// 帧就是一张纹理）。**不是**任意 kind 放行口：候选表是编译期常量
+    /// 白名单，装载体检（`adopt_tree`）仍按表核对实际声明类别。
+    /// `kinds[0]` 是报告口径类别（mismatch 信息里用它指名"期望"）。
+    ResourceMany {
+        /// 可接受的资源类别（提示串，经 `asset_kind_of_hint` 解析）。
+        kinds: &'static [&'static str],
+    },
     /// 多行文本。
     Multiline,
     /// 枚举取值。
@@ -268,8 +279,11 @@ fn own_props(tag: NodeKindTag) -> Vec<PropDesc> {
                 "texture",
                 ValueType::Resource,
                 Value::Resource(0),
-                H::Resource { kind: "texture" },
-                "纹理资源键。0 表示未绑定。",
+                // S15：纹理**或视频**资源（视频资源运行中经渲染侧同键逐帧
+                // 覆写"当前帧"，Sprite 引用它即播画面）。类型校验面不变
+                //（仍是 ValueType::Resource），放宽只在提示/体检层。
+                H::ResourceMany { kinds: &["texture", "video"] },
+                "纹理或视频资源键。0 表示未绑定。",
             ),
             PropDesc::new(
                 "flip_h",

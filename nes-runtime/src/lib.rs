@@ -19,6 +19,10 @@
 //!   └─ audio: open_audio 一次装配（Mixer + waveOut 设备线程）；混音由设备
 //!        线程自动跑（~10ms 一缓冲），帧循环只把脚本 `play` 落地的
 //!        Cmd::PlaySound 键转交混音器 —— 音频不进语义状态与指纹。
+//!   └─ video: Video 资源 bind 时经 nes-media 解析容器（S15），帧 0 先上传；
+//!        运行中每帧把在播视频的当前帧经**同键覆写**注册进 GPU 注册表
+//!        （`video` 模块）—— Sprite2D 引用该资源即播画面；脚本
+//!        `video_play`/`video_stop` 经 Cmd 驱动，播放状态不进语义状态。
 //!
 //! # 不做什么（边界纪律）
 //!
@@ -47,6 +51,7 @@
 
 use std::collections::BTreeMap;
 pub mod headless;
+mod video;
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -124,6 +129,14 @@ pub struct NesRuntime {
     sound_slots: Vec<ResId>,
     /// 槽位 -> 已注册进混音器的资产版本（热重载重注册判定）。
     registered_version: BTreeMap<ResId, u32>,
+    /// 已声明的视频槽位（S15；bind 解析遍历用，声明序确定 —— 与
+    /// `texture_slots` / `sound_slots` 同构）。
+    video_slots: Vec<ResId>,
+    /// 视频运行表（S15）：槽位 -> 解析容器 + 渲染键 + 播放状态。**渲染侧
+    /// 状态** —— 不进树、不进语义指纹（确定性裁决，见 `video` 模块文档）。
+    videos: BTreeMap<ResId, video::VideoEntry>,
+    /// 视频换页累计数（含 bind 首帧上传；诊断/测试观测面）。
+    video_swaps: u64,
 }
 
 impl NesRuntime {
@@ -230,6 +243,9 @@ impl NesRuntime {
             device: None,
             sound_slots: Vec::new(),
             registered_version: BTreeMap::new(),
+            video_slots: Vec::new(),
+            videos: BTreeMap::new(),
+            video_swaps: 0,
         };
         rt.extractor.attach_ui(rt.ui_vm.states_rc());
         // S12.1：UI 状态机的输入读面在装配处直接挂上 —— 输入视图只共享
@@ -278,6 +294,9 @@ impl NesRuntime {
         }
         self.sync_surface_to_window()?;
         let _steps = self.simulate(frame.delta, obs);
+        // S15：视频逐帧推进（在 GPU 提取前换页 —— 当帧像素即当前帧；
+        // 帧解码失败如实上抛，与纹理解码失败同律）。
+        self.advance_videos(frame.delta)?;
         // S12.1：UI 状态机在 simulate 后、提取前更新（看到当帧终值；
         // 提取层随即读状态表做四态着色）。鼠标按 视图/客户区 折算
         //（渲染把视图空间拉伸铺满表面 —— 窗口缩放后错位的根修）。
@@ -399,6 +418,15 @@ impl NesRuntime {
             .filter(|e| e.kind() == Some(AssetKind::Audio))
             .map(|e| e.id())
             .collect();
+        // 视频槽位同理重建（S15）：声明序确定；运行侧视频表一并清零
+        //（bind 的解析步会按新表重记 —— 与上传/注册账目同一家法）。
+        self.video_slots = table
+            .iter()
+            .filter(|e| e.kind() == Some(AssetKind::Video))
+            .map(|e| e.id())
+            .collect();
+        self.videos.clear();
+        self.video_swaps = 0;
         self.table = table;
         self.uploaded_version.clear();
         self.registered_version.clear();
@@ -536,6 +564,10 @@ impl NesRuntime {
         if self.mixer.is_some() {
             report.failed.extend(self.register_sounds_collecting());
         }
+        // 视频步（S15）：解析就绪且版本变化的 Video 资源进运行侧表
+        //（GPU 在场时连首帧一起上传）；解析失败按槽位进 `report.failed`
+        // 缺口清单 —— 一个坏视频不挡场景（与声音解码缺口同律）。
+        report.failed.extend(self.parse_videos_collecting());
         report
     }
 
@@ -798,6 +830,9 @@ impl NesRuntime {
             // Cmd::PlaySound 的消费点（S13 第 2 期）：每步 tick 后取走 ——
             // 未开音频时即取即弃（headless 确定性；缓冲不跨帧积压）。
             self.consume_played_sounds();
+            // Cmd::VideoPlay/VideoStop 的消费点（S15）：同一时点取走转交
+            // 渲染侧播放状态机（headless 消费即弃 —— 缓冲不进指纹）。
+            self.consume_video_cmds();
         }
         steps
     }
@@ -1063,6 +1098,9 @@ impl NesRuntime {
         obs: &mut dyn SceneObserver,
     ) -> Result<FrameOutcome, BackendError> {
         let _steps = self.simulate(frame.delta, obs);
+        // S15：视频逐帧推进（在 GPU 提取前换页 —— 当帧像素即当前帧；
+        // 帧解码失败如实上抛，与纹理解码失败同律）。
+        self.advance_videos(frame.delta)?;
         // S12.1：同窗口路径 —— simulate 后、提取前更新 UI 状态
         //（离屏目标与视口同尺寸，鼠标 1:1）。
         self.ui_vm

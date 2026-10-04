@@ -33,6 +33,9 @@ use crate::wav::Wav;
 pub struct Voice {
     /// 声部引用的源声音（与声音库共享同一份样本，零拷贝）。
     pub wav: Arc<Wav>,
+    /// 开声时用的库键（S15 起记录：[`Mixer::stop_key`] 按它点名停声 ——
+    /// 视频音轨停止语义需要"只停这一个键的声部"，`stop_all` 太宽）。
+    pub key: String,
     /// 播放光标，单位 = 源样本（`f32` 以支持重采样步进）；`floor(cursor)` 为当前帧。
     pub cursor: f32,
     /// 声部音量，登记时已钳到 0..=1。
@@ -107,6 +110,7 @@ impl Mixer {
             .ok_or_else(|| MixerError::UnknownSound(key.to_string()))?;
         self.voices.push(Voice {
             wav: Arc::clone(wav),
+            key: key.to_string(),
             cursor: 0.0,
             volume: clamp01(volume),
             looped,
@@ -117,6 +121,14 @@ impl Mixer {
     /// 停掉全部声部（声音库不受影响）。
     pub fn stop_all(&mut self) {
         self.voices.clear();
+    }
+
+    /// 停掉引用指定库键的全部声部（S15：视频音轨停止语义），返回停掉
+    /// 的数目。键未开过声部 = 返回 0（幂等无害）；声音库不受影响。
+    pub fn stop_key(&mut self, key: &str) -> usize {
+        let before = self.voices.len();
+        self.voices.retain(|v| v.key != key);
+        before - self.voices.len()
     }
 
     /// 设置总音量；越界值钳到 0..=1（NaN 按 0 处理）。

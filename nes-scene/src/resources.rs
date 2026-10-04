@@ -515,13 +515,26 @@ impl ResourceTable {
                 let Some(id) = ResId::from_value(value) else {
                     continue;
                 };
-                let expected = tree
+                // 可接受类别全集（S15）：单类别提示退化为单元素表；
+                // ResourceMany（Sprite2D.texture = texture|video）解析出表内
+                // 全部已知类别。解析不出任何已知类别 = 该属性没有体检口径
+                //（与认不出的单类别提示同一口径 —— 跳过而不是误报）。
+                let accepted: Vec<AssetKind> = tree
                     .schema_of(node)
                     .and_then(|s| s.prop(prop))
-                    .and_then(|d| match d.hint() {
-                        EditorHint::Resource { kind, .. } => asset_kind_of_hint(kind),
-                        _ => None,
-                    });
+                    .map(|d| match d.hint() {
+                        EditorHint::Resource { kind, .. } => {
+                            asset_kind_of_hint(kind).into_iter().collect()
+                        }
+                        EditorHint::ResourceMany { kinds } => kinds
+                            .iter()
+                            .filter_map(|k| asset_kind_of_hint(k))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .unwrap_or_default();
+                // 报告口径类别 = 候选表首个（mismatch 信息里的"期望"）。
+                let expected = accepted.first().copied();
 
                 let is_new = !self.entries.contains_key(&id.0);
                 if is_new {
@@ -535,7 +548,10 @@ impl ResourceTable {
                         None => report
                             .undeclared
                             .push((id, expect, node_name.clone(), prop.to_string())),
-                        Some(got) if got != expect => {
+                        // S15：体检按**可接受全集**核对 —— 表内类别即合法
+                        //（Sprite2D.texture 声明成 Video 不再误报 mismatch），
+                        // 表外类别仍如实报（报告口径类别 = expected）。
+                        Some(got) if !accepted.contains(&got) => {
                             report.mismatches.push((id, expect, got, node_name.clone()));
                         }
                         Some(_) => {}
@@ -762,6 +778,8 @@ pub fn asset_kind_of_hint(hint: &str) -> Option<AssetKind> {
             Some(AssetKind::Texture)
         }
         "ogg" | "wav" | "mp3" | "flac" | "sound" | "sounds" | "sfx" => Some(AssetKind::Audio),
+        // S15：视频资源（稳定名 "Video" 走 from_str_exact；这里是别名/扩展名兜底）。
+        "video" | "videos" | "movie" | "movies" | "amv" | "avi" => Some(AssetKind::Video),
         "ttf" | "otf" | "fonts" => Some(AssetKind::Font),
         "ron" | "scenes" | "prefab" | "level" => Some(AssetKind::Scene),
         "js" | "nes" | "scripts" => Some(AssetKind::Script),

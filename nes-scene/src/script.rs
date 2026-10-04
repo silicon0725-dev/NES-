@@ -162,6 +162,21 @@ pub enum Op {
         /// 声音键（资产装载链注册进混音器的键，约定 = 资源路径去扩展名）。
         key: String,
     },
+    /// 开始播放一个视频（S15）：`video_play "key"` 的编译产物。与
+    /// [`Op::Play`] 同一形态 —— **无栈交互**的语句级副作用：经
+    /// [`VmCtx::video_play`] 发 [`crate::tree::Cmd::VideoPlay`] 入既有
+    /// Cmd 流，树落地取走缓冲、宿主渲染侧消费（起播计时 + 音轨）。
+    /// 播放状态不进树/指纹（headless 消费即弃）；loop/倍速归后续。
+    VideoPlay {
+        /// 视频键（约定 = 资源路径去扩展名，与声音键同一推导）。
+        key: String,
+    },
+    /// 停止播放一个视频（S15）：`video_stop "key"` 的编译产物，语义同
+    /// [`Op::VideoPlay`]（宿主消费即停计时 + 停音轨）。
+    VideoStop {
+        /// 视频键。
+        key: String,
+    },
 }
 
 /// 脚本入口。
@@ -260,6 +275,21 @@ impl VmCtx<'_, '_> {
         match self {
             VmCtx::Node(c) => c.play_sound(key),
             VmCtx::Signal(c) => c.play_sound(key),
+        }
+    }
+
+    /// 播放/停止视频（S15）：两入口同权（照 `play_sound` 的口径）。
+    fn video_play(&mut self, key: &str) {
+        match self {
+            VmCtx::Node(c) => c.video_play(key),
+            VmCtx::Signal(c) => c.video_play(key),
+        }
+    }
+
+    fn video_stop(&mut self, key: &str) {
+        match self {
+            VmCtx::Node(c) => c.video_stop(key),
+            VmCtx::Signal(c) => c.video_stop(key),
         }
     }
 }
@@ -799,6 +829,15 @@ fn run<'a, 'b>(
                 // play 不写树，"process 只写自身"纪律不涉及）。键未注册等
                 // 错误在宿主转混音器处如实报告，VM 层不校验（键面归音频）。
                 ctx.play_sound(key);
+            }
+            Op::VideoPlay { key } => {
+                // video_play "key"（S15）：与 Op::Play 同一形态 —— 零栈交互、
+                // 两入口同权、VM 层不校验键面（键未解析等错误在宿主渲染侧
+                // 如实报告：未声明的键静默丢弃，与 play 未注册键同家法）。
+                ctx.video_play(key);
+            }
+            Op::VideoStop { key } => {
+                ctx.video_stop(key);
             }
         }
         pc += 1;
@@ -1608,9 +1647,9 @@ fn lex_string(chars: &[char], mut line: usize, mut col: usize) -> Result<(String
 
 // ------------------------------------------------ 语法 -> Op
 
-const RESERVED: [&str; 16] = [
+const RESERVED: [&str; 18] = [
     "on", "every", "if", "else", "while", "for", "in", "step", "break", "continue", "emit",
-    "arg", "this", "true", "false", "play",
+    "arg", "this", "true", "false", "play", "video_play", "video_stop",
 ];
 
 /// 编译期循环上下文（S6.22）：`continue` 的目标（循环顶）即时可知；
@@ -2136,6 +2175,20 @@ impl TextParser {
                 self.pos += 1;
                 let key = self.expect_str()?;
                 ops.push(Op::Play { key });
+                Ok(())
+            }
+            // video_play / video_stop 语句（S15）：与 play 同一解析样式
+            //（语句级关键字 + 字符串字面量；键是编译期常量，无载荷表达式）。
+            Tok::Ident(k) if k == "video_play" => {
+                self.pos += 1;
+                let key = self.expect_str()?;
+                ops.push(Op::VideoPlay { key });
+                Ok(())
+            }
+            Tok::Ident(k) if k == "video_stop" => {
+                self.pos += 1;
+                let key = self.expect_str()?;
+                ops.push(Op::VideoStop { key });
                 Ok(())
             }
             // push/pop 语句（S8.2b-2）：读-改-写局部绑定（变异的是绑定，

@@ -443,6 +443,24 @@ pub enum Cmd {
         /// 声音键（资产装载链注册进混音器的键，约定 = 资源路径去扩展名）。
         key: String,
     },
+    /// 请求开始播放一个视频（S15；`video_play "key"` 语句的编译产物）。
+    ///
+    /// 与 [`Cmd::PlaySound`] 同一条纪律：树**不认识视频** —— 不解码、
+    /// 不计时、不碰渲染注册表；本命令只是脚本"播视频"意图进入既有
+    /// Cmd 流的形态。落地收进 [`Self::take_video_cmds`] 的取走缓冲，
+    /// 由宿主（nes-runtime）在 tick 后消费：起播计时 + 有音轨则转交
+    /// 混音器。播放状态全在渲染侧 —— **不进树、不进语义指纹**
+    ///（headless 消费即弃，确定性不受影响）。
+    VideoPlay {
+        /// 视频键（资产装载链解析出的键，约定 = 资源路径去扩展名）。
+        key: String,
+    },
+    /// 请求停止播放一个视频（S15；`video_stop "key"` 的编译产物）。
+    /// 语义同 [`Cmd::VideoPlay`]：树只收键名，宿主消费（停计时 + 停音轨）。
+    VideoStop {
+        /// 视频键。
+        key: String,
+    },
 }
 
 /// 行为代码看到的树句柄：**只读树 + 命令缓冲**。
@@ -585,6 +603,17 @@ impl<'a> NodeCtx<'a> {
     /// process 入口与信号入口都可发。
     pub fn play_sound(&mut self, key: &str) {
         self.cmds.push(Cmd::PlaySound { key: key.to_string() });
+    }
+
+    /// 请求开始播放一个视频（S15）：入既有 Cmd 流（[`Cmd::VideoPlay`]），
+    /// 与 [`Self::play_sound`] 同一条纪律 —— 不写树、两入口同权。
+    pub fn video_play(&mut self, key: &str) {
+        self.cmds.push(Cmd::VideoPlay { key: key.to_string() });
+    }
+
+    /// 请求停止播放一个视频（S15）：入既有 Cmd 流（[`Cmd::VideoStop`]）。
+    pub fn video_stop(&mut self, key: &str) {
+        self.cmds.push(Cmd::VideoStop { key: key.to_string() });
     }
 }
 
@@ -790,6 +819,17 @@ impl<'a> SignalCtx<'a> {
     pub fn play_sound(&mut self, key: &str) {
         self.cmds.push(Cmd::PlaySound { key: key.to_string() });
     }
+
+    /// 请求开始播放一个视频（S15；与 [`NodeCtx::video_play`] 同一条
+    /// Cmd 通道 —— 信号入口照发不误）。
+    pub fn video_play(&mut self, key: &str) {
+        self.cmds.push(Cmd::VideoPlay { key: key.to_string() });
+    }
+
+    /// 请求停止播放一个视频（S15；与 [`NodeCtx::video_stop`] 同通道）。
+    pub fn video_stop(&mut self, key: &str) {
+        self.cmds.push(Cmd::VideoStop { key: key.to_string() });
+    }
 }
 
 /// 空观察者：宿主没有行为代码时的缺省。
@@ -962,6 +1002,28 @@ pub struct SceneTree {
     /// 聚积的副作用缓冲，不进语义指纹（音频不是树状态，取走与否不影响
     /// 结构/属性/局部）；无人取走时仅占内存、不影响任何语义输出。
     played_sounds: Vec<String>,
+    /// [`Cmd::VideoPlay`] / [`Cmd::VideoStop`] 的落地缓冲（S15）：与
+    /// `played_sounds` 同构 —— 树不解释视频，只把脚本请求的视频键按
+    /// **发射序**收在这里（play/stop 混排时序如实保留），宿主经
+    /// [`Self::take_video_cmds`] 取走转交渲染侧播放状态机。不进语义
+    /// 指纹；无人取走即自然蒸发。
+    video_cmds: Vec<VideoCmd>,
+}
+
+/// 视频控制命令（S15）：[`SceneTree::take_video_cmds`] 取走缓冲的元素。
+/// 树侧只是键的搬运工，播放语义（计时/换页/音轨）全在宿主渲染侧。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VideoCmd {
+    /// 起播（[`Cmd::VideoPlay`] 的落地形态）。
+    Play {
+        /// 视频键。
+        key: String,
+    },
+    /// 停播（[`Cmd::VideoStop`] 的落地形态）。
+    Stop {
+        /// 视频键。
+        key: String,
+    },
 }
 
 impl SceneTree {
@@ -1005,6 +1067,7 @@ impl SceneTree {
             paused: false,
             time_scale: 1.0,
             played_sounds: Vec::new(),
+            video_cmds: Vec::new(),
         }
     }
 
@@ -2046,6 +2109,17 @@ impl SceneTree {
         std::mem::take(&mut self.played_sounds)
     }
 
+    /// 取走自上次取走以来脚本请求的视频控制命令（S15；**发射序**，
+    /// play/stop 混排时序如实保留）。宿主（nes-runtime）在 tick 后调它，
+    /// 把命令转交渲染侧播放状态机；headless 不接渲染时不调即静默丢弃。
+    ///
+    /// 缓冲是副作用通道不是状态：不进语义指纹、不进序列化（与
+    /// [`Self::take_played_sounds`] 同一条纪律 —— 同一轨迹跑两遍指纹
+    /// 逐位相同）。
+    pub fn take_video_cmds(&mut self) -> Vec<VideoCmd> {
+        std::mem::take(&mut self.video_cmds)
+    }
+
     // ---------- 内部：不变式维护 ----------
 
     fn next_order(&mut self) -> u64 {
@@ -2081,6 +2155,14 @@ impl SceneTree {
                 // take_played_sounds 取走转交混音器；无人取走即自然蒸发
                 //（headless 零成本丢弃，确定性不受影响 —— 缓冲不进指纹）。
                 self.played_sounds.push(key);
+            }
+            Cmd::VideoPlay { key } => {
+                // 树不认识视频（S15）：与 PlaySound 同一条通道纪律 ——
+                // 只收键名，宿主 tick 后经 take_video_cmds 取走转交渲染侧。
+                self.video_cmds.push(VideoCmd::Play { key });
+            }
+            Cmd::VideoStop { key } => {
+                self.video_cmds.push(VideoCmd::Stop { key });
             }
         }
     }

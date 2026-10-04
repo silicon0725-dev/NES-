@@ -16,6 +16,10 @@ pub enum AssetKind {
     Texture,
     /// 音频（ogg/wav）。
     Audio,
+    /// 视频（S15：amv/avi —— 容器经 nes-media 解析，当前帧经渲染侧
+    /// 同键逐帧覆写上 GPU；`is_render_facing` = true，与纹理共用
+    /// RenderAssetKey 命名空间机制）。
+    Video,
     /// 字体（ttf/otf）。
     Font,
     /// 子场景（ron）。
@@ -30,9 +34,10 @@ pub enum AssetKind {
 
 impl AssetKind {
     /// 全部分类，顺序与 [`AssetKind::as_str`] 的声明顺序一致。
-    pub const ALL: [AssetKind; 7] = [
+    pub const ALL: [AssetKind; 8] = [
         Self::Texture,
         Self::Audio,
+        Self::Video,
         Self::Font,
         Self::Scene,
         Self::Script,
@@ -45,6 +50,7 @@ impl AssetKind {
         match self {
             Self::Texture => "Texture",
             Self::Audio => "Audio",
+            Self::Video => "Video",
             Self::Font => "Font",
             Self::Scene => "Scene",
             Self::Script => "Script",
@@ -58,6 +64,7 @@ impl AssetKind {
         Some(match s {
             "Texture" => Self::Texture,
             "Audio" => Self::Audio,
+            "Video" => Self::Video,
             "Font" => Self::Font,
             "Scene" => Self::Scene,
             "Script" => Self::Script,
@@ -70,8 +77,12 @@ impl AssetKind {
     /// 该分类是否面向渲染后端（即是否拥有 `RenderAssetKey` 视图）。
     ///
     /// 草案第 11 节：`RenderAssetKey` 视为 AssetRegistry 中 **Texture 类**的一面视图。
+    /// S15 起 **Video 类同面**：视频资源的"当前帧"就是一张纹理 —— 每帧
+    /// 经渲染注册表同键覆写（字形页/纹理热重载已验证的路径），Sprite2D
+    /// 的 texture 属性经提取层 `RenderKeySource` 解析到同一个键。键位
+    /// 编码只含 `(slot, gen)`，两类资源天然不同槽位，命名空间不冲突。
     pub const fn is_render_facing(self) -> bool {
-        matches!(self, Self::Texture)
+        matches!(self, Self::Texture | Self::Video)
     }
 }
 
@@ -222,11 +233,18 @@ mod tests {
     }
 
     #[test]
-    fn render_view_is_texture_only() {
+    fn render_view_is_texture_and_video_only() {
         let tex = AssetKey::new(1, 0, AssetKind::Texture);
         let view = tex.as_render_key().expect("texture 应有渲染视图");
         assert_eq!(view.to_bits(), tex.to_bits());
         assert_eq!(AssetKey::from_render_key(view, AssetKind::Texture), Some(tex));
+
+        // S15：Video 类与 Texture 同为渲染面（视频当前帧 = 同键覆写的
+        // 纹理载体）；其余类别仍然无渲染视图。
+        let video = AssetKey::new(2, 0, AssetKind::Video);
+        let vview = video.as_render_key().expect("video 应有渲染视图");
+        assert_eq!(vview.to_bits(), video.to_bits());
+        assert_eq!(AssetKey::from_render_key(vview, AssetKind::Video), Some(video));
 
         let audio = AssetKey::new(1, 0, AssetKind::Audio);
         assert_eq!(audio.as_render_key(), None);

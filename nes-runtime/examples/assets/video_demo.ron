@@ -1,0 +1,24 @@
+// S15 视频演示场景：一个 Video 资源 + 全屏 Sprite 引用它 + 首帧起播脚本。
+//
+// 装载链：Res(id:1, kind:"Video") -> bind 读 Media/spider.amv -> nes-media
+// 解析容器（AMV 内容探测）-> 第 0 帧上传 GPU（键 = AssetKey 渲染视图）->
+// 脚本 `video_play "Media/spider"` -> Cmd::VideoPlay -> tick 后转渲染侧
+// 播放状态机 -> 每帧当前解码帧同键覆写上 GPU（Sprite 即播画面）；
+// 有音轨（IMA ADPCM）则混音器同步出声（P0 起点对齐）。
+Scene(
+    version: 1,
+    resources: [
+        Res(id: 1, path: "Media/spider.amv", kind: "Video"),
+    ],
+    root: Node(
+        name: "main",
+        kind: "Node",
+        children: [
+            Node(name: "cam", kind: "Camera2D", local: (x: 192.0, y: 108.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), children: [],),
+            // 全屏 Sprite：160x128 的视频拉伸铺满 384x216 视口（sx=2.4, sy=1.6875）。
+            Node(name: "tv", kind: "Sprite2D", local: (x: 0.0, y: 0.0, rot: 0.0, sx: 2.4, sy: 1.6875, skew: 0.0), props: { "texture": Resource(1) }, children: [],),
+            Node(name: "hud", kind: "Label", local: (x: 8.0, y: 4.0, rot: 0.0, sx: 1.0, sy: 1.0, skew: 0.0), props: { "text": "S15 VIDEO DEMO | spider.amv 160x128@15fps | frame no. in stdout" }, children: [],),
+            Node(name: "game", kind: "Script", props: { "source": "every { if n < 1 { n = n + 1\n  video_play \"Media/spider\" } }" }, children: [],),
+        ],
+    ),
+)

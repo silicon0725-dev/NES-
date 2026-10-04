@@ -10,3 +10,8 @@ wgpu-win/lib/*.dll.a
 *.tmp
 .mimosa/
 nes-media/avi_probe_out/
+
+# S15：视频演示资产不入库（用户机器实测 AMV，十几 MB 级；video_demo /
+# editor_shell 启动时若缺失会从用户目录复制，都没有就打印提示退出）
+nes-runtime/examples/assets/Media/*.amv
+nes-runtime/examples/assets/Media/*.avi
