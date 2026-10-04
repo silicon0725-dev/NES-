@@ -153,6 +153,33 @@
 //! 音频钟主控严格同步 —— S15.1）、STOP 停播（记 "video stopped"，
 //! stop_key 点名停音轨）。
 //!
+//! S18.1（**编辑器时间轴 dock**）：Output dock 上方的全宽面板（高 110，
+//! 九宫格皮肤 + "TIMELINE" 标题行 —— 其余 dock 布局高度相应让位：左右
+//! 面板与可编辑区底缘统一上移）。三块内容：
+//! ① **补间行区**（ListView 复用）：选中节点的活动补间投影 —— 每帧从
+//!    `SceneTree::tween_rows(primary)` 现算（Selection 主选中驱动，照
+//!    Inspector 同款纪律），行格式冻结 ASCII：
+//!    `POS  43%  ease_out  yoyo  (812ms/1500ms)`；无补间 = 单行
+//!    `(no tweens on selection)`、无选中 = `(no selection)`；
+//! ② **进度条**：每行下沿 2px 细条（fill_slot selected 色，宽 = 行宽 ×
+//!    progress）—— Control 池路线（TL_BARS=4，照网格条带池先例，选池
+//!    而非文本进度条：与九宫格面板观感同语言、行宽自适应免截断）；
+//! ③ **创建控制行**：`NEW: [POS][SCALE][ALPHA]  to=(x,y)  ms=500
+//!    [linear][once]  [APPLY]` —— 通道按钮三枚（* 后缀 = 选中通道）+
+//!    目标数值 TextInput×2（pos 用 x/y；scale 用 sx/sy；alpha 单值复用
+//!    x 框）+ 时长 TextInput + 缓动/模式循环按钮（照 SEL/SNAP 循环口径）
+//!    + APPLY。
+//!
+//!    APPLY 语义 = **从当前值起算**：经树宿主 API
+//!    `register_tween_channel` 落地（from = 登记处采样当前实际值，与脚本
+//!    Cmd 同一条登记表路径）；输入非数值/无选中/拒收 → Output 报行不落地。
+//!
+//! 交互防护：时间轴全部控件进 hit 护盾数组（press_in_control 同款 ——
+//! 压上不清选中不框选）；三个 TextInput 并入焦点门（持焦时键盘挂载流/
+//! 音乐键让位输入）；"tldock" 容器进层级树 walk 过滤表。确定性边界：
+//! 编辑器创建的补间与脚本 Cmd 同一登记表 = 编辑态会话态（不进 RON、
+//! 编辑器不参与 headless 指纹 —— S18.1 文档 §3）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -235,6 +262,8 @@ mod editor_theme {
     pub const SLOT_ACCENT_NAME: &str = "accent";
     /// 次级文字槽。
     pub const SLOT_TEXT_DIM_NAME: &str = "text_dim";
+    /// 选中槽（S18.1 时间轴进度条 —— 进度 = "走向哪里"的语义色）。
+    pub const SLOT_SELECTED_NAME: &str = "selected";
 
     // ---- 间距栅格 ----
     /// 外边距（S12-4 冻结）。
@@ -253,6 +282,14 @@ mod editor_theme {
     pub const STATUS_BAND: f32 = 24.0;
     /// 底部 Output dock 高。
     pub const DOCK_H: f32 = 96.0;
+    /// 底部时间轴 dock 高（S18.1，Output 上方 —— 标题 18 + 行区 58 + 缝 4
+    /// + 创建控制行 20 + 上下留白 10）。
+    pub const TIMELINE_H: f32 = 110.0;
+    /// 时间轴标题行高（"TIMELINE"，与 dock 标题行同款）。
+    pub const TL_TITLE_H: f32 = 18.0;
+    /// 时间轴补间行区列表高（3 行 × 18 + 4px 顶内衬 —— ListView 行几何
+    /// 与 Output dock 同一口径）。
+    pub const TL_LIST_H: f32 = 58.0;
     /// 视口工具栏高。
     pub const TOOLBAR_H: f32 = 24.0;
     /// 工具栏按钮尺寸与步进。
@@ -292,8 +329,9 @@ mod editor_theme {
 use editor_theme::{
     DOCK_H, DOCK_ROW_H, DOCK_TITLE_H, FS_ROW_H, FS_SEP_H, FS_TITLE_H, INS_ROW_H, INSPECTOR_INSET,
     INSPECTOR_W, LEFT_PANEL_W, MARGIN, PALETTE, RULER_W, SKIN_BTN_MARGIN, SKIN_PANEL_MARGIN,
-    SPACE_S, SLOT_ACCENT_NAME, SLOT_BORDER_NAME, SLOT_PANEL_NAME, SLOT_TEXT_DIM_NAME, STATUS_BAND,
-    TOOLBAR_BTN_H, TOOLBAR_BTN_STEP, TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
+    SPACE_S, SLOT_ACCENT_NAME, SLOT_BORDER_NAME, SLOT_PANEL_NAME, SLOT_SELECTED_NAME,
+    SLOT_TEXT_DIM_NAME, STATUS_BAND, TL_LIST_H, TL_TITLE_H, TIMELINE_H, TOOLBAR_BTN_H,
+    TOOLBAR_BTN_STEP, TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
 };
 
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
@@ -418,15 +456,17 @@ fn load_user_music(
     }
 }
 
-/// 布局常量补注（S12-4 冻结、S12-6 扩底部 dock；数值定义已收敛进
-/// [`EditorTheme`]）：面板**恒定宽** —— 最大化只扩中间世界视口，侧面板
-/// 不跟着拉伸（消除"整个画面被拉长"观感的关键）。
-/// - 左层级面板：x = 8..188（宽 180），y = 40..ch-dock 上缘；
-/// - 右检查器面板：x = cw-198..cw-8（宽 190），y = 8..ch-dock 上缘；
-/// - 底部 Output dock：高 96，y = ch-dock-状态栏..ch-状态栏，全宽；
+/// 布局常量补注（S12-4 冻结、S12-6 扩底部 dock、S18.1 再扩时间轴 dock；
+/// 数值定义已收敛进 [`EditorTheme`]）：面板**恒定宽** —— 最大化只扩中间
+/// 世界视口，侧面板不跟着拉伸（消除"整个画面被拉长"观感的关键）。
+/// - 左层级面板：x = 8..188（宽 180），y = 40..ch-dock-timeline 上缘；
+/// - 右检查器面板：x = cw-198..cw-8（宽 190），y = 8..ch-dock-timeline 上缘；
+/// - 底部 Output dock：高 96，y = ch-timeline-dock-状态栏..ch-状态栏，全宽；
+/// - 底部时间轴 dock（S18.1）：高 110，紧贴 Output dock 上方，全宽；
 /// - 状态栏文本：y = ch-20（底部 16 文本 + 8 边距）；
 /// - 视口可编辑区 = 两面板之间再让出顶/左各 16px 标尺（标尺不属于
-///   可编辑区，Godot 口径）：视口高 = ch - 40 - (dock 96 + 状态栏 24)。
+///   可编辑区，Godot 口径）：视口高 = ch - 40 - (timeline 110 + dock 96
+///   + 状态栏 24)。
 ///
 /// 编辑器日志环形保留行数（新行在下，满 N 丢最旧 —— Godot Output
 /// 的最小语义；可见窗只放最新能放下的几行，最新行永远可见）。S12-8
@@ -444,6 +484,58 @@ const EDITOR_LOG_KEEP: usize = 29;
 /// 不随真字体装载变化，40 字 × 16px = 640px，最小窗 768 下 dock 内衬
 ///（≈748px）也放得下，行尾不裁字。口径复核（S12-11）：不变。
 const DOCK_LINE_CHARS: usize = 40;
+
+// ---- S18.1 时间轴 dock（编辑器补间可视化 + 创建控制）----
+//
+// 布局裁决（Output dock 上方，全宽）：标题行 + 补间行区（ListView 复用）
+// + 创建控制行。其余 dock 布局高度相应让位（见循环内布局投影块 —— 左右
+// 面板与可编辑区底缘统一上移 TIMELINE_H）。全部控件进 hit 护盾数组、
+// "tldock" 容器进层级树 walk 过滤表（照 grid/dock 先例）。
+
+/// 时间轴补间行池上限（= 行区可见行数 (58-4)/18 = 3，留 1 备用）：进度
+/// 细条按行渲染（fill_slot selected 色、行下沿 2px）—— 照网格条带池
+/// 先例，控件数恒定有界。行数超出可见窗的进度条不画（列表滚动是 UiVm
+/// 瞬态，宿主无钉底通道 —— 宁可少画也不画到列表外）。
+const TL_BARS: usize = 4;
+/// 创建控制行的通道按钮（循环选中态 * 后缀 = 工具栏 SEL/SNAP 同款口径）。
+/// alpha 单值复用 x 输入框（y 框对 alpha 无语义，投影禁用但不隐藏）。
+const TL_CHANNELS: [&str; 3] = ["POS", "SCALE", "ALPHA"];
+/// 缓动循环档序（TweenEasing::from_str_exact 的合法名单同序）。
+const TL_EASINGS: [&str; 5] = ["linear", "smoothstep", "ease_in", "ease_out", "ease_in_out"];
+/// 模式循环档序（TweenMode::from_str_exact 的合法名单同序）。
+const TL_MODES: [&str; 3] = ["once", "yoyo", "loop"];
+/// 创建控制行水平原点（面板内衬，与 dock 标题同款）。
+const TL_CTL_X: f32 = 10.0;
+/// 创建控制行控件表：(x, 宽)。标签与按钮/输入框的水平布局单点出 ——
+/// 投影块每帧按此表重写 offset/size（窗口一变当帧跟上，S12-4 口径）。
+/// 768 最小窗全宽 752 下总占地 ~562px，放得下。
+const TL_CTL_LAYOUT: [(f32, f32); 9] = [
+    (44.0, 40.0),  // POS
+    (88.0, 50.0),  // SCALE
+    (142.0, 48.0), // ALPHA
+    (218.0, 40.0), // x 输入框（pos x / scale sx / alpha a 单值复用）
+    (262.0, 40.0), // y 输入框（pos y / scale sy；alpha 无语义）
+    (332.0, 48.0), // ms 输入框
+    (384.0, 76.0), // 缓动循环按钮
+    (464.0, 48.0), // 模式循环按钮
+    (516.0, 56.0), // APPLY
+];
+
+/// 时间轴行文本（S18.1 冻结格式，全 ASCII）：
+/// `POS  43%  ease_out  yoyo  (812ms/1500ms)` —— 通道大写 / 进度百分比
+///（线性时间进度取整，缓动以名字单独成列）/ 缓动 / 模式 / 已耗/时长。
+/// 字段全部来自 [`nes_scene::TweenRow`] 稳定名，壳层零自有解析。
+fn tl_row_text(r: &nes_scene::TweenRow) -> String {
+    format!(
+        "{}  {:.0}%  {}  {}  ({}ms/{}ms)",
+        r.channel.to_ascii_uppercase(),
+        r.progress * 100.0,
+        r.easing,
+        r.mode,
+        r.elapsed_ms as i64,
+        r.duration_ms as i64,
+    )
+}
 
 /// 文件系统 dock（S12-8，Godot 左下 res:// 面板）布局常量：
 /// - 分隔条厚度（4px border 槽条）与标题行高（"res:/" 16px 文本行）；
@@ -1137,7 +1229,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -1305,6 +1397,110 @@ fn main() {
         let _ = tree.set_prop(fs_tree, "row_h", Value::I64(FS_ROW_H as i64));
         let _ = tree.set_prop(fs_tree, "selected", Value::I64(-1));
         tree.set_prop_raw(fs_tree, "z_index", Value::I64(-60));
+        // 时间轴 dock（S18.1，Output 上方的全宽面板）：九宫格皮肤铺底 +
+        // "TIMELINE" 标题 + 补间行区 ListView（选中节点的活动补间投影，
+        // 行文本 = tl_row_text 冻结格式）+ 进度细条池（fill_slot selected、
+        // 行下沿 2px —— 照网格条带池先例）+ 创建控制行（POS/SCALE/ALPHA
+        // 通道按钮 + to x/y + ms 三个 TextInput + 缓动/模式循环按钮 +
+        // APPLY）。offset/size 装配期占位，每帧布局投影重写。挂 "tldock"
+        // 容器：walk 整子树跳过（时间轴是观感/工具，不是可编辑对象）。
+        // z 纪律同 dock：铺底/标题/列表 -80（场景对象优先于观感），进度条
+        // -79（列表之上、精灵之下），交互控件缺省 z（工具栏按钮同款）。
+        let tldock = tree.add_node(root, "tldock", NodeKind::Node);
+        let tl_bg = tree.add_node(tldock, "tl_bg", NodeKind::Control);
+        let _ = tree.set_prop(tl_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(tl_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, 200.0)));
+        let _ = tree.set_prop(tl_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(600.0, TIMELINE_H)));
+        let _ = tree.set_prop(tl_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+        skin_panel(tree, tl_bg);
+        tree.set_prop_raw(tl_bg, "z_index", Value::I64(-80));
+        let tl_title = tree.add_node(tldock, "tl_title", NodeKind::Label);
+        tree.set_local(tl_title, Transform2D::from_pos(MARGIN + 2.0, 201.0));
+        let _ = tree.set_prop(tl_title, PROP_LABEL_TEXT, Value::Str("TIMELINE".into()));
+        let _ = tree.set_prop(tl_title, "font_size", Value::I64(UI_FONT_SIZE));
+        tree.set_prop_raw(tl_title, "z_index", Value::I64(-80));
+        let hud_tl = tree.add_node(tldock, "hud_tl", NodeKind::ListView);
+        let _ = tree.set_prop(hud_tl, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(hud_tl, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN + 2.0, 219.0)));
+        let _ = tree.set_prop(hud_tl, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(600.0, TL_LIST_H)));
+        let _ = tree.set_prop(hud_tl, "rows", Value::Str(String::new()));
+        let _ = tree.set_prop(hud_tl, "row_h", Value::I64(DOCK_ROW_H as i64));
+        tree.set_prop_raw(hud_tl, "z_index", Value::I64(-80));
+        // 进度细条池：行 i 的下沿 = 列表顶 +4 + i×18 + (18-2)。visible=false
+        // 备用（每帧按 tween_rows 投影布线，照网格条带池纪律）。
+        let mut tl_bars = Vec::with_capacity(TL_BARS);
+        for _ in 0..TL_BARS {
+            let bar = tree.add_node(tldock, "tl_bar", NodeKind::Control);
+            let _ = tree.set_prop(bar, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(bar, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 2.0)));
+            let _ = tree.set_prop(bar, "fill_slot", Value::Str(SLOT_SELECTED_NAME.into()));
+            let _ = tree.set_prop(bar, "visible", Value::Bool(false));
+            tree.set_prop_raw(bar, "z_index", Value::I64(-79));
+            tl_bars.push(bar);
+        }
+        // 创建控制行（行 y 由布局投影每帧重写；x 恒定 —— TL_CTL_LAYOUT
+        // 单点出表）。三枚说明标签（text_dim 色）+ 六按钮（九宫格底板 ×6
+        // 同工具栏口径）+ 三输入框。
+        let tl_new_label = tree.add_node(tldock, "tl_new_label", NodeKind::Label);
+        tree.set_local(tl_new_label, Transform2D::from_pos(-1000.0, -1000.0));
+        let _ = tree.set_prop(tl_new_label, PROP_LABEL_TEXT, Value::Str("NEW:".into()));
+        let _ = tree.set_prop(tl_new_label, "font_size", Value::I64(UI_FONT_SIZE));
+        let _ = tree.set_prop(tl_new_label, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
+        let tl_to_label = tree.add_node(tldock, "tl_to_label", NodeKind::Label);
+        tree.set_local(tl_to_label, Transform2D::from_pos(-1000.0, -1000.0));
+        let _ = tree.set_prop(tl_to_label, PROP_LABEL_TEXT, Value::Str("to=".into()));
+        let _ = tree.set_prop(tl_to_label, "font_size", Value::I64(UI_FONT_SIZE));
+        let _ = tree.set_prop(tl_to_label, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
+        let tl_ms_label = tree.add_node(tldock, "tl_ms_label", NodeKind::Label);
+        tree.set_local(tl_ms_label, Transform2D::from_pos(-1000.0, -1000.0));
+        let _ = tree.set_prop(tl_ms_label, PROP_LABEL_TEXT, Value::Str("ms=".into()));
+        let _ = tree.set_prop(tl_ms_label, "font_size", Value::I64(UI_FONT_SIZE));
+        let _ = tree.set_prop(tl_ms_label, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
+        let mut tl_plates = Vec::with_capacity(6);
+        for &(px, pw) in TL_CTL_LAYOUT.iter().take(6) {
+            let plate = tree.add_node(tldock, "tl_plate", NodeKind::Control);
+            let _ = tree.set_prop(plate, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(plate, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(TL_CTL_X + px, 280.0)));
+            let _ = tree.set_prop(plate, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
+            let _ = tree.set_prop(plate, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+            skin_button(tree, plate);
+            tree.set_prop_raw(plate, "z_index", Value::I64(-79));
+            tl_plates.push(plate);
+        }
+        let mk_tl_btn = |tree: &mut nes_scene::SceneTree, name: &str, i: usize| {
+            let (px, pw) = TL_CTL_LAYOUT[i];
+            let b = tree.add_node(tldock, name, NodeKind::Button);
+            let _ = tree.set_prop(b, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(b, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(TL_CTL_X + px, 280.0)));
+            let _ = tree.set_prop(b, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
+            let _ = tree.set_prop(b, "text", Value::Str(String::new()));
+            // 字号 14 与工具栏同源；fill_slot 置空 = 透明底，九宫格底板
+            // 纹理透出（S18 换肤口径，hover/pressed 四态照常叠加）。
+            tree.set_prop_raw(b, "font_size", Value::I64(UI_FONT_SIZE));
+            tree.set_prop_raw(b, "fill_slot", Value::Str(String::new()));
+            b
+        };
+        let tl_pos = mk_tl_btn(tree, "tl_pos", 0);
+        let tl_scale = mk_tl_btn(tree, "tl_scale", 1);
+        let tl_alpha = mk_tl_btn(tree, "tl_alpha", 2);
+        let tl_ease = mk_tl_btn(tree, "tl_ease", 6);
+        let tl_mode = mk_tl_btn(tree, "tl_mode", 7);
+        let tl_apply = mk_tl_btn(tree, "tl_apply", 8);
+        let mk_tl_input = |tree: &mut nes_scene::SceneTree, name: &str, i: usize, init: &str| {
+            let (px, pw) = TL_CTL_LAYOUT[i];
+            let n = tree.add_node(tldock, name, NodeKind::TextInput);
+            let _ = tree.set_prop(n, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(n, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(TL_CTL_X + px, 280.0)));
+            let _ = tree.set_prop(n, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
+            let _ = tree.set_prop(n, "text", Value::Str(init.to_string()));
+            // 字号 14（S12-11 前向通道 —— schema 无该键，提取层读属性缺省 16）。
+            tree.set_prop_raw(n, "font_size", Value::I64(UI_FONT_SIZE));
+            n
+        };
+        let tl_x_in = mk_tl_input(tree, "tl_x_in", 3, "0");
+        let tl_y_in = mk_tl_input(tree, "tl_y_in", 4, "0");
+        let tl_ms_in = mk_tl_input(tree, "tl_ms_in", 5, "500");
         // 视口工具栏（S12-7/F-4，Godot 2D 视口顶部工具条观感）：标尺
         // 之上一条 24px 工具带 —— panel 槽铺底 + 底缘 1px border 分隔
         // 线 + SEL/SNAP/GRID 三个开关按钮（UiVm on_activate 已通）。
@@ -1407,15 +1603,17 @@ fn main() {
         tree.set_prop_raw(tool_reset, "fill_slot", Value::Str(String::new()));
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
         tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
+        // 演示对象 y=130（S18.1 起：时间轴 dock 让走了下方 ~110px ——
+        // 对象留在缩小后视口带内（80..dock 上缘），不再压进时间轴面板）。
         let obj1 = tree.add_node(root, "obj1", NodeKind::Sprite2D);
         tree.set_prop(obj1, PROP_TEXTURE, Value::Resource(1)).unwrap();
-        tree.set_local(obj1, Transform2D::from_pos(280.0, 180.0));
+        tree.set_local(obj1, Transform2D::from_pos(280.0, 130.0));
         let obj2 = tree.add_node(root, "obj2", NodeKind::Sprite2D);
         tree.set_prop(obj2, PROP_TEXTURE, Value::Resource(2)).unwrap();
-        tree.set_local(obj2, Transform2D::from_pos(380.0, 180.0));
+        tree.set_local(obj2, Transform2D::from_pos(380.0, 130.0));
         let obj3 = tree.add_node(root, "obj3", NodeKind::Sprite2D);
         tree.set_prop(obj3, PROP_TEXTURE, Value::Resource(3)).unwrap();
-        tree.set_local(obj3, Transform2D::from_pos(480.0, 180.0));
+        tree.set_local(obj3, Transform2D::from_pos(480.0, 130.0));
         // Hierarchy 面板（S12-3 ListView 真消费者）：视口锚定控件，
         // 行文本 `rows` 与选中下标 `selected` 由宿主每帧投影（树是
         // 投影不是语义来源），行点击与滚轮滚动由 UiVm 驱动（宿主零
@@ -1506,7 +1704,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -1546,6 +1744,15 @@ fn main() {
     let mut fs_sel: Option<usize> = None;
     let mut fs_focus = false;
     let mut fs_last_press: Option<(u64, usize)> = None;
+    // 时间轴 dock 会话态（S18.1，不进树、不落盘）：通道/缓动/模式循环
+    // 档下标（创建控制行的循环按钮现态）+ 三个输入框的已提交值（会话
+    // 值 —— APPLY 落地取这里，输入框 text 属性只管显示）。
+    let mut tl_channel: usize = 0; // 0 = POS / 1 = SCALE / 2 = ALPHA
+    let mut tl_ease_idx: usize = 0; // TL_EASINGS 档序（缺省 linear = 脚本面缺省）
+    let mut tl_mode_idx: usize = 0; // TL_MODES 档序（缺省 once = 脚本面缺省）
+    let mut tl_x = String::from("0");
+    let mut tl_y = String::from("0");
+    let mut tl_ms = String::from("500");
 
     // 状态栏的 undo/redo 键按下沿检测。
     let mut prev_z = false;
@@ -1654,13 +1861,29 @@ fn main() {
     // 宿主帧后落 Inspector::modify_name 一条 Modified 事务）。
     let rename_sink: Rc<RefCell<Vec<(Uid, String)>>> = Rc::new(RefCell::new(Vec::new()));
     let rename_bound: Rc<RefCell<Option<Uid>>> = Rc::new(RefCell::new(None));
+    // 时间轴输入框提交落点（S18.1，UiVm 零写权延续 —— 帧内只报
+    // (字段号, 值)，帧后宿主落会话值 + text 属性双写）。
+    let tl_input_sinks: Rc<RefCell<Vec<(usize, String)>>> = Rc::new(RefCell::new(Vec::new()));
     {
         let sink = rename_sink.clone();
         let bound = rename_bound.clone();
-        rt.ui_vm_mut().on_commit(move |_node, value| {
-            if let Value::Str(name) = value {
+        let tl_sink = tl_input_sinks.clone();
+        let tl_map: std::collections::BTreeMap<nes_scene::NodeId, usize> = [
+            (tl_x_in, 0usize),
+            (tl_y_in, 1),
+            (tl_ms_in, 2),
+        ]
+        .into_iter()
+        .collect();
+        rt.ui_vm_mut().on_commit(move |node, value| {
+            if let Value::Str(s) = value {
+                // 时间轴输入框优先分派（字段号带回 —— 不进改名落账面）。
+                if let Some(f) = tl_map.get(&node) {
+                    tl_sink.borrow_mut().push((*f, s));
+                    return;
+                }
                 if let Some(uid) = bound.borrow().clone() {
-                    sink.borrow_mut().push((uid, name));
+                    sink.borrow_mut().push((uid, s));
                 }
             }
         });
@@ -1687,8 +1910,9 @@ fn main() {
             }
         });
     }
-    // 工具栏按钮激活落点（UiVm 零写权延续 —— 帧内报按钮名，帧后宿主
-    // 翻开关并记日志；与行点击同一共享缓冲模式）。
+    // 工具栏 + 时间轴按钮激活落点（UiVm 零写权延续 —— 帧内报按钮名，帧后
+    // 宿主翻开关/落创建控制；与行点击同一共享缓冲模式）。时间轴按钮名带
+    // tl_ 前缀（落账段按前缀分流，见循环尾）。
     let tool_clicks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     {
         let names: std::collections::BTreeMap<nes_scene::NodeId, &str> = [
@@ -1698,6 +1922,12 @@ fn main() {
             (tool_play, "play"),
             (tool_stop, "stop"),
             (tool_reset, "reset"),
+            (tl_pos, "tl_pos"),
+            (tl_scale, "tl_scale"),
+            (tl_alpha, "tl_alpha"),
+            (tl_ease, "tl_ease"),
+            (tl_mode, "tl_mode"),
+            (tl_apply, "tl_apply"),
         ]
         .into_iter()
         .collect();
@@ -1729,6 +1959,13 @@ fn main() {
     let mut demo_spin_x = 0.0f32;
     let mut demo_play_text = String::new();
     let mut demo_ime_draft = String::new();
+    // S18.1 时间轴取证：APPLY 后补间行投影文本（帧 288 采样）+ 两个与
+    // 刷新率无关的闩锁（帧 ≥284 逐帧观察登记表长度：见过 >0 = 活动补间
+    // 真实入表；其后见过 ==0 = 推进/到站移除真实发生 —— 时间基准是帧差
+    // 累计的毫秒，固定帧号采样会随刷新率漂移，闩锁不会）。
+    let mut demo_tl_rows = String::new();
+    let mut demo_tl_seen_active = false;
+    let mut demo_tl_seen_done = false;
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -1778,25 +2015,29 @@ fn main() {
                 72 => inject_input(InputEvent::Key { key: Key::Other(VK_F8), down: false }),
                 // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
                 // spin.nes 行（768x432 客户区）。S15 起 res:// 树多出
-                // Media/（演示视频目录 + 条目两行）—— 默认 55% 档的
-                // fs 列表（~5.8 行可见）装不下 spin.nes：先 F9 切
-                // files 档再双击。S17.4 起 Extensions/ 多出 shake.js
-                //（真扩展实战入库）—— 字典序在 Scripts/ 之上，spin.nes
-                // 整体再下移一行（行高 18）：files 档 y≈307 / 默认档
-                // y≈310。两次点击沿间隔 10 帧 < 30（双击裁决窗），挂载
-                // 后 U 卸载回空 registry_key（树形态断言兼容）。Media/
-                // 缺席的机器保持默认档布局 —— 断言面（fs open / mount
-                // 行）两种形态都成立。
+                // Media/（演示视频目录 + 条目两行）；S18.1 起时间轴 dock
+                // 又让走 110px —— 左栏可用高 162，files 档 fs 列表仅
+                // ~4.3 行可见（顶 y=123.2），spin.nes（Media 在场时行 7）
+                // 在可见窗之外：先在 fs 树上滚轮下滚 4 格（ListView 步长
+                // = row_h 18；scroll 钳到 scroll_max ≈ 73），spin 行落进
+                // 窗内（屏上 y ≈ 181/180）再双击（两次点击沿间隔 <30 帧
+                // = 双击裁决窗）。Media/ 缺席的机器保持默认档布局，行 5
+                // 同法可达 —— 断言面（fs open / mount 行）两种形态都成立。
                 74 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: true }),
                 76 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: false }),
-                80 => inject_input(InputEvent::MouseMove {
+                78 => inject_input(InputEvent::MouseMove { x: 60.0, y: 160.0 }),
+                80 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
+                82 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
+                84 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
+                86 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
+                88 => inject_input(InputEvent::MouseMove {
                     x: 60.0,
-                    y: if video_present { 307.0 } else { 310.0 },
+                    y: if video_present { 189.0 } else { 188.0 },
                 }),
-                82 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
-                84 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 90 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 92 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                96 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                98 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 100 => inject_input(InputEvent::Key { key: Key::U, down: true }),
                 102 => inject_input(InputEvent::Key { key: Key::U, down: false }),
                 // S12-9：play-in-editor 全链路 —— Enter 重挂 spin.nes
@@ -1837,8 +2078,8 @@ fn main() {
                 // 从改名框挪走 —— 焦点门让位输入的对面即"失焦后 0 键归
                 // 编辑器"）再连按三次 0（间隔 >1 帧，每次 down/up 成对）：
                 // flac -> mp3 -> 停，Output 三行状态由循环尾断言取证。
-                216 => inject_input(InputEvent::Key { key: Key::Escape, down: true }),
-                218 => inject_input(InputEvent::Key { key: Key::Escape, down: false }),
+                218 => inject_input(InputEvent::Key { key: Key::Escape, down: true }),
+                220 => inject_input(InputEvent::Key { key: Key::Escape, down: false }),
                 222 => inject_input(InputEvent::MouseMove { x: 400.0, y: 396.0 }),
                 224 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 226 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
@@ -1848,6 +2089,29 @@ fn main() {
                 240 => inject_input(InputEvent::Key { key: Key::Num0, down: false }),
                 244 => inject_input(InputEvent::Key { key: Key::Num0, down: true }),
                 246 => inject_input(InputEvent::Key { key: Key::Num0, down: false }),
+                // S18.1 时间轴创建流取证（768x432 客户区：时间轴 dock 顶
+                // tl_y = 432-24-96-110 = 202，创建控制行 ctl_y = 202+18+58+4
+                // = 282，控件高 20 → 取中 y=292）：点 x 输入框（中心 238）
+                // 夺焦 → Backspace 清缺省 "0" → 键入 '2' → 点 y 输入框
+                //（中心 282；x 框失焦即提交 "2"）→ 同法键入 '4' → 点
+                // APPLY（中心 544）登记 pos 补间 to=(2,4) ms=500。全链路
+                // 实走：夺焦/键入/失焦提交/APPLY 落地，时间轴面板与护盾
+                // 同帧受验（点击全程不清选中 —— obj1 始终是主选中）。
+                250 => inject_input(InputEvent::MouseMove { x: 238.0, y: 292.0 }),
+                252 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                254 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                256 => inject_input(InputEvent::Key { key: Key::Backspace, down: true }),
+                258 => inject_input(InputEvent::Key { key: Key::Backspace, down: false }),
+                260 => inject_input(InputEvent::Char(0x32)),
+                264 => inject_input(InputEvent::MouseMove { x: 282.0, y: 292.0 }),
+                266 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                268 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                270 => inject_input(InputEvent::Key { key: Key::Backspace, down: true }),
+                272 => inject_input(InputEvent::Key { key: Key::Backspace, down: false }),
+                274 => inject_input(InputEvent::Char(0x34)),
+                278 => inject_input(InputEvent::MouseMove { x: 544.0, y: 292.0 }),
+                280 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                282 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 _ => {}
             }
         }
@@ -1895,11 +2159,40 @@ fn main() {
                 demo_spin_x = tree.local(spin).unwrap_or_default().pos.x;
             }
         }
-        if demo && index == 214 {
-            demo_ime_draft = rt
+        // S12-11 IME 取证（S18.1 起为**滞容闩锁**）：Char 经真实消息泵
+        // 投递，到达帧有 1..数帧抖动（帧负载越大越明显）—— 固定帧号点
+        // 采样会偶发扑空。改为 211..=218 窗内逐帧观察，草稿一旦含中字符
+        // 即闩住取证值（Escape 在 218 抬起、222 才点击别处 —— 窗内草稿
+        // 不会被回滚/提交打断）。
+        if demo && (211..=218).contains(&index) && !demo_ime_draft.contains('\u{4E2D}') {
+            let d = rt
                 .ui_vm_mut()
                 .text_state(name_input)
-                .map(|t| t.draft)
+                .map(|t| t.draft.clone())
+                .unwrap_or_default();
+            if d.contains('\u{4E2D}') {
+                demo_ime_draft = d;
+            }
+        }
+        // S18.1 时间轴闩锁（APPLY 落地在帧 282 沿之后 —— 从 284 起观察）：
+        // 补间登记表只在树 tick 的推进阶段变化（编辑态 NoObserver 照常
+        // tick），活动 >0 与其后 ==0 两个事实各闩一次，与刷新率无关。
+        if demo && index >= 284 {
+            let n = rt.tree_mut().tweens().len();
+            if n > 0 {
+                demo_tl_seen_active = true;
+            } else if demo_tl_seen_active {
+                demo_tl_seen_done = true;
+            }
+        }
+        if demo && index == 288 {
+            demo_tl_rows = rt
+                .tree_mut()
+                .prop(hud_tl, "rows")
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
                 .unwrap_or_default();
         }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
@@ -1964,6 +2257,10 @@ fn main() {
                     name_input, hud_tree, hud_dock, ruler_h, ruler_v, ruler_corner,
                     tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset,
                     fs_bg, fs_sep, fs_tree,
+                    // S18.1 时间轴面板全部控件：压上不清选中、不框选
+                    //（输入框/按钮的交互让给 UiVm 同款纪律）。
+                    tl_bg, hud_tl, tl_pos, tl_scale, tl_alpha, tl_x_in, tl_y_in,
+                    tl_ms_in, tl_ease, tl_mode, tl_apply,
                 ]
                 .iter()
                 .any(|&n| press_in_control(tree, n, viewport, (mx, my)))
@@ -2204,10 +2501,14 @@ fn main() {
                 }
             }
         }
-        // 焦点门：改名输入框持焦时 Enter/字母属于输入框（UiVm 提交
-        // 改名）—— 键盘挂载流整体让路。focus 是上一帧 UiVm 更新的
-        // 结果（一帧滞后，与既有 UI 命中口径一致）。
-        let renaming = rt.ui_vm_mut().focus() == Some(name_input);
+        // 焦点门：文本输入框（改名框或时间轴三个输入框 —— S18.1 并入同
+        // 一道门）持焦时 Enter/字母/数字属于输入框 —— 键盘挂载流与音乐
+        // 键整体让路。focus 是上一帧 UiVm 更新的结果（一帧滞后，与既有
+        // UI 命中口径一致）。
+        let renaming = matches!(
+            rt.ui_vm_mut().focus(),
+            Some(f) if f == name_input || f == tl_x_in || f == tl_y_in || f == tl_ms_in
+        );
         if !renaming {
             // F5：PLAY / 重启（Shift+F5 = STOP，Godot 同款；S12-9）。
             // 运行态编辑会话随 PLAY 收尾：拖拽/框选半途即刻作废（结构
@@ -2416,12 +2717,13 @@ fn main() {
             // 坐标 == 视图坐标，标尺刻度/命中/框选全部免换算。
             tree.set_local(cam, Transform2D::from_pos(viewport.0 / 2.0, viewport.1 / 2.0));
             // 视口区与可编辑区（S12-6 加标尺/dock 后的口径）：视口区
-            // 底缘上移到 dock 上缘；可编辑区再让出顶/左各 16px 标尺
+            // 底缘上移到 dock 上缘；S18.1 起再让位时间轴 dock（Output
+            // 上方 ~110px）；可编辑区再让出顶/左各 16px 标尺
             //（标尺不属于可编辑区，Godot 口径 —— 网格/命中/框选只在
             // 可编辑区内）。
             let gx0 = MARGIN + LEFT_PANEL_W;
             let gx1 = viewport.0 - INSPECTOR_W - 2.0 * MARGIN;
-            let gy1 = viewport.1 - STATUS_BAND - DOCK_H;
+            let gy1 = viewport.1 - STATUS_BAND - DOCK_H - TIMELINE_H;
             let vx0 = gx0 + RULER_W;
             // S12-7：标尺整体下移让出视口工具栏（工具带 24px 在标尺之
             // 上 —— Godot 2D 视口顶部工具条的堆叠顺序）。
@@ -2474,7 +2776,7 @@ fn main() {
             // 分割比例由 F9 档位推导（fs_focus 会话态 —— 比例本身不进
             // 树，只落在每帧重写的 offset/size 上，焦点段占大头）。
             // 最小窗口下段高钳 0（列表/条带照画零矩形，提取层口径）。
-            let avail_h = (viewport.1 - TOP_BAND - STATUS_BAND - DOCK_H).max(0.0);
+            let avail_h = (viewport.1 - TOP_BAND - STATUS_BAND - DOCK_H - TIMELINE_H).max(0.0);
             let top_frac = if fs_focus { FS_SPLIT_ALT } else { FS_SPLIT_TOP };
             let scene_h = ((avail_h - FS_SEP_H) * top_frac).max(0.0);
             let fs_h = (avail_h - FS_SEP_H - scene_h).max(0.0);
@@ -2506,11 +2808,12 @@ fn main() {
                 .map(|i| i as i64)
                 .unwrap_or(-1);
             let _ = tree.set_prop(fs_tree, "selected", Value::I64(fs_sel_row));
-            // 右检查器面板底：x = cw-198（宽 190 + 右缘 8），y = 8..dock 上缘。
+            // 右检查器面板底：x = cw-198（宽 190 + 右缘 8），y = 8..时间轴上缘
+            //（S18.1 起 dock 之上再让出时间轴带）。
             let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - INSPECTOR_W - 2.0 * MARGIN, MARGIN)));
             let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_SIZE,
-                Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, viewport.1 - MARGIN - STATUS_BAND - DOCK_H)));
+                Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, viewport.1 - MARGIN - STATUS_BAND - DOCK_H - TIMELINE_H)));
             // 状态栏贴底：y = ch-20。
             tree.set_local(hud_st, Transform2D::from_pos(MARGIN, viewport.1 - 20.0));
 
@@ -2689,6 +2992,109 @@ fn main() {
                 .collect();
             let _ = tree.set_prop(hud_dock, "rows", Value::Str(dock_rows.join("\n")));
 
+            // 时间轴 dock 布线（S18.1，Output 上方的全宽面板）：九宫格
+            // 铺底 + "TIMELINE" 标题 + 补间行区 + 进度条池 + 创建控制行。
+            // 每帧投影（投影无状态口径）—— 补间行从 tween_rows(primary)
+            // 现算（Selection 主选中驱动 —— 照 Inspector 同款纪律）。
+            let tl_y = dock_y - TIMELINE_H;
+            let tl_w = viewport.0 - 2.0 * MARGIN;
+            let _ = tree.set_prop(tl_bg, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(MARGIN, tl_y)));
+            let _ = tree.set_prop(tl_bg, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(tl_w, TIMELINE_H)));
+            tree.set_local(tl_title, Transform2D::from_pos(MARGIN + 2.0, tl_y + 1.0));
+            let _ = tree.set_prop(hud_tl, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(MARGIN + 2.0, tl_y + TL_TITLE_H)));
+            let _ = tree.set_prop(hud_tl, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(tl_w - 4.0, TL_LIST_H)));
+            // 行投影：主选中的活动补间（行序 = 注册序 —— tween_rows 单点
+            // 保证）；无选中/无补间 = 单行说明（冻结文案，冒烟可断言）。
+            let tl_primary = sel.primary(tree);
+            let tl_rows: Vec<nes_scene::TweenRow> = match tl_primary {
+                Some(p) => tree.tween_rows(p),
+                None => Vec::new(),
+            };
+            let tl_rows_text = if tl_rows.is_empty() {
+                if tl_primary.is_some() {
+                    "(no tweens on selection)".to_string()
+                } else {
+                    "(no selection)".to_string()
+                }
+            } else {
+                tl_rows.iter().map(tl_row_text).collect::<Vec<_>>().join("\n")
+            };
+            let _ = tree.set_prop(hud_tl, "rows", Value::Str(tl_rows_text));
+            // 进度条池：可见行（3 行）每行一条行下沿 2px 细条，宽 = 行宽
+            // × progress（fill_slot selected 色 —— 照网格条带池先例的
+            // Control 池路线，非文本进度条）。行超出可见窗的不画（列表
+            // 滚动是 UiVm 瞬态，宿主无钉底通道 —— 宁可少画不画到窗外）。
+            let tl_bar_fit = (((TL_LIST_H - 4.0) / DOCK_ROW_H).floor() as usize).min(TL_BARS);
+            for (i, &bar) in tl_bars.iter().enumerate() {
+                if i < tl_rows.len() && i < tl_bar_fit {
+                    let bw = ((tl_w - 4.0) * tl_rows[i].progress.clamp(0.0, 1.0)).max(0.0);
+                    let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(
+                            MARGIN + 2.0,
+                            tl_y + TL_TITLE_H + 4.0 + i as f32 * DOCK_ROW_H + DOCK_ROW_H - 2.0,
+                        )));
+                    let _ = tree.set_prop(bar, PROP_CONTROL_SIZE,
+                        Value::Vec2(nes_scene::Vec2::new(bw, 2.0)));
+                    let _ = tree.set_prop(bar, "visible", Value::Bool(true));
+                } else {
+                    // 池内备用条带：熄灭（投影无状态，每帧重写一遍口径）。
+                    let _ = tree.set_prop(bar, "visible", Value::Bool(false));
+                }
+            }
+            // 创建控制行：说明标签 + 六按钮（九宫格底板随行布线）+ 三输
+            // 入框。行 y 每帧重写；x 来自 TL_CTL_LAYOUT 单点表（恒定）。
+            // 通道按钮 * 后缀 = 当前选中通道（工具栏 SEL/SNAP 同款口径）；
+            // 缓动/模式按钮文本 = 当前档名（循环点按换档，落账段翻下标）。
+            let tl_ctl_y = tl_y + TL_TITLE_H + TL_LIST_H + SPACE_S;
+            tree.set_local(tl_new_label,
+                Transform2D::from_pos(MARGIN + TL_CTL_X, tl_ctl_y + 3.0));
+            tree.set_local(tl_to_label,
+                Transform2D::from_pos(MARGIN + TL_CTL_X + 194.0, tl_ctl_y + 3.0));
+            tree.set_local(tl_ms_label,
+                Transform2D::from_pos(MARGIN + TL_CTL_X + 306.0, tl_ctl_y + 3.0));
+            const TL_BTN_LAYOUT_IDX: [usize; 6] = [0, 1, 2, 6, 7, 8];
+            let ch = |i: usize, name: &str| {
+                if tl_channel == i {
+                    format!("{name}*")
+                } else {
+                    name.to_string()
+                }
+            };
+            let tl_btns: [(nes_scene::NodeId, usize, String); 6] = [
+                (tl_pos, 0, ch(0, "POS")),
+                (tl_scale, 1, ch(1, "SCALE")),
+                (tl_alpha, 2, ch(2, "ALPHA")),
+                (tl_ease, 6, TL_EASINGS[tl_ease_idx].to_string()),
+                (tl_mode, 7, TL_MODES[tl_mode_idx].to_string()),
+                (tl_apply, 8, "APPLY".to_string()),
+            ];
+            for (i, &plate) in tl_plates.iter().enumerate() {
+                let (px, pw) = TL_CTL_LAYOUT[TL_BTN_LAYOUT_IDX[i]];
+                let _ = tree.set_prop(plate, PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(MARGIN + TL_CTL_X + px, tl_ctl_y)));
+                let _ = tree.set_prop(plate, PROP_CONTROL_SIZE,
+                    Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
+            }
+            for (b, li, text) in tl_btns {
+                let (px, pw) = TL_CTL_LAYOUT[li];
+                let _ = tree.set_prop(b, PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(MARGIN + TL_CTL_X + px, tl_ctl_y)));
+                let _ = tree.set_prop(b, PROP_CONTROL_SIZE,
+                    Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
+                let _ = tree.set_prop(b, "text", Value::Str(text));
+            }
+            for (n, li) in [(tl_x_in, 3usize), (tl_y_in, 4), (tl_ms_in, 5)] {
+                let (px, pw) = TL_CTL_LAYOUT[li];
+                let _ = tree.set_prop(n, PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(MARGIN + TL_CTL_X + px, tl_ctl_y)));
+                let _ = tree.set_prop(n, PROP_CONTROL_SIZE,
+                    Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
+            }
+
             // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
             // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
             // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与
@@ -2729,7 +3135,9 @@ fn main() {
             }
             // S18 起 skips 加 theme_node：主题节点是皮肤数据不是可编辑
             // 对象，不进层级树行列表（同 grid/ruler/dock 纪律）。
-            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node];
+            // S18.1 起 skips 再加 tldock：时间轴是观感/工具（补间可视化 +
+            // 创建控制），不是场景对象 —— 整子树不进层级树。
+            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock];
             walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, &skips);
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
@@ -3043,6 +3451,27 @@ fn main() {
         }
         }
 
+        // 时间轴输入框提交落账（帧后 —— on_commit 钩子帧内只报值）：
+        // 会话值（APPLY 落地取这里）+ text 属性双写（失焦后显示已提交
+        // 值）。运行态让路（滞留提交直接丢弃 —— 与改名同一护盾口径）。
+        if play.playing {
+            tl_input_sinks.borrow_mut().clear();
+        } else {
+            for (field, value) in tl_input_sinks.borrow_mut().drain(..) {
+                let node = match field {
+                    0 => tl_x_in,
+                    1 => tl_y_in,
+                    _ => tl_ms_in,
+                };
+                match field {
+                    0 => tl_x = value.clone(),
+                    1 => tl_y = value.clone(),
+                    _ => tl_ms = value.clone(),
+                }
+                let _ = rt.tree_mut().set_prop(node, "text", Value::Str(value));
+            }
+        }
+
         // 层级树行点击落账（帧后 —— UiVm 钩子回调在帧内只报行下标）：
         // 一次点击 = 一次 Selection::select（与视口点选同款单选替换语义；
         // 选择是会话态，不进事务不落盘）。下一帧的树投影与 selected 行
@@ -3060,6 +3489,134 @@ fn main() {
         // 同款；STOP/RESET 越界按一行说明处理）；SEL/SNAP/GRID 开关是
         // 编辑动作 —— 运行态静默忽略（按钮可点但无效果，无日志灌水）。
         for name in tool_clicks.borrow_mut().drain(..) {
+            // S18.1 时间轴按钮分流（tl_ 前缀）：通道/缓动/模式循环换档 +
+            // APPLY 落地。编辑态专属 —— 运行态静默忽略（补间创建是编辑
+            // 动作，与 SEL/SNAP/GRID 同一护盾口径）。
+            if let Some(tl) = name.strip_prefix("tl_") {
+                if play.playing {
+                    continue;
+                }
+                match tl {
+                    "pos" | "scale" | "alpha" => {
+                        tl_channel = match tl {
+                            "pos" => 0,
+                            "scale" => 1,
+                            _ => 2,
+                        };
+                        log_line(
+                            &editor_log,
+                            format!("tween: channel {}", tl),
+                        );
+                    }
+                    "ease" => {
+                        tl_ease_idx = (tl_ease_idx + 1) % TL_EASINGS.len();
+                        log_line(
+                            &editor_log,
+                            format!("tween: easing {}", TL_EASINGS[tl_ease_idx]),
+                        );
+                    }
+                    "mode" => {
+                        tl_mode_idx = (tl_mode_idx + 1) % TL_MODES.len();
+                        log_line(
+                            &editor_log,
+                            format!("tween: mode {}", TL_MODES[tl_mode_idx]),
+                        );
+                    }
+                    "apply" => {
+                        // APPLY 语义（S18.1 冻结）：**从当前值起算** ——
+                        // 经树宿主 API register_tween_channel 落地，from
+                        // 在登记处按通道采样当前实际值（= "从现在走到目
+                        // 标"，与脚本 Cmd 落地逐位同源）。输入非数值 /
+                        // 无选中 / 参数拒收 → Output 报一行，不落地。
+                        let target = sel.primary(rt.tree_mut());
+                        let parsed = (
+                            tl_x.trim().parse::<f32>().ok(),
+                            tl_y.trim().parse::<f32>().ok(),
+                        );
+                        let ms = tl_ms.trim().parse::<f64>().ok();
+                        let channel = match tl_channel {
+                            0 => match parsed {
+                                (Some(x), Some(y)) => Some(nes_scene::TweenChannel::Pos {
+                                    from: nes_scene::Vec2::ZERO,
+                                    to: nes_scene::Vec2::new(x, y),
+                                }),
+                                _ => None,
+                            },
+                            1 => match parsed {
+                                (Some(x), Some(y)) => Some(nes_scene::TweenChannel::Scale {
+                                    from: nes_scene::Vec2::ZERO,
+                                    to: nes_scene::Vec2::new(x, y),
+                                }),
+                                _ => None,
+                            },
+                            // alpha 单值复用 x 框（y 框无语义，不参与解析）。
+                            _ => parsed
+                                .0
+                                .map(|a| nes_scene::TweenChannel::Alpha { from: 0.0, to: a }),
+                        };
+                        let easing = nes_scene::TweenEasing::from_str_exact(TL_EASINGS[tl_ease_idx])
+                            .expect("TL_EASINGS 与 TweenEasing 合法名表同序");
+                        let mode = nes_scene::TweenMode::from_str_exact(TL_MODES[tl_mode_idx])
+                            .expect("TL_MODES 与 TweenMode 合法名表同序");
+                        let Some(channel) = channel else {
+                            log_line(
+                                &editor_log,
+                                format!(
+                                    "tween: bad input ({} x='{}' y='{}')",
+                                    TL_CHANNELS[tl_channel].to_ascii_lowercase(),
+                                    tl_x,
+                                    tl_y
+                                ),
+                            );
+                            continue;
+                        };
+                        let Some(ms) = ms.filter(|m| m.is_finite() && *m > 0.0) else {
+                            log_line(&editor_log, format!("tween: bad ms '{}'", tl_ms));
+                            continue;
+                        };
+                        let Some(node) = target else {
+                            log_line(&editor_log, "tween: no selection".into());
+                            continue;
+                        };
+                        let (node_name, ok) = {
+                            let tree = rt.tree_mut();
+                            let name = tree.name(node).unwrap_or("?").to_string();
+                            let ok = tree.register_tween_channel(node, channel, ms, easing, mode);
+                            (name, ok)
+                        };
+                        if ok {
+                            // from 不进日志（登记处采样 —— 行投影/时间轴
+                            // 现态即真相；to/时长/缓动/模式照输入回显）。
+                            let line = if tl_channel == 2 {
+                                format!(
+                                    "tween alpha {} to={} ms={} {} {}",
+                                    node_name,
+                                    parsed.0.unwrap_or(0.0),
+                                    ms,
+                                    TL_EASINGS[tl_ease_idx],
+                                    TL_MODES[tl_mode_idx]
+                                )
+                            } else {
+                                format!(
+                                    "tween {} {} to=({},{}) ms={} {} {}",
+                                    TL_CHANNELS[tl_channel].to_ascii_lowercase(),
+                                    node_name,
+                                    parsed.0.unwrap_or(0.0),
+                                    parsed.1.unwrap_or(0.0),
+                                    ms,
+                                    TL_EASINGS[tl_ease_idx],
+                                    TL_MODES[tl_mode_idx]
+                                )
+                            };
+                            log_line(&editor_log, line);
+                        } else {
+                            log_line(&editor_log, "tween: rejected (invalid target/params)".into());
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match name.as_str() {
                 "play" => {
                     drag_start = None;
@@ -3251,6 +3808,23 @@ fn main() {
             let x = tree.local(spin).unwrap_or_default().pos.x;
             assert_eq!(x, 0.0, "RESET 后 spin 回到运行前位置（实际 {x}）");
         }
+        // S18.1：时间轴创建流全链路 —— APPLY 落地日志（输入框提交的
+        // x=2/y=4 + 缺省 ms=500）+ 时间轴行投影含 POS 行（选中节点的
+        // 活动补间可视化）+ 两个闩锁（活动补间真实入表 → 推进到站自然
+        // 移除；帧差毫秒基准，与刷新率无关）。
+        assert!(
+            has("tween pos obj1 to=(2,4) ms=500 linear once"),
+            "timeline APPLY tween log missing: {lines:?}"
+        );
+        assert!(
+            demo_tl_rows.contains("POS"),
+            "timeline rows missing POS row: {demo_tl_rows:?}"
+        );
+        assert!(demo_tl_seen_active, "APPLY 后登记表未见活动补间");
+        assert!(
+            demo_tl_seen_done,
+            "补间未见到站移除（ms=500 应在演示窗内自然完成）"
+        );
         // 树形态：挂载 Script 子节点留存（名字 = 脚本基名），registry_key
         // 已回空串（卸载），enabled = false（切换后未回改）。
         let tree = rt.tree_mut();
@@ -3264,8 +3838,8 @@ fn main() {
             "卸载 = registry_key 回空串"
         );
         assert_eq!(tree.prop(kids[0], "enabled"), Some(&Value::Bool(false)));
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset 冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY 冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in);
 }

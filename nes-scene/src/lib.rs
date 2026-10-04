@@ -114,6 +114,6 @@ pub use tree::{Uid,
     Cmd, NoObserver, NodeCtx, NodeData, NodeFlags, Observers, ProcessMode, SceneObserver,
     SceneTree, Signal, SignalConnection, SignalConnectionId, SignalCtx, SignalFilter,
     SignalHandler, TeeObserver, TickStats, TreeEvent, TreeOp, Tween, TweenChannel, TweenEasing,
-    TweenMode, VideoCmd, SIGNAL_DELIVERY_CAP,
+    TweenMode, TweenRow, VideoCmd, SIGNAL_DELIVERY_CAP,
 };
 pub use value::{Value, ValueType};

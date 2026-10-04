@@ -1666,6 +1666,31 @@ pub struct Tween {
     pub duration_ms: f64,
 }
 
+/// 一条进行中补间的**只读投影行**（S18.1 编辑器时间轴 dock 的数据面）：
+/// [`SceneTree::tween_rows`] 按登记序对目标节点的每个通道产出一行 ——
+/// 字符串字段全部取自稳定名（[`TweenChannel::kind`] / [`TweenEasing::as_str`]
+/// / [`TweenMode::as_str`]），编辑器按字面拼接行文本，零自有解析。
+///
+/// 边界（文档 §3）：投影行是**视图**不是状态 —— 不进指纹、不进序列化；
+/// 指纹采样面仍是 [`SceneTree::tweens()`] 的内部结构切片（逐位口径不变）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TweenRow {
+    /// 通道稳定名："pos" / "scale" / "alpha" / "frame" / "pivot"。
+    pub channel: String,
+    /// 线性时间进度 0..1（**未过缓动** —— 缓动以名字单独成列；口径与
+    /// tick 推进同式：once = elapsed/duration 夹取、yoyo = 去回折返形状、
+    /// loop = 对 1 取模）。
+    pub progress: f32,
+    /// 缓动稳定名（"linear"/"smoothstep"/"ease_in"/"ease_out"/"ease_in_out"）。
+    pub easing: String,
+    /// 模式稳定名（"once"/"yoyo"/"loop"）。
+    pub mode: String,
+    /// 已推进毫秒数（内部登记原值）。
+    pub elapsed_ms: f64,
+    /// 单程时长毫秒数。
+    pub duration_ms: f64,
+}
+
 impl SceneTree {
     /// 建树。根节点固定为 [`NodeKind::Node`]，名字可指定（影响路径首段）。
     pub fn new(root_name: &str) -> Self {
@@ -1845,6 +1870,76 @@ impl SceneTree {
     ///（见 [`Tween`] 文档）。
     pub fn tweens(&self) -> &[Tween] {
         &self.tweens
+    }
+
+    // ---------- 补间宿主面（S18.1 编辑器时间轴 dock） ----------
+    //
+    // 裁决：编辑器创建的补间与脚本 Cmd::Tween* 走**同一条登记表路径**
+    //（不存在第二注册表）—— last-wins 按（节点，通道）二元组、from 落地
+    // 采样、非法请求拒收，全部语义与脚本面逐位同源。边界：编辑器是宿主，
+    // 不参与 headless 指纹基线；补间本身仍是树状态（若对编辑中的场景取
+    // 指纹会含进行中补间 —— 编辑器从不取，见 S18.1 文档 §3）。
+
+    /// 宿主登记一条补间（S18.1 公开面；[`Cmd::TweenPos`]..[`Cmd::TweenStop`]
+    /// 落地的同一条路径公开化）。`from` 沿用**"落地时采样当前值"**既有冻结
+    /// 语义：Pos/Scale/Alpha/Pivot 四通道的 `from` 字段在此刻按通道各自
+    /// 重采样（local pos / local scale / alpha 属性缺省 1.0 / pivot 属性
+    /// 缺省 (0,0)），调用侧携带的 `from` 不参与 —— 与 Cmd 落地逐位同源；
+    /// Frame 通道的 `from`/`to` 是语句字面量口径，照实登记不采样。
+    ///
+    /// 返回 `true` = 已登记；`false` = 节点无效或参数拒收（duration <= 0
+    /// / 非有限、alpha 终点非有限 —— 与解析期/落地处既有拒收口径同表）。
+    /// last-wins：同目标同通道先替换再追加（不同通道并存互不干扰）。
+    pub fn register_tween_channel(
+        &mut self,
+        node: NodeId,
+        channel: TweenChannel,
+        duration_ms: f64,
+        easing: TweenEasing,
+        mode: TweenMode,
+    ) -> bool {
+        let channel = self.with_landed_from(node, channel);
+        self.register_tween(node, channel, duration_ms, easing, mode)
+    }
+
+    /// 移除目标节点**全部通道**的进行中补间（S18.1 公开面；[`Cmd::TweenStop`]
+    /// 落地的树侧等价）：各通道停在当前值（local/属性不动），登记按目标
+    /// 句柄整体丢弃。幂等（无登记时调用 = 无事发生）。
+    pub fn stop_tweens(&mut self, node: NodeId) {
+        self.tweens.retain(|tw| tw.target != NodeHandle::of(node));
+    }
+
+    /// 目标节点的补间投影行（S18.1 编辑器时间轴 dock 数据面）：按**登记序**
+    /// 逐条投影（确定性 —— 行序即注册序，同帧同树必同行序）；死/无关节点
+    /// = 空行集。字段口径见 [`TweenRow`]。投影是视图不是状态：不进指纹、
+    /// 不进序列化（指纹仍按 [`Self::tweens()`] 内部切片采样，逐位不变）。
+    pub fn tween_rows(&self, node: NodeId) -> Vec<TweenRow> {
+        let target = NodeHandle::of(node);
+        self.tweens
+            .iter()
+            .filter(|tw| tw.target == target)
+            .map(|tw| {
+                // 进度 = 线性时间进度（未过缓动），算式与 tick 推进阶段
+                // 同式（once 夹取 / yoyo 去回折返 / loop 取模）—— 时间轴
+                // 行上缓动以名字单独成列，进度条画的是时间不是曲线。
+                let progress = match tw.mode {
+                    TweenMode::Once => (tw.elapsed_ms / tw.duration_ms).clamp(0.0, 1.0),
+                    TweenMode::Yoyo => {
+                        let p = tw.elapsed_ms / tw.duration_ms;
+                        (if p < 1.0 { p } else { 2.0 - p }).clamp(0.0, 1.0)
+                    }
+                    TweenMode::Loop => (tw.elapsed_ms / tw.duration_ms) % 1.0,
+                };
+                TweenRow {
+                    channel: tw.channel.kind().to_string(),
+                    progress: progress as f32,
+                    easing: tw.easing.as_str().to_string(),
+                    mode: tw.mode.as_str().to_string(),
+                    elapsed_ms: tw.elapsed_ms,
+                    duration_ms: tw.duration_ms,
+                }
+            })
+            .collect()
     }
 
     // ---------- 遍历 ----------
@@ -2977,6 +3072,57 @@ impl SceneTree {
         }
     }
 
+    /// 通道 `from` 的落地采样（S16 冻结语义的**单点实现**，S18.1 起脚本
+    /// Cmd 与宿主 API 共用）：Pos/Scale/Alpha/Pivot 四通道的 `from` = 此刻
+    /// 该节点当前实际值（local pos / local scale / alpha 属性缺省 1.0 /
+    /// pivot 属性缺省 (0,0) —— 与各 Cmd 落地原口径逐位同源）；Frame 通道
+    /// 的 from/to 是语句字面量，原样返回不采样。目标不存在时按缺省值采样
+    ///（与原实现 `unwrap_or_default` 兜底同口径 —— 随后登记路径按无效
+    /// 节点拒收，采样值不生效）。
+    fn with_landed_from(&self, node: NodeId, channel: TweenChannel) -> TweenChannel {
+        match channel {
+            TweenChannel::Pos { to, .. } => {
+                let from = self
+                    .nodes
+                    .get(node)
+                    .map(|nd| Vec2::new(nd.local.pos.x, nd.local.pos.y))
+                    .unwrap_or_default();
+                TweenChannel::Pos { from, to }
+            }
+            TweenChannel::Scale { to, .. } => {
+                let from = self
+                    .nodes
+                    .get(node)
+                    .map(|nd| Vec2::new(nd.local.scale.x, nd.local.scale.y))
+                    .unwrap_or_default();
+                TweenChannel::Scale { from, to }
+            }
+            TweenChannel::Alpha { to, .. } => {
+                let from = self
+                    .prop(node, "alpha")
+                    .and_then(|v| match v {
+                        Value::F32(f) => Some(*f),
+                        Value::I64(i) => Some(*i as f32),
+                        _ => None,
+                    })
+                    .map(|f| if f.is_finite() { f } else { 1.0 })
+                    .unwrap_or(1.0);
+                TweenChannel::Alpha { from, to }
+            }
+            TweenChannel::Pivot { to, .. } => {
+                let from = self
+                    .prop(node, "pivot")
+                    .and_then(|v| match v {
+                        Value::Vec2(p) => Some(*p),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                TweenChannel::Pivot { from, to }
+            }
+            other => other,
+        }
+    }
+
     /// 补间登记（S16 第 1 期；S16.1 起全部通道共用一条路径）：`from` 在
     /// **落地时**采样、last-wins 按（节点，通道）二元组替换、非法请求
     /// 拒收不落地。返回 `true` = 已登记。
@@ -3077,20 +3223,17 @@ impl SceneTree {
                 // 补间登记（S16 第 1 期）：登记表是树状态，Cmd 直接操作 ——
                 // 不走单帧取走缓冲（与 PlaySound/VideoPlay 的"树无法解释才
                 // 外送"不同）。
-                // - `from` 在**落地时**采样（本命令的冻结选择）：apply 发生在
-                //   命令发射后的当下（回调 Cmd 即刻落地），此时该节点的 local
-                //   含本帧补间推进（推进阶段 1.75 先于 process/信号泵）——
-                //   last-wins 换程从当前实际位置起算，不跳变；
-                // - 死节点 / duration <= 0：静默丢弃（登记路径统一兜底，
-                //   见 [`Self::register_tween`]）。
-                let from = self
-                    .nodes
-                    .get(node)
-                    .map(|nd| Vec2::new(nd.local.pos.x, nd.local.pos.y))
-                    .unwrap_or_default();
-                self.register_tween(
+                // - `from` 在**落地时**采样（本命令的冻结选择）：采样在
+                //   [`Self::register_tween_channel`] 内单点实现（S18.1 起
+                //   脚本面与宿主面同路）—— apply 发生在命令发射后的当下
+                //  （回调 Cmd 即刻落地），此时该节点的 local 含本帧补间推
+                //   进（推进阶段 1.75 先于 process/信号泵）—— last-wins 换
+                //   程从当前实际位置起算，不跳变；
+                // - 死节点 / duration <= 0：静默丢弃（登记路径统一兜底）。
+                //   携带的 from 字段为占位（登记路径按通道重采样，不参与）。
+                self.register_tween_channel(
                     node,
-                    TweenChannel::Pos { from, to },
+                    TweenChannel::Pos { from: Vec2::ZERO, to },
                     duration_ms,
                     easing,
                     mode,
@@ -3104,15 +3247,11 @@ impl SceneTree {
                 mode,
             } => {
                 // 缩放通道（S16.1）：与 pos 同一登记纪律 —— from = 落地时
-                // 当前实际 scale；last-wins 只替换同通道（pos 并存不冲突）。
-                let from = self
-                    .nodes
-                    .get(node)
-                    .map(|nd| Vec2::new(nd.local.scale.x, nd.local.scale.y))
-                    .unwrap_or_default();
-                self.register_tween(
+                // 当前实际 scale（采样单点在 register_tween_channel）；
+                // last-wins 只替换同通道（pos 并存不冲突）。
+                self.register_tween_channel(
                     node,
-                    TweenChannel::Scale { from, to },
+                    TweenChannel::Scale { from: Vec2::ZERO, to },
                     duration_ms,
                     easing,
                     mode,
@@ -3126,19 +3265,11 @@ impl SceneTree {
                 mode,
             } => {
                 // 透明度通道（S16.1）：from = 落地时当前 alpha 属性（缺失/
-                // 非有限按缺省 1.0 —— 与 schema 缺省及渲染中性 tint 同口径）。
-                let from = self
-                    .prop(node, "alpha")
-                    .and_then(|v| match v {
-                        Value::F32(f) => Some(*f),
-                        Value::I64(i) => Some(*i as f32),
-                        _ => None,
-                    })
-                    .map(|f| if f.is_finite() { f } else { 1.0 })
-                    .unwrap_or(1.0);
-                self.register_tween(
+                // 非有限按缺省 1.0 —— 与 schema 缺省及渲染中性 tint 同口径；
+                // 采样单点在 register_tween_channel）。
+                self.register_tween_channel(
                     node,
-                    TweenChannel::Alpha { from, to },
+                    TweenChannel::Alpha { from: 0.0, to },
                     duration_ms,
                     easing,
                     mode,
@@ -3158,7 +3289,7 @@ impl SceneTree {
                 // 采样 —— 与 alpha 的"from = 落地时当前值"刻意不同）；写入
                 // 面每 tick 经既有属性写路径直写 `frame`，越界回绕归渲染侧
                 //（提取层 rem_euclid），本层不钳制。
-                self.register_tween(
+                self.register_tween_channel(
                     node,
                     TweenChannel::Frame { from, to },
                     duration_ms,
@@ -3174,19 +3305,12 @@ impl SceneTree {
                 mode,
             } => {
                 // 精灵锚点通道（S16.4）：登记纪律与 scale 同（from = 落地时
-                // 当前 pivot 属性值，缺失按缺省 (0,0) —— 与 schema 缺省及
-                // 渲染"无记录 = 无平移"同口径）；last-wins 只替换同通道。
+                // 当前 pivot 属性值，缺失按缺省 (0,0) —— 采样单点在
+                // register_tween_channel）；last-wins 只替换同通道。
                 // px/py 越界照实接受不钳制（S16.3 越界锚定合法语义）。
-                let from = self
-                    .prop(node, "pivot")
-                    .and_then(|v| match v {
-                        Value::Vec2(p) => Some(*p),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                self.register_tween(
+                self.register_tween_channel(
                     node,
-                    TweenChannel::Pivot { from, to },
+                    TweenChannel::Pivot { from: Vec2::ZERO, to },
                     duration_ms,
                     easing,
                     mode,
@@ -3194,8 +3318,9 @@ impl SceneTree {
             }
             Cmd::TweenStop { node } => {
                 // 停补间（S16.1 起语义 = 全部通道）：登记丢弃，各通道停在
-                // 当前值（local/属性不动）。
-                self.tweens.retain(|tw| tw.target != NodeHandle::of(node));
+                // 当前值（local/属性不动）。S18.1 起走公开面 stop_tweens
+                //（树侧等价单点实现，宿主/脚本同路）。
+                self.stop_tweens(node);
             }
         }
     }
