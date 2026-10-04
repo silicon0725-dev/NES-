@@ -1,0 +1,50 @@
+[package]
+name = "nes-extension-js"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 JS extension runtime (S17 part 1): QuickJS-NG backend via rquickjs; capability object injection; one of the two whitelist adapter layers allowed third-party dependencies (G15: rquickjs family)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_extension_js"
+path = "src/lib.rs"
+
+# ============================================================
+# 依赖分层政策（S17 用户裁决，守卫 G15 校验）
+# ============================================================
+#
+# **本 crate 是两个白名单适配层之一（媒体解码 nes-media / JS 扩展运行时
+# 本 crate）** —— 第三方被收口在最外圈的叶子上，引擎核心零第三方纪律
+# 不变（G3/G10/G11/G12/G14 逐条保持）。
+#
+#     QuickJS-NG（C，cc 就地编译）──▶ rquickjs-sys ──▶ rquickjs-core ──▶ 本 crate
+#                                         │
+#                                         ▼（path，唯一消费方）
+#                                    nes-runtime
+#
+# 白名单：
+#   * 第三方 = **rquickjs 家族闭包**（rquickjs / rquickjs-core /
+#     rquickjs-macro / rquickjs-sys 及其全部传递依赖）—— 家族根带来的
+#     依赖是白名单的内在成本，跟踪闭包而非逐个枚举（与 G13 同一口径）；
+#   * 仓库内 = nes-extension-api（path，纯 ABI 冻结面）。
+#   其它任何依赖一律越界（G15）。
+#
+# 选型记录（S17 用户裁决）：
+#   * 引擎 = **QuickJS-NG**（社区维护分叉，非 Bellard 原版）—— 经
+#     rquickjs-sys 0.9 随包 C 源码由 cc 就地编译（默认特性即此路径，
+#     bindgen 是可选特性且默认关闭：绑定为预生成，无 bindgen 工具链
+#     依赖）；MSVC 工具链下 cl.exe 负责编译。
+#   * 绑定 = **rquickjs 0.9**（高层安全绑定，目标 QuickJS-NG）。任务书
+#     指向"最新 0.9 系"：crates.io 上 0.9 系恰为 0.9.0 一版（其后是
+#     0.10~0.14 系，撰写时最新为 0.14.0）—— 本期钉 0.9.0，后续升系是
+#     纯 nes-extension-js 内部事务（JsRuntime trait 冻结面不变）。
+#
+# 本 crate 刻意**不并入**上层任何工作区：空 `[workspace]` 表把它显式钉成
+# 自己的工作区根（与 nes-audio / nes-render-wgpu / nes-media 同一纪律）。
+[dependencies]
+nes-extension-api = { path = "../nes-extension-api" }
+rquickjs = "0.9.0"
+
+[workspace]

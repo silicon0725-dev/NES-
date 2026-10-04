@@ -39,17 +39,41 @@
         runtime ──▶ nes-audio 方向唯一）外，任何 crate 不得（直接或传递）
         依赖它 —— 音频核心是依赖树的纯叶子，正向白名单仅含组装层，反向一律禁止
 
-    G13 nes-media（S14 编解码适配层）是**全仓库唯一允许第三方依赖的 crate**：
-        其依赖树中的第三方（registry）crate 必须全部落在白名单家族内 ——
-        image 系（image 及其全部传递依赖）+ symphonia 系（symphonia 及其
-        全部传递依赖）；仓库内直接依赖只许 nes-audio（path）。其它任何
-        registry 依赖一律越界；除 nes-runtime 正向接入外，任何 crate 不得
-        依赖 nes-media —— 第三方被收口在最外圈的一个叶子上，引擎核心
-        （G3/G10/G12 钉住的那七个）零第三方纪律不变。
+    G13 nes-media（S14 编解码适配层）是**两个白名单适配层之一（媒体解码 /
+        JS 扩展运行时，S17 起）**：其依赖树中的第三方（registry）crate 必须
+        全部落在白名单家族内 —— image 系（image 及其全部传递依赖）+
+        symphonia 系（symphonia 及其全部传递依赖）；仓库内直接依赖只许
+        nes-audio（path）。其它任何 registry 依赖一律越界；除 nes-runtime
+        正向接入外，任何 crate 不得依赖 nes-media —— 第三方被收口在最外圈
+        的叶子（适配层）上，引擎核心（G3/G10/G12 钉住的那七个）零第三方
+        纪律不变。
 
     G13 为 S14「媒体解码适配层第 1 期」新增：依赖分层政策（用户裁决）
     由本条正向钉住 —— 编解码器采用成熟 Rust 库（image 0.25 系 /
     symphonia 0.5 系），与既有守卫互不侵扰（G1-G12 逐条保持）。
+    S17 起 G13 文案修订：nes-media 不再是"全仓库唯一"允许第三方的
+    crate —— 依赖分层政策从单叶扩成**双叶**（媒体解码 / JS 扩展运行时），
+    见 G15。
+
+    G14 nes-extension-api（S17 扩展 ABI 层）零依赖（normal / dev / build
+        三类都不得有）、无 build.rs、独立工作区根 —— 它只定义 NES 自己的
+        Extension API（值类型 / JsRuntime trait / 能力 traits / 生命周期），
+        任何第三方或仓库内依赖都会泄进冻结面；除 nes-extension-js（绑定
+        实现）与 nes-runtime（能力宿主，S17 第 2 期正向接入）外，任何
+        crate 不得依赖它 —— **要冻结的是 Extension API，不是某个 JS 引擎**。
+
+    G15 nes-extension-js（S17 JS 扩展运行时）是**两个白名单适配层中的
+        另一个**：其依赖树中的第三方（registry）crate 必须全部落在
+        **rquickjs 家族闭包**内（rquickjs 及其全部传递依赖，含
+        rquickjs-core / rquickjs-sys 与 QuickJS-NG 的 C 编译链）；仓库内
+        直接依赖只许 nes-extension-api（path）。其它任何 registry 依赖
+        一律越界；除 nes-runtime 正向接入外，任何 crate 不得依赖它 ——
+        JS 引擎类型被收口在绑定层的叶子上，上层只见 nes-extension-api
+        的冻结面（可换 backend：Boa / quickjs-rs 是未来可选实现方）。
+
+    G14 / G15 为 S17「扩展运行时第 1 期」新增，与 nes-extension-api /
+    nes-extension-js 两份 Cargo.toml 的依赖纪律注释一一对应；
+    G11 的 runtime 正向白名单同步扩两条（第 2 期接线消费）。
 
 退出码：0 = 全部通过；1 = 有检查项失败；2 = 环境/参数错误（例如 cargo 不可用）。
 仅使用 Python 标准库，可直接接入 CI。
@@ -78,12 +102,16 @@ BACKEND_ALLOWED = (CONTRACT_CRATE,)                # 后端唯一合法直接依
 BACKEND_FORBIDDEN_UPSTREAM = ("nes-scene", "nes-asset", "nes-render-extract")
 NO_DEP_ON_BACKEND = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE)  # 这些层不得依赖后端
 RUNTIME_CRATE = "nes-runtime"                      # 引擎组装层：全链顶端叶子
-MEDIA_CRATE = "nes-media"                          # S14 编解码适配层：唯一允许第三方的 crate
+MEDIA_CRATE = "nes-media"                          # S14 编解码适配层：两个白名单适配层之一
+EXTENSION_API_CRATE = "nes-extension-api"          # S17 扩展 ABI 层：纯冻结面（零依赖）
+EXTENSION_JS_CRATE = "nes-extension-js"            # S17 JS 扩展运行时：另一个白名单适配层
 # S13 第 2 期：runtime 正向接入音频（runtime ──▶ nes-audio 方向唯一）。
 # S14 第 1 期：runtime 正向接入编解码适配层（解码产物 -> 既有纹理/Wav 面）。
+# S17 第 2 期：runtime 正向接入扩展运行时（扩展写树 = 游戏状态，经能力
+#              traits 回写场景层；JS 引擎类型不出 nes-extension-js）。
 RUNTIME_ALLOWED = ("nes-asset", "nes-scene", "nes-render-api",
                    "nes-render-extract", "nes-render-wgpu", "nes-audio",
-                   MEDIA_CRATE)
+                   MEDIA_CRATE, EXTENSION_API_CRATE, EXTENSION_JS_CRATE)
 SOURCE_FORBIDDEN_RE = re.compile(r"nes[-_]render", re.IGNORECASE)
 SOURCE_SCAN_EXT = (".rs", ".toml")
 # 提取层源码里不得出现对资源层类型的真实引用（注释里提名字不算，故只匹配 use / 路径限定调用）。
@@ -99,6 +127,13 @@ NO_DEP_ON_AUDIO = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE)
 MEDIA_THIRD_ROOTS = ("image", "symphonia")         # 第三方白名单根（及其全部传递依赖）
 MEDIA_REPO_ALLOWED = ("nes-audio",)                # 仓库内白名单（必须 path 依赖）
 MEDIA_CONSUMERS_ALLOWED = (RUNTIME_CRATE,)         # 唯一消费方：引擎组装层
+# S17 扩展生态：nes-extension-api 的正向白名单（绑定实现 + 能力宿主）与
+# nes-extension-js 的第三方家族根（rquickjs 及其传递闭包）/ 仓库内白名单 /
+# 唯一消费方（第 2 期接线，先钉政策）。
+EXTAPI_REPO_ALLOWED = (EXTENSION_JS_CRATE, RUNTIME_CRATE)
+EXTJS_THIRD_ROOTS = ("rquickjs",)                  # rquickjs 家族闭包（含 QuickJS-NG 编译链）
+EXTJS_REPO_ALLOWED = (EXTENSION_API_CRATE,)        # 仓库内白名单（必须 path 依赖）
+EXTJS_CONSUMERS_ALLOWED = (RUNTIME_CRATE,)         # 唯一消费方：引擎组装层
 
 
 class Colors:
@@ -229,7 +264,7 @@ def main() -> int:
         return 2
 
     crates = PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE, RUNTIME_CRATE,
-                          AUDIO_CRATE, MEDIA_CRATE)
+                          AUDIO_CRATE, MEDIA_CRATE, EXTENSION_API_CRATE, EXTENSION_JS_CRATE)
     missing = [c for c in crates if not os.path.isfile(os.path.join(root, c, "Cargo.toml"))]
     if missing:
         print("缺少 crate 清单文件：%s" % ", ".join(missing), file=sys.stderr)
@@ -520,11 +555,12 @@ def main() -> int:
         detail,
     )
 
-    # ---- G13：nes-media 是全仓库唯一允许第三方依赖的 crate（S14 依赖分层政策）----
+    # ---- G13：nes-media 是两个白名单适配层之一（媒体解码，S14 依赖分层政策）----
     #      第三方（registry）依赖树必须全部落在 image 系 / symphonia 系两个
     #      白名单家族的传递闭包内；仓库内直接依赖只许 nes-audio（path）；
     #      除 nes-runtime 正向接入外无人依赖它。引擎核心的零第三方纪律
-    #      （G3/G10/G11/G12）不受影响 —— 第三方被收口在最外圈的一个叶子上。
+    #      （G3/G10/G11/G12/G14）不受影响 —— 第三方收口在最外圈的两片叶子
+    #      上（媒体解码 / JS 扩展运行时，后者见 G15）。
     md_declared = declared_deps(metas[MEDIA_CRATE], MEDIA_CRATE)
     md_trans = root_dep_names(metas[MEDIA_CRATE])
     allowed_third: set = set()
@@ -544,7 +580,8 @@ def main() -> int:
     md_rev_bad = []
     md_rev_lines = []
     for crate in PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE,
-                              AUDIO_CRATE, MEDIA_CRATE):
+                              AUDIO_CRATE, MEDIA_CRATE,
+                              EXTENSION_API_CRATE, EXTENSION_JS_CRATE):
         deps = root_dep_names(metas[crate])
         md_rev_lines.append("%s：传递依赖 %d 个" % (crate, len(deps)))
         for d in deps:
@@ -574,6 +611,127 @@ def main() -> int:
         "%s 第三方依赖全部落在 image/symphonia 白名单家族内、仓库内仅 nes-audio（path）、"
         "除 runtime 正向接入外无人反向依赖" % MEDIA_CRATE,
         not (md_illegal or md_repo_bad or md_unpathed or md_rev_bad),
+        detail,
+    )
+
+    # ---- G14：nes-extension-api 是纯 ABI 冻结面（零依赖、无 build.rs、
+    #      独立根；除绑定实现与能力宿主外无人依赖它）----
+    ea_declared = declared_deps(metas[EXTENSION_API_CRATE], EXTENSION_API_CRATE)
+    ea_trans = root_dep_names(metas[EXTENSION_API_CRATE])
+    ea_build_rs = os.path.isfile(os.path.join(root, EXTENSION_API_CRATE, "build.rs"))
+    ea_ws_root = os.path.normcase(
+        os.path.abspath(metas[EXTENSION_API_CRATE].get("workspace_root", ""))
+    )
+    ea_own_ws = ea_ws_root == os.path.normcase(os.path.join(root, EXTENSION_API_CRATE))
+    ea_rev_bad = []
+    ea_rev_lines = []
+    # 反向禁令不含 nes-extension-js（绑定实现）与 nes-runtime（能力宿主，
+    # 第 2 期接线）—— 二者是 EXTAPI_REPO_ALLOWED 的正向白名单。
+    for crate in PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE,
+                              AUDIO_CRATE, MEDIA_CRATE):
+        deps = root_dep_names(metas[crate])
+        ea_rev_lines.append("%s：传递依赖 %d 个" % (crate, len(deps)))
+        for d in deps:
+            if d == EXTENSION_API_CRATE:
+                ea_rev_bad.append("%s -> %s" % (crate, d))
+    detail = "声明依赖 %d 条：%s" % (
+        len(ea_declared),
+        ", ".join("%s[%s]" % (n, k) for n, k, _ in ea_declared) if ea_declared else "(无)",
+    )
+    detail += "\n传递依赖 %d 个：%s" % (len(ea_trans), ", ".join(ea_trans) if ea_trans else "(无)")
+    detail += "\nbuild.rs 存在：%s（应为否：纯接口 + 值类型，无任何构建脚本）" % (
+        "是" if ea_build_rs else "否"
+    )
+    detail += "\nworkspace_root：%s（%s）" % (
+        metas[EXTENSION_API_CRATE].get("workspace_root", "(未知)"),
+        "独立工作区根" if ea_own_ws else "被上层工作区吞并",
+    )
+    detail += "\n" + "\n".join(ea_rev_lines)
+    if ea_declared:
+        detail += "\n出现依赖即越界：ABI 冻结面零依赖（任何第三方/仓库内类型泄入即冻结失效）"
+    if ea_build_rs:
+        detail += "\n出现 build.rs：本 crate 的纪律是纯接口 + 值类型，不需要构建脚本"
+    if not ea_own_ws:
+        detail += "\n扩展 ABI 层未钉成独立工作区根：须以空 [workspace] 表钉回独立根"
+    if ea_rev_bad:
+        detail += "\n违规反向依赖（合法消费方仅 %s）：%s" % (
+            " / ".join(EXTAPI_REPO_ALLOWED), ", ".join(ea_rev_bad))
+    record(
+        "G14",
+        "%s 零依赖（normal/dev/build 均为空）、无 build.rs、独立工作区根、"
+        "除绑定实现/能力宿主外无人反向依赖" % EXTENSION_API_CRATE,
+        not (ea_declared or ea_build_rs or not ea_own_ws or ea_rev_bad),
+        detail,
+    )
+
+    # ---- G15：nes-extension-js 是另一个白名单适配层（JS 扩展运行时）----
+    #      第三方（registry）依赖树必须全部落在 rquickjs 家族闭包内
+    #      （rquickjs 及其全部传递依赖，含 QuickJS-NG 的 C 编译链）；
+    #      仓库内直接依赖只许 nes-extension-api（path）；除 nes-runtime
+    #      正向接入外无人依赖它。JS 引擎类型收口在绑定层叶子上。
+    ej_declared = declared_deps(metas[EXTENSION_JS_CRATE], EXTENSION_JS_CRATE)
+    ej_trans = root_dep_names(metas[EXTENSION_JS_CRATE])
+    ej_build_rs = os.path.isfile(os.path.join(root, EXTENSION_JS_CRATE, "build.rs"))
+    ej_ws_root = os.path.normcase(
+        os.path.abspath(metas[EXTENSION_JS_CRATE].get("workspace_root", ""))
+    )
+    ej_own_ws = ej_ws_root == os.path.normcase(os.path.join(root, EXTENSION_JS_CRATE))
+    ej_allowed_third: set = set()
+    for family_root in EXTJS_THIRD_ROOTS:
+        ej_allowed_third |= reachable_names_from(metas[EXTENSION_JS_CRATE], family_root)
+    ej_illegal = [
+        d for d in ej_trans
+        if d not in ej_allowed_third and d not in EXTJS_REPO_ALLOWED
+    ]
+    ej_repo = [n for n, _k, p in ej_declared if p]
+    ej_repo_bad = [n for n in ej_repo if n not in EXTJS_REPO_ALLOWED]
+    ej_unpathed = [
+        n for n, _k, p in ej_declared if not p and n not in ej_allowed_third
+    ]
+    ej_rev_bad = []
+    ej_rev_lines = []
+    for crate in PROTECTED + (CONTRACT_CRATE, EXTRACT_CRATE, BACKEND_CRATE,
+                              AUDIO_CRATE, MEDIA_CRATE, EXTENSION_API_CRATE):
+        deps = root_dep_names(metas[crate])
+        ej_rev_lines.append("%s：传递依赖 %d 个" % (crate, len(deps)))
+        for d in deps:
+            if d == EXTENSION_JS_CRATE:
+                ej_rev_bad.append("%s -> %s" % (crate, d))
+    detail = "声明依赖 %d 条：%s" % (
+        len(ej_declared),
+        ", ".join("%s[%s]%s" % (n, k, "(path)" if p else "(registry)") for n, k, p in ej_declared)
+        or "(无)",
+    )
+    detail += "\n传递依赖 %d 个：%s" % (len(ej_trans), ", ".join(ej_trans) or "(无)")
+    detail += "\n第三方白名单（rquickjs 家族闭包 %d 包）：%s" % (
+        len(ej_allowed_third), ", ".join(sorted(ej_allowed_third)))
+    detail += "\n仓库内白名单：%s（必须 path）" % ", ".join(EXTJS_REPO_ALLOWED)
+    detail += "\nbuild.rs 存在：%s（应为否：QuickJS 的 C 编译脚本属 rquickjs-sys，不在本 crate）" % (
+        "是" if ej_build_rs else "否"
+    )
+    detail += "\nworkspace_root：%s（%s）" % (
+        metas[EXTENSION_JS_CRATE].get("workspace_root", "(未知)"),
+        "独立工作区根" if ej_own_ws else "被上层工作区吞并",
+    )
+    detail += "\n" + "\n".join(ej_rev_lines)
+    if ej_illegal:
+        detail += "\n越界的第三方依赖（白名单外）：" + ", ".join(ej_illegal)
+    if ej_repo_bad:
+        detail += "\n越界的仓库内依赖（只许 nes-extension-api）：" + ", ".join(ej_repo_bad)
+    if ej_unpathed:
+        detail += "\n非 path 且不在 rquickjs 家族闭包内的直接依赖：" + ", ".join(ej_unpathed)
+    if ej_build_rs:
+        detail += "\n出现 build.rs：C 编译由 rquickjs-sys 自带构建脚本承担，本 crate 不该有"
+    if not ej_own_ws:
+        detail += "\nJS 扩展运行时未钉成独立工作区根：须以空 [workspace] 表钉回独立根"
+    if ej_rev_bad:
+        detail += "\n违规反向依赖（唯一合法消费方是 %s）：%s" % (
+            " / ".join(EXTJS_CONSUMERS_ALLOWED), ", ".join(ej_rev_bad))
+    record(
+        "G15",
+        "%s 第三方依赖全部落在 rquickjs 白名单家族内、仓库内仅 nes-extension-api（path）、"
+        "除 runtime 正向接入外无人反向依赖" % EXTENSION_JS_CRATE,
+        not (ej_illegal or ej_repo_bad or ej_unpathed or ej_build_rs or not ej_own_ws or ej_rev_bad),
         detail,
     )
 

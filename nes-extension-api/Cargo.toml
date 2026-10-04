@@ -1,0 +1,39 @@
+[package]
+name = "nes-extension-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "NES 2.0 extension ABI (S17 part 1): engine-side value types, JsRuntime trait, capability traits and extension lifecycle - zero dependencies by discipline"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nes_extension_api"
+path = "src/lib.rs"
+
+# ============================================================
+# 依赖分层政策（S17 用户裁决，守卫 G14 校验）
+# ============================================================
+#
+# **本 crate 是纯 ABI 层：零第三方依赖、零仓库内依赖** —— 它只定义
+# NES 自己的扩展接口面：
+#
+#   * `NesValue`       —— 引擎 <-> 脚本的值边界（不暴露任何第三方类型）；
+#   * `JsRuntime`      —— 可换 backend 的 JS 执行面（QuickJS-NG / Boa /
+#                         quickjs-rs 都是它的未来实现方，上层无感知）；
+#   * 能力 traits      —— Scene / Node / Input / Audio（宿主实现、
+#                         JS 侧绑定）+ `ExtensionLifecycle`（扩展生命周期）。
+#
+# **要冻结的是 Extension API，不是某个 JS 引擎**（S17 用户裁决）：本 crate
+# 就是那个冻结面。任何 JS 引擎类型都不得出现在这里 —— 谁依赖谁：
+#
+#     nes-extension-api ──▶ nes-extension-js（QuickJS-NG 绑定实现）
+#                  └──────▶ nes-runtime（能力宿主，把 traits 桥到真引擎）
+#
+# 除上述两个正向白名单 crate 外，任何 crate 不得依赖本 crate（G14）。
+#
+# 本 crate 刻意**不并入**上层任何工作区：空 `[workspace]` 表把它显式钉成
+# 自己的工作区根（与 nes-audio / nes-render-wgpu / nes-media 同一纪律）。
+[dependencies]
+
+[workspace]
