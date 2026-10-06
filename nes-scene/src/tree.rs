@@ -1418,6 +1418,15 @@ pub struct SceneTree {
     /// last-wins 按（节点，通道）二元组：同目标同通道的重复登记前者被
     /// 替换（不同通道并存）；目标死亡自动清。
     tweens: Vec<Tween>,
+    /// 信号送达计数表（S19.3，诊断面）：信号名 -> 累计送达次数。泵
+    ///（tick 阶段 5）在**每次实际交付**处递增 —— 广播交付一条计一、
+    /// 路由交付每条命中连接各计一；处理器级联再发射的信号回到同泵
+    /// 交付，照实各计。被订阅过滤/超上限丢弃/门控跳过/未注册处理器的
+    /// 信号**不发生交付，不计数**（与 `TickStats::signals_delivered`
+    /// 同一判据）。与 `played_sounds`/`video_cmds` 同一家法：副作用
+    /// 通道的累积读数，不是树状态 —— **不进语义指纹、不进序列化**；
+    /// 无清空口（诊断面只增，宿主重开场景即换新树）。
+    signal_stats: HashMap<String, u64>,
 }
 
 /// 视频控制命令（S15）：[`SceneTree::take_video_cmds`] 取走缓冲的元素。
@@ -1734,6 +1743,7 @@ impl SceneTree {
             played_sounds: Vec::new(),
             video_cmds: Vec::new(),
             tweens: Vec::new(),
+            signal_stats: HashMap::new(),
         }
     }
 
@@ -1994,6 +2004,24 @@ impl SceneTree {
     /// 尚未交付的宿主预发信号（泵在每次 tick 帧末清空队列）。
     pub fn pending_signals(&self) -> &[Signal] {
         &self.signal_queue
+    }
+
+    /// 信号送达计数读面（S19.3）：（信号名, 累计送达次数）清单，计数
+    /// 降序、同计数按名字典序（行序确定 —— SIGNALS 面板直接消费）。
+    ///
+    /// 口径（与字段注一致）：只计**实际交付**（广播一次计一、路由每条
+    /// 命中连接各计一、级联再发射照实各计）；过滤/丢弃/跳过不计。诊断
+    /// 面 —— 不进语义指纹、不进序列化（查证：`determinism.rs`
+    /// `scene_fingerprint` 采样面 = 帧/暂停/时间缩放/前序节点/脚本局部/
+    /// 补间登记表，与此表无涉；照 `played_sounds` 副作用通道口径）。
+    pub fn signal_stats_sorted(&self) -> Vec<(String, u64)> {
+        let mut rows: Vec<(String, u64)> = self
+            .signal_stats
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows
     }
 
     // ---------- 订阅册（草案 §12 connect/disconnect，S6.17） ----------
@@ -2872,6 +2900,8 @@ impl SceneTree {
                 }
                 inflight.append(&mut re_emitted);
                 stats.signals_delivered += 1;
+                // S19.3 送达计数：广播交付一次计一（诊断面，不进指纹）。
+                *self.signal_stats.entry(sig.name.clone()).or_insert(0) += 1;
             }
 
             // 路由交付（订阅册，S6.17/S6.18）：按注册序，每条命中连接一次，
@@ -2948,6 +2978,9 @@ impl SceneTree {
                 inflight.append(&mut re_emitted);
                 stats.signals_delivered += 1;
                 stats.signals_routed += 1;
+                // S19.3 送达计数：路由交付每条命中连接各计一（同一条信号
+                // 多连接 = 多次交付；级联再发射回泵后照广播口径再计）。
+                *self.signal_stats.entry(sig.name.clone()).or_insert(0) += 1;
             }
         }
 

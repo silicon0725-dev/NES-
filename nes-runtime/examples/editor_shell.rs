@@ -220,6 +220,29 @@
 //! 折叠/选择动态（折叠组 0 行不占位）—— 改名输入框槽位公式不变
 //! （Transform 恒为首组且行数固定，既有动态槽位机制自然跟随）。
 //!
+//! S19.3（**SIGNALS 信号面板**，蓝图 §3.2）：Output dock 同区**双页签** ——
+//! 底部 dock 标题行内 `[OUTPUT][SIGNALS]` 两枚小页签按钮（照工具栏按钮
+//! 模式：九宫格底板 + 透明底 Button，开在既有 "dock" 容器下 —— walk 整
+//! 子树跳过、不进行列表；活动页签文本带 * 后缀，开关态是编辑器会话态
+//! `dock_tab`，不进树）。
+//!
+//! SIGNALS 视图 = ListView 行（复用 hud_dock，数据面按页签切换投影），
+//! 行格式 `<name>  emitted:N  on:<k>  <tags>`（name 字典序）。三个字段：
+//! `emitted:N` 是运行时送达计数（`SceneTree::signal_stats_sorted()` 实时
+//! 读面，计数降序由引擎侧保证、本视图重排为字典序 —— 行序稳定锚）；
+//! `on:<k>` 是静态扫描聚合的订阅（`on`/`onSignal`）引用数；`<tags>` 是
+//! 来源拼注 —— g=游戏脚本（Script 节点 source/registry_key 源）、e=扩展
+//!（Extensions/*.js + 扩展运行时注册名）、s=静态引擎源（仅运行时统计
+//! 可见的引擎自发信号，如 tree/* 桥信号、tween_done）。
+//!
+//! 数据聚合照 scan_assets 先例每 60 帧重扫。静态面：Script 节点的
+//! `source` 属性 / `registry_key` 文件 + Extensions/*.js，经壳层纯函数
+//! `scan_signal_refs` 扫 `emit "x"`/`on "x"` 与 `emitSignal("x")`/
+//! `onSignal("x")`，整行注释剔除。动态面：扩展运行时注册名经
+//! `NesRuntime::extension_signal_subscriptions` 只读读面。
+//! **行为零变化**：OUTPUT 页签内容/断言照旧；SIGNALS 纯只读观测
+//!（无写入路径、无日志灌水 —— 页签切换不落 Output 行）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -362,6 +385,12 @@ mod editor_theme {
     pub const FS_ROW_H: f32 = 18.0;
     /// dock 标题行高（"Output" 一行）。
     pub const DOCK_TITLE_H: f32 = 18.0;
+    /// S19.3 页签按钮 x 起点（dock 标题行内，"Output" 标题文本右侧）。
+    pub const TAB_BTN_X: f32 = 72.0;
+    /// 页签按钮宽（OUTPUT 6 字 / SIGNALS 7 字，真字体 14px 下放得下；
+    /// 位图回退溢出按钮框 = 降级路径照旧不破功能 —— 工具栏同款口径）。
+    pub const TAB_BTN_W_OUT: f32 = 48.0;
+    pub const TAB_BTN_W_SIG: f32 = 64.0;
     /// fs 分隔条厚度。
     pub const FS_SEP_H: f32 = 4.0;
     /// fs 标题行高。
@@ -388,8 +417,8 @@ use editor_theme::{
     INSPECTOR_W, LEFT_PANEL_W, MARGIN, MENU_H, MENU_HIT_LAST_W, MENU_ITEM_POOL, MENU_ITEM_X,
     MENU_W, PALETTE, RULER_W, SKIN_BTN_MARGIN, SKIN_PANEL_MARGIN, SPACE_S, SLOT_ACCENT_NAME,
     SLOT_BORDER_NAME, SLOT_PANEL_NAME, SLOT_SELECTED_NAME, SLOT_TEXT_DIM_NAME, SLOT_TEXT_NAME,
-    STATUS_BAND, TL_LIST_H, TL_TITLE_H, TIMELINE_H, TOOLBAR_BTN_H, TOOLBAR_BTN_STEP,
-    TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
+    STATUS_BAND, TAB_BTN_W_OUT, TAB_BTN_W_SIG, TAB_BTN_X, TL_LIST_H, TL_TITLE_H, TIMELINE_H,
+    TOOLBAR_BTN_H, TOOLBAR_BTN_STEP, TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
 };
 
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
@@ -912,6 +941,251 @@ fn script_pool(entries: &[FsEntry]) -> Vec<String> {
         .collect()
 }
 
+// ---- S19.3 SIGNALS 静态扫描（壳层纯函数，零 I/O 零新依赖）----
+
+/// 关键字后的双引号字符串字面量（`kw "name"` 形态；关键字后空白可省）。
+fn quoted_after_kw(rest: &str) -> Option<String> {
+    let rest = rest.trim_start().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// `kw("name")` 形态（js 扩展）：括号后跳空白取双引号字面量。
+fn quoted_after_paren(rest: &str) -> Option<String> {
+    let rest = rest.trim_start().strip_prefix('(')?;
+    quoted_after_kw(rest)
+}
+
+/// 单行信号引用扫描：返回本行扫出的 (emit 名, on 名) 序列。词边界 =
+/// 关键字前一字符非标识符字符（字母/数字/下划线）—— `person "x"` 不误
+/// 报 `on`；js 形态关键字优先于 nes 形态（`emitSignal(` 不会被 `emit`
+/// 抢走 —— nes 形态要求关键字后是空白+引号，`Signal(...` 不命中）。
+fn scan_line_refs(line: &str) -> (Vec<String>, Vec<String>) {
+    let bytes = line.as_bytes();
+    let (mut emits, mut ons) = (Vec::new(), Vec::new());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // 词边界：前一字符是标识符字符则此处必是更长单词的内部。
+        let ident_before =
+            i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !ident_before {
+            let rest = &line[i..];
+            // js 形态优先于 nes 形态（emitSignal/onSignal 不被短关键字抢
+            // 走 —— nes 形态要求关键字后是空白+引号，`Signal(...` 不命
+            // 中，双保险）。
+            let mut matched: Option<(String, usize, bool)> = None;
+            if let Some(tail) = rest.strip_prefix("emitSignal") {
+                matched = quoted_after_paren(tail).map(|n| (n, "emitSignal".len(), true));
+            } else if let Some(tail) = rest.strip_prefix("onSignal") {
+                matched = quoted_after_paren(tail).map(|n| (n, "onSignal".len(), false));
+            } else if let Some(tail) = rest.strip_prefix("emit") {
+                matched = quoted_after_kw(tail).map(|n| (n, "emit".len(), true));
+            } else if let Some(tail) = rest.strip_prefix("on") {
+                matched = quoted_after_kw(tail).map(|n| (n, "on".len(), false));
+            }
+            if let Some((name, kw_len, is_emit)) = matched {
+                if is_emit {
+                    emits.push(name);
+                } else {
+                    ons.push(name);
+                }
+                i += kw_len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (emits, ons)
+}
+
+/// SIGNALS 面板的静态扫描（S19.3，蓝图 §3.2"谁在听"的静态半边）：
+/// 从一段脚本源码扫出全部信号引用名。
+///
+/// - `.nes` 文本脚本形态：`emit "name"` / `on "name"`（关键字 + 空白 +
+///   双引号字符串字面量）；
+/// - `.js` 扩展形态：`emitSignal("name")` / `onSignal("name")`；
+/// - **整行注释剔除**：trim 后以 `//` 起的行整行跳过。行尾注释不剔除
+///   （`emit "x" // note` 仍命中）—— 蓝图 Q3 的**误报容忍**口径：静态
+///   扫描是诊断面不是编译器，字符串内容/行尾注释里的同形文本会命中，
+///   如实记入不追杀（P0 不做词法级字符串跳过）；
+/// - 返回 `(emits, ons)`，各自**去重 + 字典序**（同名多次引用折叠一次
+///   —— 计数口径只在运行时送达面，静态面只答"谁引用了谁"）。
+pub fn scan_signal_refs(source: &str) -> (Vec<String>, Vec<String>) {
+    let (mut emits, mut ons) = (Vec::new(), Vec::new());
+    for raw in source.lines() {
+        let line = raw.trim_start();
+        if line.starts_with("//") {
+            continue; // 整行注释剔除（任务口径；行尾注释见上注 —— 容忍）。
+        }
+        let (mut e, mut o) = scan_line_refs(line);
+        emits.append(&mut e);
+        ons.append(&mut o);
+    }
+    emits.sort();
+    emits.dedup();
+    ons.sort();
+    ons.dedup();
+    (emits, ons)
+}
+
+/// scan_signal_refs 单元测试（`cargo test --example editor_shell` 跑；
+/// 混合源夹具：nes 形态 / js 形态 / 整行注释剔除 / 词边界不误报 / 去重
+/// 排序 / 行尾注释容忍）。
+#[cfg(test)]
+mod scan_signal_tests {
+    use super::scan_signal_refs;
+
+    #[test]
+    fn mixed_fixture_nes_and_js_forms() {
+        let src = "\
+every { emit \"fire\" }
+on \"fire\" { this.alpha = 0.5 }
+on \"hit\" { emit \"died\" }
+";
+        let (emits, ons) = scan_signal_refs(src);
+        assert_eq!(emits, vec!["died".to_string(), "fire".to_string()]);
+        assert_eq!(ons, vec!["fire".to_string(), "hit".to_string()]);
+    }
+
+    #[test]
+    fn js_forms_and_comment_lines() {
+        let src = "\
+nes.onSignal(\"poke\", function () { nes.emitSignal(\"poked\", 1); });
+// emit \"ghost\" <- full-line comment, must be dropped
+// on \"ghost2\"
+nes.onUpdate(function () { nes.emitSignal(\"tick_end\", 0); });
+";
+        let (emits, ons) = scan_signal_refs(src);
+        assert_eq!(emits, vec!["poked".to_string(), "tick_end".to_string()]);
+        assert_eq!(ons, vec!["poke".to_string()]);
+        assert!(
+            !emits.contains(&"ghost".to_string()) && !ons.contains(&"ghost2".to_string()),
+            "注释行内引用必须剔除"
+        );
+    }
+
+    #[test]
+    fn word_boundary_no_false_positive() {
+        let src = "person \"bob\"  # not an on ref\nicon \"a.png\"  # ic-on prefix, no match\n";
+        let (emits, ons) = scan_signal_refs(src);
+        assert!(emits.is_empty(), "{emits:?}");
+        assert!(ons.is_empty(), "person/icon 的词内 on 不得命中：{ons:?}");
+    }
+
+    #[test]
+    fn dedup_sorted_and_trailing_comment_tolerated() {
+        let src = "\
+emit \"b\" // trailing comment: still counted (false-positive tolerance)
+emit \"a\"
+emit \"b\"
+";
+        let (emits, ons) = scan_signal_refs(src);
+        assert_eq!(emits, vec!["a".to_string(), "b".to_string()], "去重+字典序");
+        assert!(ons.is_empty());
+    }
+
+    #[test]
+    fn nes_keyword_not_eaten_by_js_form() {
+        // `emitSignal(` 不被 nes `emit` 抢走（emit 形态要求空白+引号）。
+        let src = "nes.emitSignal(\"only_js\", 1);\n";
+        let (emits, ons) = scan_signal_refs(src);
+        assert_eq!(emits, vec!["only_js".to_string()]);
+        assert!(ons.is_empty());
+    }
+}
+
+/// 一条引用并进聚合表：g/e 来源位 + on 计数（静态扫描逐次计）。
+fn index_add(
+    idx: &mut std::collections::BTreeMap<String, (bool, bool, u64)>,
+    emits: &[String],
+    ons: &[String],
+    game: bool,
+) {
+    for n in emits {
+        let e = idx.entry(n.clone()).or_insert((false, false, 0));
+        if game {
+            e.0 = true;
+        } else {
+            e.1 = true;
+        }
+    }
+    for n in ons {
+        let e = idx.entry(n.clone()).or_insert((false, false, 0));
+        if game {
+            e.0 = true;
+        } else {
+            e.1 = true;
+        }
+        e.2 += 1;
+    }
+}
+
+/// SIGNALS 静态聚合（S19.3 数据面）：信号名 -> (游戏脚本引用, 扩展引用,
+/// on 计数)。三个来源（蓝图 §3.2"谁在发/谁在听"的静态半边）：
+/// ① Script 节点（g）：`source` 属性内嵌文本优先；否则 `registry_key`
+///    非空时按资产根相对路径读文件（与运行时装载同一相对系）。两者皆空
+///    = 未挂载，跳过；
+/// ② `Extensions/*.js`（e）：字典序 = 宿主装载序同源；
+/// ③ 扩展运行时注册名（e，`NesRuntime::extension_signal_subscriptions`
+///    只读读面）：静态扫描未命中的订阅名补 on:1 —— 订阅即听者；静态已
+///    计过的名字不重复加（防同一名双计）。
+/// 读盘失败（缺失/非 UTF-8）如实跳过 —— 静态扫描是诊断面，坏源不阻塞
+/// 面板（带病也能跑的既有口径）。BTreeMap = 行字典序的天然来源。
+fn scan_signal_index(
+    tree: &nes_scene::SceneTree,
+    assets: &Path,
+    ext_subs: &[String],
+) -> std::collections::BTreeMap<String, (bool, bool, u64)> {
+    let mut idx: std::collections::BTreeMap<String, (bool, bool, u64)> = Default::default();
+    // ① Script 节点（g）。
+    for id in tree.preorder() {
+        if tree.kind_tag(id) != Some(nes_scene::NodeKindTag::Script) {
+            continue;
+        }
+        let inline = match tree.prop(id, "source") {
+            Some(Value::Str(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        };
+        let (emits, ons) = if let Some(text) = inline {
+            scan_signal_refs(&text)
+        } else {
+            let key = match tree.prop(id, "registry_key") {
+                Some(Value::Str(s)) if !s.is_empty() => s.clone(),
+                _ => continue, // 未挂载：无源可扫。
+            };
+            match std::fs::read_to_string(assets.join(&key)) {
+                Ok(text) => scan_signal_refs(&text),
+                Err(_) => continue, // 读不到（装载缺口同款）：如实跳过。
+            }
+        };
+        index_add(&mut idx, &emits, &ons, true);
+    }
+    // ② Extensions/*.js（e）。
+    if let Ok(entries) = std::fs::read_dir(assets.join("Extensions")) {
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("js"))
+            .collect();
+        files.sort();
+        for f in files {
+            if let Ok(text) = std::fs::read_to_string(&f) {
+                let (emits, ons) = scan_signal_refs(&text);
+                index_add(&mut idx, &emits, &ons, false);
+            }
+        }
+    }
+    // ③ 扩展运行时注册名（e）。
+    for name in ext_subs {
+        let e = idx.entry(name.clone()).or_insert((false, true, 0));
+        e.1 = true;
+        if e.2 == 0 {
+            e.2 = 1; // 静态未命中才补 1（防同一名双计）。
+        }
+    }
+    idx
+}
+
 /// 相对路径后缀（不含点；无后缀 = 空串）—— 双击分派的提示行用。
 fn extension_suffix(rel: &str) -> &str {
     rel.rsplit_once('.').map(|(_, e)| e).unwrap_or("")
@@ -1403,7 +1677,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -1533,6 +1807,45 @@ fn main() {
         let _ = tree.set_prop(hud_dock, "rows", Value::Str(String::new()));
         let _ = tree.set_prop(hud_dock, "row_h", Value::I64(DOCK_ROW_H as i64));
         tree.set_prop_raw(hud_dock, "z_index", Value::I64(-80));
+        // S19.3 页签行（dock 标题行内 [OUTPUT][SIGNALS] —— Output 同区双
+        // 页签，蓝图 §3.2 前哨形态）：两枚小页签按钮 + 九宫格底板（照工
+        // 具栏按钮模式：底板垫底、按钮透明底 —— hover/pressed 四态照常）。
+        // 开在既有 "dock" 容器下 —— walk 整子树跳过（观感件不进行列表）；
+        // z=-80 同 dock。offset/size 装配期占位，每帧布局投影随 dock 重写；
+        // 活动页签文本 * 后缀（工具栏开关同款口径）。会话态 dock_tab 不进
+        // 树（见会话态声明与投影块）。
+        let mk_tab_plate = |tree: &mut nes_scene::SceneTree, x: f32, w: f32| {
+            let plate = tree.add_node(dock, "tab_plate", NodeKind::Control);
+            let _ = tree.set_prop(plate, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(plate, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(x, 320.0)));
+            let _ = tree.set_prop(plate, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(w, DOCK_TITLE_H)));
+            let _ = tree.set_prop(plate, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+            skin_button(tree, plate);
+            tree.set_prop_raw(plate, "z_index", Value::I64(-80));
+            plate
+        };
+        let mk_tab_btn = |tree: &mut nes_scene::SceneTree, name: &str, text: &str, x: f32, w: f32| {
+            let b = tree.add_node(dock, name, NodeKind::Button);
+            let _ = tree.set_prop(b, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(b, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(x, 320.0)));
+            let _ = tree.set_prop(b, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(w, DOCK_TITLE_H)));
+            let _ = tree.set_prop(b, "text", Value::Str(text.to_string()));
+            // 字号 14 + 透明底：与工具栏五键逐位同源（底板纹理透出）。
+            tree.set_prop_raw(b, "font_size", Value::I64(UI_FONT_SIZE));
+            tree.set_prop_raw(b, "fill_slot", Value::Str(String::new()));
+            tree.set_prop_raw(b, "z_index", Value::I64(-80));
+            b
+        };
+        let tab_plate_out = mk_tab_plate(tree, TAB_BTN_X, TAB_BTN_W_OUT);
+        let tab_plate_sig = mk_tab_plate(tree, TAB_BTN_X + TAB_BTN_W_OUT + SPACE_S, TAB_BTN_W_SIG);
+        let tab_output = mk_tab_btn(tree, "tab_output", "OUTPUT", TAB_BTN_X, TAB_BTN_W_OUT);
+        let tab_signals = mk_tab_btn(
+            tree,
+            "tab_signals",
+            "SIGNALS",
+            TAB_BTN_X + TAB_BTN_W_OUT + SPACE_S,
+            TAB_BTN_W_SIG,
+        );
         // 文件系统 dock（S12-8，Godot 左下 res:// 面板）：panel 槽
         // 铺底 + "res:/" 标题行 + 资产树 ListView（复用控件，行文本 =
         // 相对资产根的缩进树；选中/行点击与层级树同款投影-回调口径）。
@@ -1958,7 +2271,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -1999,6 +2312,13 @@ fn main() {
     let mut fs_sel: Option<usize> = None;
     let mut fs_focus = false;
     let mut fs_last_press: Option<(u64, usize)> = None;
+    // S19.3 SIGNALS 页签会话态（不进树、不落盘）：0 = OUTPUT（缺省 ——
+    // 既有行为零变化）、1 = SIGNALS。静态聚合缓存（信号名 -> (g, e, on)）
+    // 每 60 帧重扫（照 scan_assets 先例 —— 文件读盘 + 树走查不逐帧做）；
+    // emitted 计数是树读面，投影每帧现算（实时）。初扫在装配完成后。
+    let mut dock_tab: u8 = 0;
+    let ext_subs0 = rt.extension_signal_subscriptions();
+    let mut sig_index = scan_signal_index(rt.tree_mut(), &assets, &ext_subs0);
     // 时间轴 dock 会话态（S18.1，不进树、不落盘）：通道/缓动/模式循环
     // 档下标（创建控制行的循环按钮现态）+ 三个输入框的已提交值（会话
     // 值 —— APPLY 落地取这里，输入框 text 属性只管显示）。
@@ -2196,6 +2516,10 @@ fn main() {
             (tl_ease, "tl_ease"),
             (tl_mode, "tl_mode"),
             (tl_apply, "tl_apply"),
+            // S19.3 页签按钮（dock 标题行）—— 切换是会话态投影，落账段
+            // 只翻 dock_tab，不落 Output 行（零日志灌水）。
+            (tab_output, "tab_output"),
+            (tab_signals, "tab_signals"),
         ]
         .into_iter()
         .collect();
@@ -2250,6 +2574,12 @@ fn main() {
     let mut demo_script_row_off = false;
     let mut demo_script_row_none = false;
     let mut demo_appearance_body = String::new();
+    // S19.3 SIGNALS 页签取证闩锁（同款滞容口径）：①SIGNALS 激活窗内闩
+    // 行面全文（应含 "spun" —— PLAY 期 spin 每帧 emit、ScriptVm 观察者
+    // 交付计数；应含 "on:"/"emitted:" 行格式）；②切回 OUTPUT 后闩活动
+    // 标记（OUTPUT* —— 页签切换链路双向各走一次的凭证）。
+    let mut demo_signals_rows = String::new();
+    let mut demo_tab_back_text = String::new();
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -2425,6 +2755,18 @@ fn main() {
                 344 => inject_input(InputEvent::MouseMove { x: 300.0, y: 34.0 }),
                 346 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 348 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                // S19.3 页签切换取证（420 帧窗尾部，既有链路全部收尾后）：
+                // 点 SIGNALS 页签（dock 标题行，768x432：dock_y = 432-24-96
+                // = 312，SIGNALS tab (124..188, 312..330) 取中 (156,321)）→
+                // 行面闩锁 → 点回 OUTPUT（OUTPUT tab (72..120) 取中
+                // (96,321)）恢复缺省视图 —— 页签切换链路双向各实走一次，
+                // 既有断言全部保持 OUTPUT 语境。
+                360 => inject_input(InputEvent::MouseMove { x: 156.0, y: 321.0 }),
+                362 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                364 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                380 => inject_input(InputEvent::MouseMove { x: 96.0, y: 321.0 }),
+                382 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                384 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 _ => {}
             }
         }
@@ -2570,6 +2912,27 @@ fn main() {
             if let Some(Value::Str(s)) = rt.tree_mut().prop(ins_appearance, PROP_LABEL_TEXT) {
                 if s.starts_with("alpha: ") {
                     demo_appearance_body = s.clone();
+                }
+            }
+        }
+        // S19.3 SIGNALS 页签取证（滞容闩锁，见上方声明注）：SIGNALS 激活
+        // 窗（帧 364 抬沿后 ..=378，380 才移向 OUTPUT tab）内闩一次非空
+        // 行面；切回 OUTPUT 后（≥390）闩 tab_output 的活动标记 OUTPUT*。
+        if demo
+            && (366..=378).contains(&index)
+            && demo_signals_rows.is_empty()
+            && dock_tab == 1
+        {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(hud_dock, "rows") {
+                if !s.is_empty() {
+                    demo_signals_rows = s.clone();
+                }
+            }
+        }
+        if demo && index >= 390 && demo_tab_back_text.is_empty() {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(tab_output, "text") {
+                if s == "OUTPUT*" {
+                    demo_tab_back_text = s.clone();
                 }
             }
         }
@@ -2734,22 +3097,24 @@ fn main() {
             // 条带）上 = 面板交互：护住选中（不清空、不框选）。输入框
             // 与层级树的点击让给 UiVm 的夺焦/行点击路径；标尺与 dock
             // 照 Godot 口径不属于可编辑区 —— 点上去既不清选中也不框选。
-            let over_ui = {
-                let tree = rt.tree_mut();
-                [
-                    name_input, hud_tree, hud_dock, ruler_h, ruler_v, ruler_corner,
-                    tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset,
-                    fs_bg, fs_sep, fs_tree,
-                    // S18.1 时间轴面板全部控件：压上不清选中、不框选
-                    //（输入框/按钮的交互让给 UiVm 同款纪律）。
-                    tl_bg, hud_tl, tl_pos, tl_scale, tl_alpha, tl_x_in, tl_y_in,
-                    tl_ms_in, tl_ease, tl_mode, tl_apply,
-                    // S19.1 菜单条与下拉弹层（纵深防御 —— 菜单开着时点
-                    // 击在更早的菜单路径里已消费；菜单收着时压菜单条也
-                    // 不清选中不框选）。播放组按钮随迁仍护（菜单条内，
-                    // Godot：点播放不清选中）。
-                    menu_bg, menu_pop_bg,
-                ]
+                let over_ui = {
+                    let tree = rt.tree_mut();
+                    [
+                        name_input, hud_tree, hud_dock, ruler_h, ruler_v, ruler_corner,
+                        tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset,
+                        fs_bg, fs_sep, fs_tree,
+                        // S18.1 时间轴面板全部控件：压上不清选中、不框选
+                        //（输入框/按钮的交互让给 UiVm 同款纪律）。
+                        tl_bg, hud_tl, tl_pos, tl_scale, tl_alpha, tl_x_in, tl_y_in,
+                        tl_ms_in, tl_ease, tl_mode, tl_apply,
+                        // S19.1 菜单条与下拉弹层（纵深防御 —— 菜单开着时点
+                        // 击在更早的菜单路径里已消费；菜单收着时压菜单条也
+                        // 不清选中不框选）。播放组按钮随迁仍护（菜单条内，
+                        // Godot：点播放不清选中）。
+                        menu_bg, menu_pop_bg,
+                        // S19.3 页签按钮（dock 标题行内 —— 压上不清选中）。
+                        tab_output, tab_signals, tab_plate_out, tab_plate_sig,
+                    ]
                 .iter()
                 .chain(menu_item_plates.iter())
                 .any(|&n| press_in_control(tree, n, viewport, (mx, my)))
@@ -2990,6 +3355,11 @@ fn main() {
                     fs_sel = None;
                 }
             }
+            // S19.3：SIGNALS 静态聚合同周期重扫（读盘 + 树走查 —— 与
+            // scan_assets 同一条"每 60 帧"取舍；emitted 是树读面，投影
+            // 每帧现算不吃这份缓存）。
+            let ext_subs = rt.extension_signal_subscriptions();
+            sig_index = scan_signal_index(rt.tree_mut(), &assets, &ext_subs);
         }
         // 焦点门：文本输入框（改名框或时间轴三个输入框 —— S18.1 并入同
         // 一道门）持焦时 Enter/字母/数字属于输入框 —— 键盘挂载流与音乐
@@ -3029,6 +3399,10 @@ fn main() {
                     }
                 }
                 log_line(&editor_log, format!("scan {} script(s)", scripts.len()));
+                // S19.3：手动刷新顺带重扫 SIGNALS 静态聚合（不落行 ——
+                // 静态面无新增信号就不打扰；同周期刷新的静默口径）。
+                let ext_subs = rt.extension_signal_subscriptions();
+                sig_index = scan_signal_index(rt.tree_mut(), &assets, &ext_subs);
             }
             // F9：左栏 Scene/FileSystem 分割档切换（焦点段占大头；
             // 会话态不进树 —— 比例只落在每帧重写的 offset/size 上，
@@ -3506,13 +3880,64 @@ fn main() {
             let _ = tree.set_prop(dock_bg, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - 2.0 * MARGIN, DOCK_H)));
             tree.set_local(dock_title, Transform2D::from_pos(MARGIN + 2.0, dock_y + 1.0));
+            // S19.3：标题文本随活动页签（OUTPUT 视图时与既有 "Output"
+            // 逐位同 —— 行为零变化；SIGNALS 激活时标题随之，投影无状态）。
+            let _ = tree.set_prop(
+                dock_title,
+                PROP_LABEL_TEXT,
+                Value::Str(if dock_tab == 0 { "Output" } else { "SIGNALS" }.into()),
+            );
+            // S19.3 页签布线：两枚 tab 随 dock 每帧重写（标题行内）；活动
+            // 页签文本 * 后缀（工具栏开关同款口径 —— 会话态投影，不进树）。
+            let tab_defs = [
+                (tab_output, tab_plate_out, dock_tab == 0, "OUTPUT", TAB_BTN_X, TAB_BTN_W_OUT),
+                (
+                    tab_signals,
+                    tab_plate_sig,
+                    dock_tab == 1,
+                    "SIGNALS",
+                    TAB_BTN_X + TAB_BTN_W_OUT + SPACE_S,
+                    TAB_BTN_W_SIG,
+                ),
+            ];
+            for (b, p, active, text, x, w) in tab_defs {
+                let _ = tree.set_prop(
+                    b,
+                    PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(x, dock_y)),
+                );
+                let _ = tree.set_prop(
+                    b,
+                    PROP_CONTROL_SIZE,
+                    Value::Vec2(nes_scene::Vec2::new(w, DOCK_TITLE_H)),
+                );
+                let _ = tree.set_prop(
+                    b,
+                    "text",
+                    Value::Str(if active {
+                        format!("{text}*")
+                    } else {
+                        text.to_string()
+                    }),
+                );
+                let _ = tree.set_prop(
+                    p,
+                    PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(x, dock_y)),
+                );
+                let _ = tree.set_prop(
+                    p,
+                    PROP_CONTROL_SIZE,
+                    Value::Vec2(nes_scene::Vec2::new(w, DOCK_TITLE_H)),
+                );
+            }
             let dock_list_h = DOCK_H - DOCK_TITLE_H - 2.0;
             let _ = tree.set_prop(hud_dock, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(MARGIN + 2.0, dock_y + DOCK_TITLE_H)));
             let _ = tree.set_prop(hud_dock, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - 2.0 * MARGIN - 4.0, dock_list_h)));
             let dock_fit = (((dock_list_h - 4.0) / DOCK_ROW_H).floor() as usize).max(1);
-            let dock_rows: Vec<String> = editor_log
+            let log_fit: Vec<String> = editor_log
                 .borrow()
                 .iter()
                 .rev()
@@ -3520,6 +3945,43 @@ fn main() {
                 .rev()
                 .map(|l| l.chars().take(DOCK_LINE_CHARS).collect())
                 .collect();
+            // S19.3：行面按活动页签分派 —— OUTPUT = 既有日志行（逐位不动，
+            // 行为零变化的回归锚）；SIGNALS = 信号观测行（name 字典序）：
+            // `<name>  emitted:N  on:<k>  <tags>`。emitted 实时取
+            // signal_stats_sorted（送达计数读面）；on/tags 来自 60 帧一扫
+            // 的静态聚合缓存；tags = g(游戏脚本)/e(扩展)/s(仅运行时统计
+            // 可见 —— 引擎自发信号，如 tree/* 桥信号、tween_done；编辑态
+            // NoObserver 订阅全滤不交付，故编辑期引擎信号如实不入表)。
+            let dock_rows: Vec<String> = if dock_tab == 0 {
+                log_fit
+            } else {
+                let stats = tree.signal_stats_sorted();
+                let mut merged: std::collections::BTreeMap<String, (bool, bool, u64, u64)> =
+                    std::collections::BTreeMap::new();
+                for (name, (g, e, on)) in sig_index.iter() {
+                    merged.insert(name.clone(), (*g, *e, *on, 0));
+                }
+                for (name, cnt) in stats {
+                    merged.entry(name).or_insert((false, false, 0, 0)).3 = cnt;
+                }
+                merged
+                    .iter()
+                    .map(|(name, (g, e, on, emitted))| {
+                        let mut tags = String::new();
+                        if *g {
+                            tags.push('g');
+                        }
+                        if *e {
+                            tags.push('e');
+                        }
+                        if tags.is_empty() && *emitted > 0 {
+                            tags.push('s');
+                        }
+                        format!("{name}  emitted:{emitted}  on:{on}  {tags}")
+                    })
+                    .map(|l| l.chars().take(DOCK_LINE_CHARS).collect())
+                    .collect()
+            };
             let _ = tree.set_prop(hud_dock, "rows", Value::Str(dock_rows.join("\n")));
 
             // 时间轴 dock 布线（S18.1，Output 上方的全宽面板）：九宫格
@@ -4297,6 +4759,11 @@ fn main() {
                     }
                 }
                 "reset" => play.reset(&mut rt, &editor_log),
+                // S19.3 页签切换（会话态投影，不落 Output —— 零日志灌水，
+                // 环形缓冲既有断言面不动）。运行态照常受理：纯只读视图
+                // 切换，无编辑语义（SIGNALS 本就是观测面）。
+                "tab_output" => dock_tab = 0,
+                "tab_signals" => dock_tab = 1,
                 _ => {
                     if play.playing {
                         continue;
@@ -4529,6 +4996,20 @@ fn main() {
                 && demo_appearance_body.contains("frame: 0"),
             "appearance snapshot rows wrong: {demo_appearance_body:?}"
         );
+        // S19.3：SIGNALS 视图行含 PLAY 期真实送达的信号（spin 每帧
+        // emit "spun"，ScriptVm 观察者缺省全收 = 广播交付逐帧计数 ——
+        // emitted 计数来自 signal_stats_sorted 读面）+ 行格式两字段；
+        // 页签切回 OUTPUT（活动标记恢复 —— 切换链路双向各走一次）。
+        assert!(
+            demo_signals_rows.contains("spun")
+                && demo_signals_rows.contains("emitted:")
+                && demo_signals_rows.contains("on:"),
+            "SIGNALS rows missing spun row: {demo_signals_rows:?}"
+        );
+        assert_eq!(
+            demo_tab_back_text, "OUTPUT*",
+            "页签未切回 OUTPUT（活动标记缺失）"
+        );
         // 树形态：挂载 Script 子节点留存（名字 = 脚本基名），registry_key
         // 已回空串（卸载），enabled = false（切换后未回改）。
         let tree = rt.tree_mut();
@@ -4554,7 +5035,7 @@ fn main() {
                 "menu outside-click must not change selection (got {prim:?})"
             );
         }
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照 冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
     let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);

@@ -1,1 +1,4 @@
-every { this.pos = xy(this.pos.x + 0.3, this.pos.y) }
+every {
+  this.pos = xy(this.pos.x + 0.3, this.pos.y)
+  emit "spun" 1
+}

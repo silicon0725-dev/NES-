@@ -675,6 +675,16 @@ impl NesRuntime {
             .map(|m| m.has_signal_hats())
             .unwrap_or(false)
     }
+
+    /// 扩展已注册的信号名快照（S19.3 SIGNALS 面板数据面；只读转发
+    /// [`ExtensionManager::signal_subscriptions`] —— 声明序去重的订阅名；
+    /// 未开扩展 = 空表）。壳层静态聚合用它补"扩展 onSignal 注册名"来源。
+    pub fn extension_signal_subscriptions(&self) -> Vec<String> {
+        self.extensions
+            .as_ref()
+            .map(|m| m.signal_subscriptions())
+            .unwrap_or_default()
+    }
 }
 
 /// S17.2 扩展信号观察者：hat 的引擎半边。
