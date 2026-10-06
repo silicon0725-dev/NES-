@@ -15,3 +15,7 @@ nes-media/avi_probe_out/
 # editor_shell 启动时若缺失会从用户目录复制，都没有就打印提示退出）
 nes-runtime/examples/assets/Media/*.amv
 nes-runtime/examples/assets/Media/*.avi
+
+# S20：编辑器 Ctrl+S 演示保存目标（运行期产物不入库 —— 冒烟断言写盘后
+# 由本忽略规则挡在版本库外）
+nes-runtime/examples/assets/Scenes/
