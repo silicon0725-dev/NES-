@@ -197,6 +197,29 @@
 //! （无既有能力者如实报 "not in beta"，照 S12-8 .ron 双击先例）；
 //! 快捷键全部照旧 —— 菜单只是快捷键的可视化入口，不改键位。
 //!
+//! S19.2（**Inspector 三分区重组**，蓝图 §3.1 + §4.3）：检查器从两组扩
+//! 成**对象中心三分区** ——
+//! - **Transform**：name/x/y/z + 改名框（现状行不动，恒为首组）；
+//! - **Appearance**（新只读分区）：Sprite2D 选中时 alpha / pivot / frame
+//!   三行 —— 每帧快照只读投影（S16 系既有属性读面：alpha F32 缺省
+//!   1.0 / pivot Vec2 缺省 (0,0) / frame I64 缺省 0，出生即满配）；非
+//!   Sprite 选中 = 单行 `(n/a)`；
+//! - **Script**：升级为**对象中心脚本列表** —— 选中节点的全部已挂载
+//!   Script 子节点逐行 `SCRIPT <basename> <ON|OFF>` 投影（挂载判定 =
+//!   registry_key 非空 —— S12-7 挂载事务的落账面；ON/OFF = enabled 属
+//!   性，schema 缺省 true = 挂载即 ON）；无已挂载 = `(no scripts)` 行。
+//!   F6 候选/Enter 挂载/U 卸载首个/E 切换的挂载流原样并入（U/E 仍作用
+//!   于第一个 Script 子节点 —— P0 不做行级选择差异化，见 S19.2 文档
+//!   §5）。
+//!
+//! 折叠组从 2 组扩成 3 组：group_stage 扩到 3 位（bit0=Transform /
+//! bit1=Appearance / bit2=Script），F7 循环 0..=7，组标题点击翻对应位
+//! （既有机制照抄）。组标题折叠标记从显式前缀（"- Transform"）改后缀
+//! （"Transform -" 展开 / "Transform +" 折叠 —— 蓝图 §3.1 示例口径）。
+//! 行布局改**游标式动态分配**：分区标题 y = 前序分区底缘，正文行数随
+//! 折叠/选择动态（折叠组 0 行不占位）—— 改名输入框槽位公式不变
+//! （Transform 恒为首组且行数固定，既有动态槽位机制自然跟随）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -926,6 +949,67 @@ fn mount_target(
     tree.uid_of(m).map(|u| (u, mounted, enabled))
 }
 
+/// 对象中心脚本列表（S19.2，Inspector Script 分区的行投影）：选中节点
+/// 的全部**已挂载** Script 子节点逐行投影 —— 挂载判定 = registry_key
+/// 非空（mount_script 事务的落账面；U 卸载写空串即从列表消失，Script
+/// 子节点本身留存）。行格式（全 ASCII）：`SCRIPT <basename> <ON|OFF>`
+/// —— basename = 注册键的文件基名（与挂载日志同 [`base_name`] 口径），
+/// ON/OFF = enabled 属性（schema 缺省 true = 挂载即 ON）。无已挂载子节
+/// 点 = 单行 `(no scripts)`（时间轴 `(no tweens on selection)` 同款空
+/// 态文案纪律）。数据模型注：多个 Script 子节点在 schema 上可并存，
+/// 编辑器挂载流只在"无 Script 子节点"时新建 —— 编辑器流下至多 1 行
+/// 有数据；投影按"全部子节点"写（数据面如实，不限个数）。
+fn script_list_rows(tree: &nes_scene::SceneTree, primary: nes_scene::NodeId) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for &c in tree.children(primary) {
+        if tree.kind_tag(c) != Some(nes_scene::NodeKindTag::Script) {
+            continue;
+        }
+        let key = match tree.prop(c, "registry_key") {
+            Some(Value::Str(s)) if !s.is_empty() => s.clone(),
+            _ => continue, // 未挂载（registry_key 空）不占行 —— 子节点仍在树里。
+        };
+        let enabled = matches!(tree.prop(c, "enabled"), Some(Value::Bool(true)));
+        rows.push(format!(
+            "SCRIPT {} {}",
+            base_name(&key),
+            if enabled { "ON" } else { "OFF" }
+        ));
+    }
+    if rows.is_empty() {
+        rows.push("(no scripts)".to_string());
+    }
+    rows
+}
+
+/// Appearance 分区正文（S19.2 只读快照投影）：Sprite2D 选中时 alpha /
+/// pivot / frame 三行 —— 全部是 S16 系既有属性读面，缺省兜底与提取层
+/// 同款（alpha F32 缺省 1.0 / pivot Vec2 缺省 (0,0) / frame I64 缺省
+/// 0；缺失/类型错按缺省显示）。非 Sprite 选中 = 单行 `(n/a)`。只读：
+/// 本分区无任何写路径（编辑归后续里程碑，见 S19.2 文档 §5）。
+fn appearance_rows(tree: &nes_scene::SceneTree, node: nes_scene::NodeId) -> Vec<String> {
+    if tree.kind_tag(node) != Some(nes_scene::NodeKindTag::Sprite2D) {
+        return vec!["(n/a)".to_string()];
+    }
+    let alpha = match tree.prop(node, "alpha") {
+        Some(Value::F32(f)) => *f,
+        _ => 1.0,
+    };
+    let (px, py) = match tree.prop(node, "pivot") {
+        Some(Value::Vec2(v)) => (v.x, v.y),
+        _ => (0.0, 0.0),
+    };
+    let frame = match tree.prop(node, "frame") {
+        Some(Value::I64(i)) => *i,
+        _ => 0,
+    };
+    vec![
+        format!("alpha: {alpha:.2}"),
+        format!("pivot: ({px:.2},{py:.2})"),
+        format!("frame: {frame}"),
+    ]
+}
+
 /// F-4 挂载事务（S12-8 起为 FileSystem 双击与 Inspector Enter **两处
 /// 入口的同一事务**，原 Enter 内联体上提）：目标解析（选中本身是
 /// Script -> 挂它；否则第一个 Script 子节点；再没有 -> 同事务新建，
@@ -1319,7 +1403,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -1844,18 +1928,29 @@ fn main() {
         // TextInput 读该属性、缺省 16 逐位不变。IME 锚点累加同字号（见
         // ime_caret_offset 注 —— 同字体同字号才是"精确"的判据）。
         tree.set_prop_raw(name_input, "font_size", Value::I64(UI_FONT_SIZE));
-        // Inspector 分区标题（S12-7 Godot 分组观感）：text_dim 色小节
-        // 标题，"+" 折叠 / "-" 展开；点击标题行（宿主矩形命中）或 F7
-        // 切换折叠。位置/文本每帧投影（跟随右面板与组布局）。
-        // ins_script 是 Script 分区正文（mount/unmount/enabled 行）。
+        // Inspector 分区标题（S12-7 Godot 分组观感；S19.2 三分区）：
+        // text_dim 色小节标题，展开 "-" / 折叠 "+"（后缀式 —— 蓝图 §3.1
+        // 口径，S12-7 的显式前缀式退役）；点击标题行（宿主矩形命中）或
+        // F7 切换折叠。位置/文本每帧投影（跟随右面板与组布局）。
+        // ins_appearance 是 Appearance 分区正文（alpha/pivot/frame 只读
+        // 快照行）；ins_script 是 Script 分区正文（脚本列表 + 挂载流行）。
         let ins_tf_title = tree.add_node(root, "ins_tf_title", NodeKind::Label);
         tree.set_local(ins_tf_title, Transform2D::from_pos(-1000.0, -1000.0));
-        let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT, Value::Str("- Transform".into()));
+        let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT, Value::Str("Transform -".into()));
         let _ = tree.set_prop(ins_tf_title, "font_size", Value::I64(UI_FONT_SIZE));
         let _ = tree.set_prop(ins_tf_title, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
+        let ins_ap_title = tree.add_node(root, "ins_ap_title", NodeKind::Label);
+        tree.set_local(ins_ap_title, Transform2D::from_pos(-1000.0, -1000.0));
+        let _ = tree.set_prop(ins_ap_title, PROP_LABEL_TEXT, Value::Str("Appearance -".into()));
+        let _ = tree.set_prop(ins_ap_title, "font_size", Value::I64(UI_FONT_SIZE));
+        let _ = tree.set_prop(ins_ap_title, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
+        let ins_appearance = tree.add_node(root, "ins_appearance", NodeKind::Label);
+        tree.set_local(ins_appearance, Transform2D::from_pos(-1000.0, -1000.0));
+        let _ = tree.set_prop(ins_appearance, PROP_LABEL_TEXT, Value::Str(String::new()));
+        let _ = tree.set_prop(ins_appearance, "font_size", Value::I64(UI_FONT_SIZE));
         let ins_sc_title = tree.add_node(root, "ins_sc_title", NodeKind::Label);
         tree.set_local(ins_sc_title, Transform2D::from_pos(-1000.0, -1000.0));
-        let _ = tree.set_prop(ins_sc_title, PROP_LABEL_TEXT, Value::Str("- Script".into()));
+        let _ = tree.set_prop(ins_sc_title, PROP_LABEL_TEXT, Value::Str("Script -".into()));
         let _ = tree.set_prop(ins_sc_title, "font_size", Value::I64(UI_FONT_SIZE));
         let _ = tree.set_prop(ins_sc_title, "color_slot", Value::Str(SLOT_TEXT_DIM_NAME.into()));
         let ins_script = tree.add_node(root, "ins_script", NodeKind::Label);
@@ -1863,7 +1958,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -1881,8 +1976,9 @@ fn main() {
 
     // F-4 脚本挂载与编辑器会话态（不进树、不进指纹）：
     // - 候选池 = Scripts/*.nes（资产根相对路径）+ F6 轮换下标；
-    // - 分组折叠 stage：bit0 = Transform 折叠、bit1 = Script 折叠
-    //   （F7 循环 0..=3，点组标题翻对应位）；
+    // - 分组折叠 stage（S19.2 三组三位）：bit0 = Transform 折叠、
+    //   bit1 = Appearance 折叠、bit2 = Script 折叠（F7 循环 0..=7，点
+    //   组标题翻对应位）；
     // - 工具栏三开关（SEL 选择/拖拽总开关、SNAP 恒吸附、GRID 网格）；
     // - 分区标题行矩形（上一帧投影产出 -> 帧首命中，一帧滞后与既有
     //   UI 命中同口径）：(面板左 x, 行顶 y, 组下标)。
@@ -2145,6 +2241,15 @@ fn main() {
     let mut demo_menu_open_seen = false;
     let mut demo_menu_item0 = String::new();
     let mut demo_menu_closed_seen = false;
+    // S19.2 Inspector 三分区取证闩锁（同款滞容口径）：①脚本列表行
+    // ON（挂载沿后）②OFF（E 切换沿后）③空态 (no scripts)（U 卸载沿
+    // 后）—— 三个沿都在注入流前段（帧 20/30/40），窗口互不重叠；④
+    // Appearance 只读分区正文（obj1 = Sprite2D 恒选中、分区展开态），
+    // alpha/pivot/frame 三行整体闩一次。
+    let mut demo_script_row_on = false;
+    let mut demo_script_row_off = false;
+    let mut demo_script_row_none = false;
+    let mut demo_appearance_body = String::new();
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -2434,6 +2539,40 @@ fn main() {
                 demo_menu_closed_seen = true;
             }
         }
+        // S19.2 三分区取证（滞容闩锁，见上方声明注）：挂载（帧 20 沿）
+        // 后窗 22..=29 闩 "SCRIPT spin.nes ON"（enabled schema 缺省 true
+        // = 挂载即 ON）；E 切换（帧 30 沿）后窗 32..=39 闩 OFF；U 卸载
+        //（帧 40 沿）后窗 42..=49 闩空态行。F7 折叠（帧 50 起）在全部
+        // 窗口之后不干扰；Appearance 正文（帧 12..=28，早于挂载流也无
+        // 依赖 —— obj1 从帧 0 即主选中）整体闩三行快照。
+        if demo && (22..=29).contains(&index) && !demo_script_row_on {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(ins_script, PROP_LABEL_TEXT) {
+                if s.contains("SCRIPT spin.nes ON") {
+                    demo_script_row_on = true;
+                }
+            }
+        }
+        if demo && (32..=39).contains(&index) && !demo_script_row_off {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(ins_script, PROP_LABEL_TEXT) {
+                if s.contains("SCRIPT spin.nes OFF") {
+                    demo_script_row_off = true;
+                }
+            }
+        }
+        if demo && (42..=49).contains(&index) && !demo_script_row_none {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(ins_script, PROP_LABEL_TEXT) {
+                if s.contains("(no scripts)") {
+                    demo_script_row_none = true;
+                }
+            }
+        }
+        if demo && (12..=28).contains(&index) && demo_appearance_body.is_empty() {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(ins_appearance, PROP_LABEL_TEXT) {
+                if s.starts_with("alpha: ") {
+                    demo_appearance_body = s.clone();
+                }
+            }
+        }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
         // 运行态（S12-9）：编辑交互整体让路 —— Tab 循环也一样。
         if !play.playing && tab_now && !prev_tab {
@@ -2689,14 +2828,15 @@ fn main() {
             // 自身的点击由 UiVm 帧内路径接手，不受此门影响）。
             if let Some(gi) = title_click {
                 group_stage ^= 1 << gi;
-                let (gname, open) = if gi == 0 {
-                    ("transform", group_stage & 1 == 0)
-                } else {
-                    ("script", group_stage & 2 == 0)
+                let gname = match gi {
+                    0 => "transform",
+                    1 => "appearance",
+                    _ => "script",
                 };
+                let open = group_stage & (1 << gi) == 0;
                 log_line(
                     &editor_log,
-                    format!("group {} {}", gname, if open { "open" } else { "closed" }),
+                    format!("group {gname} {}", if open { "open" } else { "closed" }),
                 );
                 drag_start = None;
             }
@@ -2900,10 +3040,12 @@ fn main() {
                     format!("split {}", if fs_focus { "files" } else { "scene" }),
                 );
             }
-            // F7：循环切换分组折叠（4 态：全开 -> 折 Transform -> 全折
-            // -> 折 Script -> 全开）。会话态，不进树。
+            // F7：循环切换分组折叠（S19.2 三组三位 8 态：全开 -> 折
+            // Transform -> 折 Appearance -> 折 Transform+Appearance ->
+            // 折 Script -> ... 二进制递进，8 态后回全开）。会话态，不进
+            // 树。
             if f7_now {
-                group_stage = (group_stage + 1) % 4;
+                group_stage = (group_stage + 1) % 8;
                 log_line(&editor_log, format!("groups stage {}", group_stage));
             }
             // F6：轮换挂载候选。
@@ -3621,27 +3763,30 @@ fn main() {
                 .unwrap_or(-1);
             let _ = tree.set_prop(hud_tree, "selected", Value::I64(sel_row));
 
-            // Inspector View（S12-7 Godot 分区）：标题 + Transform /
-            // Script 两组。组标题是独立 Label（text_dim 色），hud_ins
-            // 文本给标题让出空行（行序即布局）；折叠 = 该组行不进文本、
-            // 后续行上移。分区标题矩形记入 title_rows（下一帧帧首命中
-            // —— 一帧滞后与既有 UI 命中同口径）。数值行随选中实时刷新。
+            // Inspector View（S12-7 Godot 分区；S19.2 三分区重组）：
+            // 标题 + Transform / Appearance / Script 三组。组标题是独立
+            // Label（text_dim 色），hud_ins 文本给标题让出空行（行序即
+            // 布局）；折叠 = 该组行不进文本、后续行上移（游标式动态分
+            // 配 —— 每组标题 y = 前序分区底缘，折叠组 0 行不占位）。分区
+            // 标题矩形记入 title_rows（下一帧帧首命中 —— 一帧滞后与既有
+            // UI 命中同口径）。数值行随选中实时刷新。
             let ins_x = viewport.0 - INSPECTOR_W;
             title_rows.clear();
             let mut ins_text = String::from("Inspector");
             match sel.primary(tree) {
                 Some(p) => {
                     let tf_open = group_stage & 1 == 0;
-                    let sc_open = group_stage & 2 == 0;
+                    let ap_open = group_stage & 2 == 0;
+                    let sc_open = group_stage & 4 == 0;
                     // Transform 组标题（面板第 2 行，S12-11 起步进
-                    // INS_ROW_H；S19.1 起顶部再让位菜单栏一行）：前缀
-                    // "-" 展开 / "+" 折叠，text_dim 色（装配期定槽，
-                    // 此处只翻文本）。
+                    // INS_ROW_H；S19.1 起顶部再让位菜单栏一行）：后缀
+                    // "-" 展开 / "+" 折叠（S19.2 蓝图口径），text_dim 色
+                    //（装配期定槽，此处只翻文本）。
                     title_rows.push((ins_x, 12.0 + MENU_H + INS_ROW_H, 0));
                     tree.set_local(ins_tf_title, Transform2D::from_pos(ins_x, 12.0 + MENU_H + INS_ROW_H));
                     let _ = tree.set_prop(ins_tf_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT,
-                        Value::Str(if tf_open { "- Transform" } else { "+ Transform" }.into()));
+                        Value::Str(if tf_open { "Transform -" } else { "Transform +" }.into()));
                     // 属性行随折叠省略（hud_ins 第 2 行留空给标题）。
                     // 名字截 5 字符：行宽 "name " + 5 = 10 字，不超内衬
                     // 宽（11 字上限）。
@@ -3668,7 +3813,9 @@ fn main() {
                     // 槽位紧跟组行（行高 INS_ROW_H —— 不再是装配期写死的
                     // 常量，S12-6 ①根修口径延续：每帧重写，窗口一变当帧
                     // 跟上；S12-11 步进 20 见常量注；S19.1 基点再让位菜
-                    // 单栏一行）。
+                    // 单栏一行）。S19.2：Transform 恒为首组且行数固定，
+                    // 公式不变 —— 输入框槽位天然跟随分区布局（既有动态
+                    // 槽位机制）。
                     let input_y = 12.0
                         + MENU_H
                         + 2.0 * INS_ROW_H
@@ -3683,16 +3830,43 @@ fn main() {
                     let _ = tree.set_prop(name_input, PROP_CONTROL_SIZE,
                         Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W - 2.0 * INSPECTOR_INSET, 20.0)));
 
-                    // Script 分区标题（F-4 挂载流）+ 正文四行：候选轮换
-                    //（F6）/ 挂载（Enter）/ 卸载（U）/ enabled（E）。
-                    // 行宽 11 字预算内（S12-6 口径），候选文件名超宽截断。
-                    let sc_y = input_y + 20.0 + 4.0;
-                    title_rows.push((ins_x, sc_y, 1));
+                    // Appearance 分区标题（S19.2 新组，位 1）+ 只读正文：
+                    // Sprite2D 选中 = alpha/pivot/frame 三行快照；其余类
+                    // 型 = (n/a)。正文行数进布局游标（折叠 = 0 行）。
+                    let ap_y = input_y + 20.0 + 4.0;
+                    title_rows.push((ins_x, ap_y, 1));
+                    tree.set_local(ins_ap_title, Transform2D::from_pos(ins_x, ap_y));
+                    let _ = tree.set_prop(ins_ap_title, "visible", Value::Bool(true));
+                    let _ = tree.set_prop(ins_ap_title, PROP_LABEL_TEXT,
+                        Value::Str(if ap_open { "Appearance -" } else { "Appearance +" }.into()));
+                    let ap_lines: Vec<String> = if ap_open {
+                        appearance_rows(tree, p)
+                    } else {
+                        Vec::new()
+                    };
+                    if ap_open {
+                        tree.set_local(ins_appearance, Transform2D::from_pos(ins_x, ap_y + INS_ROW_H));
+                        let _ = tree.set_prop(ins_appearance, "visible", Value::Bool(true));
+                        let _ = tree.set_prop(ins_appearance, PROP_LABEL_TEXT,
+                            Value::Str(ap_lines.join("\n")));
+                    } else {
+                        let _ = tree.set_prop(ins_appearance, "visible", Value::Bool(false));
+                    }
+
+                    // Script 分区标题（F-4 挂载流；S19.2 位 2）+ 正文 =
+                    // 对象中心脚本列表（每挂载脚本一行 SCRIPT <basename>
+                    // ON|OFF，无挂载 = (no scripts)）+ 挂载流四行：候选
+                    // 轮换（F6）/ 挂载（Enter）/ 卸载（U）/ enabled（E，
+                    // 首个目标 —— 行级选择差异化归 §5 遗留）。行宽 11 字
+                    // 预算内（S12-6 口径），候选文件名超宽截断。
+                    let sc_y = ap_y + INS_ROW_H + ap_lines.len() as f32 * INS_ROW_H;
+                    title_rows.push((ins_x, sc_y, 2));
                     tree.set_local(ins_sc_title, Transform2D::from_pos(ins_x, sc_y));
                     let _ = tree.set_prop(ins_sc_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_sc_title, PROP_LABEL_TEXT,
-                        Value::Str(if sc_open { "- Script" } else { "+ Script" }.into()));
+                        Value::Str(if sc_open { "Script -" } else { "Script +" }.into()));
                     if sc_open {
+                        let mut body = script_list_rows(tree, p);
                         // 挂载目标只读解析（显示现态：enabled 只对已挂
                         // 载脚本有语义 —— 未挂载显示 "-"）。
                         let (mounted, enabled) = match mount_target(tree, p) {
@@ -3703,14 +3877,17 @@ fn main() {
                             .get(script_idx)
                             .map(|r| base_name(r).chars().take(INS_LINE_CHARS).collect())
                             .unwrap_or_else(|| "-".into());
+                        body.push("mount: F6".to_string());
+                        body.push(cand_line);
+                        body.push("unmount U".to_string());
+                        body.push(format!(
+                            "enabled: {}",
+                            if !mounted { "-" } else if enabled { "Y" } else { "N" },
+                        ));
                         tree.set_local(ins_script, Transform2D::from_pos(ins_x, sc_y + INS_ROW_H));
                         let _ = tree.set_prop(ins_script, "visible", Value::Bool(true));
                         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT,
-                            Value::Str(format!(
-                                "mount: F6\n{}\nunmount U\nenabled: {}",
-                                cand_line,
-                                if !mounted { "-" } else if enabled { "Y" } else { "N" },
-                            )));
+                            Value::Str(body.join("\n")));
                     } else {
                         let _ = tree.set_prop(ins_script, "visible", Value::Bool(false));
                     }
@@ -3720,7 +3897,7 @@ fn main() {
                     let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
                     tree.set_local(hud_ins, Transform2D::from_pos(ins_x, 12.0 + MENU_H));
                     // 无选中：分区/输入框全部隐藏（Godot 空面板直感）。
-                    for n in [ins_tf_title, ins_sc_title, ins_script] {
+                    for n in [ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script] {
                         let _ = tree.set_prop(n, "visible", Value::Bool(false));
                     }
                     let _ = tree.set_prop(name_input, "visible", Value::Bool(false));
@@ -4333,6 +4510,25 @@ fn main() {
             has("shortcut table (editor)") && has("F5=play/restart"),
             "shortcut table rows missing: {lines:?}"
         );
+        // S19.2：对象中心脚本列表行变化三连（挂载 ON -> E 切 OFF -> U
+        // 卸载空态）+ Appearance 只读分区三行快照（Sprite 选中态，值 =
+        // schema 缺省：alpha 1.00 / pivot (0.00,0.00) / frame 0 —— 演示
+        // 场景未写这三个属性，快照读面如实反映缺省）。
+        assert!(demo_script_row_on, "script list row (ON) missing: {lines:?}");
+        assert!(
+            demo_script_row_off,
+            "script list row (OFF after E) missing: {lines:?}"
+        );
+        assert!(
+            demo_script_row_none,
+            "script list empty-state row missing: {lines:?}"
+        );
+        assert!(
+            demo_appearance_body.contains("alpha: 1.00")
+                && demo_appearance_body.contains("pivot: (0.00,0.00)")
+                && demo_appearance_body.contains("frame: 0"),
+            "appearance snapshot rows wrong: {demo_appearance_body:?}"
+        );
         // 树形态：挂载 Script 子节点留存（名字 = 脚本基名），registry_key
         // 已回空串（卸载），enabled = false（切换后未回改）。
         let tree = rt.tree_mut();
@@ -4358,8 +4554,8 @@ fn main() {
                 "menu outside-click must not change selection (got {prim:?})"
             );
         }
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路 冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照 冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
 }
