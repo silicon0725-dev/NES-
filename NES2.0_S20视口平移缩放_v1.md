@@ -1,6 +1,7 @@
 # NES 2.0 S20 视口平移缩放 v1
 
 - 分支：`s20-panzoom`（wt-panzoom 独立 worktree）；基线 HEAD `9ebf084`（S19.6 Scene 树真图标集）
+- 追平轮 `s20-1-play-view-fix`（wt-playview 独立 worktree；基线 HEAD `b17a46f`）：实测"点 PLAY 后 UI 乱飞"根因修复 —— §3.5 运行态视图与 UI 锚定（active_view 单点 + 护盾拆分 + gizmo 退场），单文件改动照旧
 - 改动面：`nes-runtime/examples/editor_shell.rs` 单文件（壳层相机会话态 + 换算 + 投影 + 冒烟）+ `.gitignore`（Ctrl+S 演示保存目标不入库）；**零 crate 源码改动、零新依赖、依赖分层不变**
 - 用户基准：Godot 2D 工作区 —— 滚轮缩放朝光标、中键拖拽平移、标尺随缩放自适应、缩放百分比显示
 
@@ -10,7 +11,7 @@
 2. **相机换算式（查证后的契约结论，修正了任务书里 "scale = 1/zoom" 的直觉猜想）**：引擎相机缩放权威在 `Camera2D` 节点的 **`zoom` 属性**（schema："缩放倍数。越大画面越近"，合法域 0.05..16；相机节点**自身变换缩放不参与视图矩阵** —— `nes-render-api` `Camera2DState` 契约冻结 + S19.1 像素契约测试 `t_camera_*` 同源）。视图矩阵冻结式 `view = T(viewport/2) ∘ S(zoom) ∘ T(-center) ∘ R(-rotation)`，即 **`screen = viewport_center + zoom × (world − center)`**。故每帧（extract 前）驱动式为 **`cam.pos = center` + `cam.zoom 属性 = EditorCam.zoom`**；zoom=1 + 初始 center=(开窗/2) 时与旧"置中恒等映射"逐位同值（既有固定坐标断言全部保持）。
 3. **场景数据保护三时机**（编辑视图不进场景文件、不进游戏运行态）：装载时 stash cam 原始 local transform + zoom 属性；**Save（Ctrl+S / Scene>Save）前还原 stash、保存后重应用编辑视图**；**PLAY 时还原场景相机**（首 PLAY 的全树快照在还原之后捕获 ⇒ RESET 回到的也是场景相机），STOP/RESET 后重应用编辑视图。
 4. **渲染面事实（投影改造依据）**：Control 类（有 SetRect 状态）走 HUD 口径（渲染侧经视图矩阵的**逆**折回世界 —— 钉屏幕像素，相机不动它）；**纯 Label 与 Sprite2D 走世界变换**（吃视图矩阵）。故网格条带/标尺刻度/选中框/轨迹点（Control）由投影换算出屏幕位；全部 UI Label 与 S19.6 图标精灵经 `place_at_screen` 反向放置（世界位 = screen_to_world(屏幕位) + 本地缩放 1/zoom —— 视图 zoom 与本地 1/zoom 相抵，屏上恒定 1:1 尺寸与位置）。
-5. **门禁**：十 crate `cargo test --release` **792/792**（基线 792 + 新增 0 —— 断言进 NES_EDIT_DEMO 钩子与 editor_shell 示例测试面）+ editor_shell 单元测试 **13/13**（S20 新增 8 项，`--examples` 面）+ clippy `--all-targets` **0 警告 ×10** + 依赖守卫 **15/15** + editor_shell 双冒烟（120 帧干净退出 + NES_EDIT_DEMO 420 帧全断言，连跑 5 次稳定）+ first_game/tween_demo/frame_demo 180 帧冒烟回归全过。
+5. **门禁（追平轮复跑）**：十 crate `cargo test --release` **792/792** 全绿（nes-asset 34 + nes-scene 271 + nes-render-api 48 + nes-render-extract 65 + nes-audio 52 + nes-media 27 + nes-extension-api 7 + nes-extension-js 29 + nes-render-wgpu 143 + nes-runtime 116 —— 基线面零改动）+ editor_shell 单元测试 **15/15**（追平轮 +2：活动视图单点 / UI 摆位量化证据）+ clippy `--all-targets` **0 警告 ×10** + 依赖守卫 **15/15** + editor_shell 双冒烟（120 帧干净退出 + NES_EDIT_DEMO 420 帧全断言 —— 含运行态 UI 锚定三闩锁）+ first_game 180 帧冒烟。
 
 ## 1. EditorCam 与三时机还原语义
 
@@ -90,6 +91,63 @@ center_new    = mouse_world − (s − viewport_center) / zoom_new
 - `MouseButton::Middle`（S12-3 button_down 表先例：`button_down("middle")` + `buttons_pressed/released[2]` 边沿）。按下沿记（鼠标屏位，起始 center）锚点，拖拽 delta（屏像素）经 `pan_screen` 反向加到 center（`center -= delta / zoom`，拽着世界走）—— 绝对式锚定比逐帧增量抗丢帧。
 - 运行态：滚轮缩放/中键平移/工具栏 ± 全部让路（编辑视图在运行态冻结 —— 投影护盾不写 cam）；PLAY 启动时半途的 pan 锚点与拖拽/框选一并作废。
 
+## 3.5 运行态视图与 UI 锚定（实测"点 PLAY 后 UI 乱飞"根因修复）
+
+### 3.5.1 根因
+
+用户实测（截图确诊）：点 PLAY 后菜单项/标尺数字/面板标题/图标列在视口里乱飞。链条：
+
+1. S20 起，菜单栏 Label/标尺数字/面板标题/dock 标题/时间轴标签/图标精灵全是**世界空间树节点**，每帧经 `place_at_screen`（用相机把屏幕槽位换算成世界位）摆放；
+2. PLAY 三时机还原把**渲染相机**换成场景相机（位置/zoom ≠ 编辑视图时两者不等）；
+3. 而运行态 `!playing` 护盾把 **UI 投影所依赖的编辑视图驱动**一并停了 —— UI 节点停在按编辑视图算出的旧世界位，渲染却用场景相机 ⇒ 世界位与相机的配对错位，全部 UI 飞散。
+
+### 3.5.2 活动视图文法（`CamRig::active_view`）
+
+单点函数，返回本帧 UI 投影换算基准 `(center, zoom)`：
+
+| 态 | 值 | 依据 |
+|---|---|---|
+| 编辑态 | `EditorCam` 会话态（center, zoom） | 与交互换算同源 —— 编辑期行为零变化 |
+| 运行态 | **实时读场景 cam 节点**：center = `tree.world(cam)` 平移分量、zoom = `zoom` 属性（缺省 1；非正/非有限回 1 —— 防御路径，schema 面上 set_prop 已钳 [0.05,16]） | 与提取层 `camera_state_of` **同源同序**（渲染侧相机权威就是这两个读面）—— UI 换算与渲染矩阵恒用同一台相机 |
+
+语义效果：
+
+- **UI 摆位投影运行态照跑**（`!playing` 护盾拆分，见 3.5.3）：place_at_screen 全家（菜单栏/标尺数字/面板标题/dock/时间轴/按钮标签/图标列/进度条/状态栏/检查器）每帧按**活动视图**换算 ⇒ PLAY 后 UI 钉屏幕不动（Godot 语义：编辑器 UI 不随游戏相机飞），游戏世界按场景相机渲染；
+- **游戏脚本动相机，UI 跟随语义正确**：运行态 active_view 就是脚本正在驱动的那台相机（当帧 `refresh_transforms` 后读 world 缓存）——脚本把相机拉远，钉屏 UI 仍钉屏；
+- **读数一帧滞后**：投影先于当帧脚本执行，脚本当帧的相机写入下一帧才反映在 UI 摆位上 —— 与既有 UI 命中一帧滞后同口径；
+- **不做编辑器域 clamp**：运行态 zoom 原样跟随（schema 合法域 0.05..16 可超出编辑器 0.1..8），夹了反而与渲染矩阵错位。
+
+### 3.5.3 `!playing` 护盾拆分清单
+
+| 护盾 | 处置 | 面 |
+|---|---|---|
+| cam 节点写入（`apply_editor`） | **保留** | 游戏运行态用场景定义的相机，编辑视图停写 |
+| 编辑交互（Tab 循环/点选/框选/gizmo 拖拽/方向键/Delete/undo-redo/F6..F9/Enter/U/E/改名提交/行点击落账/时间轴落账/fs 落账/音乐键） | **保留**（零变化） | 全部编辑动作让路 |
+| 滚轮缩放/中键平移/工具栏 ± | **保留**（零变化） | 运行态相机归游戏 |
+| **UI 摆位投影**（place_at_screen 全家 + 网格/标尺/轨迹/选中框换算） | **拆除**（改按活动视图继续） | 乱飞根因所在 —— 投影本就每帧无状态重写，继续跑只是换算基准换成活动视图 |
+
+### 3.5.4 gizmo 退场语义（Godot：运行时编辑器辅助件退场）
+
+运行态 `visible=false`（STOP/RESET 后下一帧投影自然复燃，投影无状态口径天然收口）：
+
+| 容器/池 | 实现 | 备注 |
+|---|---|---|
+| 网格条带池（grid_bars ×340） | 布局条件加 `&& !playing`（GRID 开关同门）—— 全池走既有熄灭分支 | GRID 关闭路径的复用，无新机制 |
+| 标尺刻度池（ruler_ticks） | 顶横/左竖点亮循环加 `&& !playing` —— used=0 ⇒ 全池走余量熄灭分支 | 16px 标尺带（ruler_h/v/corner 屏幕镀边）**不藏**（纯屏幕 chrome，不飞不挡游戏） |
+| 标尺数字池（ruler_labels） | 两段点亮循环加 `&& !playing` —— lab_used=0 ⇒ 全池走余量置空分支（空文本不上屏） | 数字与刻度统一退场 |
+| 轨迹点池（traj_dots ×12） | `traj_from_to` 运行态强制 None ⇒ 全池走熄灭分支 | 编辑器会话可视化不叠游戏画面 |
+| 选中框（sel_box） | 投影尾段 `visible = !playing`（照 icons 池显隐先例） | 精灵 z=5 选中高亮是引擎机制，不在此列 |
+
+### 3.5.5 恢复路径
+
+STOP/RESET 重应用编辑视图（三时机之三，`apply_editor`）⇒ 下一帧投影按编辑视图（= 活动视图）换算 ⇒ UI/gizmo 自然回位，无残留。冒烟闩锁：PLAY 窗内网格整池熄灭 + 选中框隐藏；RESET 后网格首条带复燃。
+
+### 3.5.6 契约测试（editor headless 可测面）
+
+- `active_view_follows_scene_camera_when_playing`：编辑态 active_view == EditorCam；PLAY（restore_scene）后 == 场景 cam（stash 还原值）；脚本动相机当帧跟随；schema 钳制值（0.05/16）原样跟随、裸通道 NaN 归 1；STOP 重应用后回编辑视图。
+- `ui_label_lands_on_active_view_slot_when_playing`：编辑视图 zoom=2 平移后 PLAY，菜单 Label 的 world 位 == 屏幕槽位经活动视图（场景 cam 恒等映射）的换算值（乱飞修复的量化证据，含"编辑视图换算值可判然不同"的反证 + world→screen 渲染闭合核对）。
+- NES_EDIT_DEMO 冒烟闩锁：gizmo 退场三态（3.5.5）。
+
 ## 4. 标尺/网格自适应
 
 ### 4.1 标尺（S12-3 标尺的 S20 升级）
@@ -115,10 +173,10 @@ center_new    = mouse_world − (s − viewport_center) / zoom_new
 | 门禁 | 结果 |
 |---|---|
 | 十 crate `cargo test --release` | **792/792 全绿**（nes-asset 34 + nes-audio 52 + nes-extension-api 7 + nes-extension-js 29 + nes-media 27 + nes-render-api 48 + nes-render-extract 65 + nes-render-wgpu 143 + nes-scene 271 + nes-runtime 116；基线 792 + 0 —— 本轮断言走示例测试与冒烟钩子，零 crate 测试面改动） |
-| editor_shell 单元测试（`cargo test --example editor_shell`） | **13/13**（S20 新增 8：三组 zoom 往返 + zoom=1 恒等映射 + 缩放朝光标世界点不变 + clamp/中心档位/平移 + 标尺自适应与 zoom=1 钉住 + 网格倍增 + headless 滚轮→cam 节点驱动链 + 带几何冻结式；既有 scan_signal 5 项不动） |
+| editor_shell 单元测试（`cargo test --example editor_shell`） | **15/15**（S20 新增 8 + 追平轮 +2：`active_view_follows_scene_camera_when_playing` 活动视图单点（编辑态==EditorCam / PLAY 后==场景 cam / 脚本动相机当帧跟随 / schema 钳制值跟随 + 裸通道 NaN 归 1 / STOP 回位）、`ui_label_lands_on_active_view_slot_when_playing` UI 摆位量化证据（菜单 Label world 位 == 屏幕槽位经活动视图换算 + 旧路径反证 + 渲染闭合）；既有 scan_signal 5 项不动） |
 | clippy `--all-targets` ×10 | **0 警告** |
 | 依赖守卫 | **15/15**（check_dependency_direction.py） |
-| editor_shell 冒烟 | 120 帧干净退出；NES_EDIT_DEMO=1 420 帧全断言（**连跑 5 次稳定**，含 Scenes/ 目录在场的复跑形态） |
+| editor_shell 冒烟 | 120 帧干净退出；NES_EDIT_DEMO=1 NES_GAME_FRAMES=420 全断言（含 §3.5 三闩锁：PLAY 窗网格整池熄灭 / 选中框隐藏 / RESET 后首条带复燃） |
 | 回归冒烟 | first_game / tween_demo / frame_demo 各 180 帧干净退出 |
 
 - **冒烟修正（S12-8 演示流的存量脆弱面，S20 顺手根治）**：fs 双击导航原按 "Media 在场时 spin.nes = 行 7 + 滚 4 格" 写死 —— 资产树在 S16..S19 间长大（Textures/ 等子目录条目增多），行号漂移导致写死坐标点击错行。改**目标现算**：spin.nes 实际行号（当帧 fs_entries）+ 单次多格滚轮（采集器同帧相加，无逐格丢格面）+ 行中点击 y。断言面（fs open / mount 行）不变。
@@ -131,3 +189,5 @@ center_new    = mouse_world − (s − viewport_center) / zoom_new
 3. **缩放动画平滑**：滚轮缩放是即时跳档（×1.15 硬切），无 Godot 那样的指数趋近平滑；需要帧差驱动的插值会话态。
 4. **帧选 F 键（frame selection）**：框选当前要求拖拽手势；"F 键把可视区内精灵全部入选"的 Godot 快捷键未做（F 键进 `Key::Other(vk)` 通道，接线成本低，归交互里程碑）。
 5. **zoom 化的像素对齐**：非整数 zoom 下 1px 网格线/标尺刻度落在半像素上（无 MSAA 光栅下的抖动）；Godot 以抗锯齿线宽解决，P0 接受现状。
+6. **运行态 UI 摆位一帧滞后**（§3.5.2 既有裁决，非缺陷）：投影先于当帧脚本执行，脚本当帧的相机写入下一帧才反映在 UI 摆位上 —— 与既有 UI 命中一帧滞后同口径；要做到零滞后需把 UI 投影挪到 simulate 之后（帧序重构，收益不抵风险）。
+7. **运行态标尺带镀边不退场**：gizmo 退场清单（§3.5.4）只藏刻度/数字，16px 标尺带底条（ruler_h/v/corner 纯屏幕 chrome）运行态保留 —— Godot 运行态整个 2D 编辑视口被游戏画面替换，壳层是面板常驻形态，带底条保留属刻意边界；若要"全屏游戏感"归后续编辑器布局里程碑。

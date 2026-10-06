@@ -123,7 +123,12 @@
 //! 入口 `if !playing` 一层护盾）；相机置中与全部面板投影照常 ——
 //! 编辑器快捷键（F5/F6/Del…）在运行态仍会进检测，但动作被禁用故
 //! 无副作用；游戏键（WASD 等）经同一输入快照直达脚本 —— 编辑器与
-//! 游戏共享同一快照源（S8.2b-3 既有口径）。
+//! 游戏共享同一快照源（S8.2b-3 既有口径）。S20 补充：UI 投影的
+//! `!playing` 护盾只护**编辑交互**与 cam 节点写入 —— UI 摆位投影
+//! （place_at_screen 全家）运行态照跑，换算走[`CamRig::active_view`]
+//! 活动视图单点（编辑态 = 编辑视图；运行态 = 场景相机实时读 ——
+//! UI 钉屏幕不随游戏相机飞）；编辑辅助件（网格/标尺刻度与数字/轨迹
+//! 点/选中框）运行态 visible=false 退场（Godot 语义）。
 //!
 //! S13 第 2 期（音频接入）：启动时声明一个演示声音资产（Audio/beep.wav
 //! —— 440Hz 蜂鸣，代码生成与 bmp 同口径）并随 bind 装载；PLAY 会话时
@@ -349,6 +354,17 @@
 //!    逐位同观感（64px 刻度 / 128px 数字）。数字标签 = 世界坐标值（含
 //!    负数）。网格 32px 世界间距在屏上密度超限（间距×zoom < 12px）时
 //!    ×2 递进（保持方形、世界原点对齐不变）。
+//! ⑥ **运行态视图与 UI 锚定**（实测"点 PLAY 后 UI 乱飞"根因修复）：
+//!    PLAY 三时机还原把渲染相机换成场景相机，而 UI 投影此前停用编辑视
+//!    图后仍按**编辑视图**换算摆位 ⇒ 菜单/标尺数字/面板标题/图标列全部
+//!    停在旧世界位、被场景相机渲染到错误屏位。修复 = [`CamRig::active_view`]
+//!    活动视图单点：编辑态 = 编辑视图；运行态 = 实时读场景 cam 节点
+//!   （world 平移作 center、zoom 属性作 zoom，与提取层 `camera_state_of`
+//!    同源同序）—— UI 摆位投影每帧照跑、永远按真正渲染的那台相机换算
+//!   （Godot 语义：编辑器 UI 钉屏幕不随游戏相机飞）。`!playing` 护盾
+//!    只剩两职：护**编辑交互**、护 **cam 节点写入**。编辑辅助件（网格
+//!    条带/标尺刻度与数字/轨迹点/选中框）运行态 visible=false 退场，
+//!    STOP/RESET 重应用编辑视图后投影自然复燃（无残留）。
 //!
 //! 运行：`cargo run --example editor_shell`
 
@@ -2131,9 +2147,10 @@ impl BandRects {
 /// - **Save**（Ctrl+S / Scene>Save）：[`CamRig::restore_scene`] → 写盘 →
 ///   [`CamRig::apply_editor`]（场景文件不受编辑视图污染）；
 /// - **PLAY**：[`CamRig::restore_scene`]（快照捕获在其后 ⇒ RESET 也回到
-///   场景相机；游戏运行态用场景定义的相机，投影 `!playing` 护盾停写）；
-/// - **STOP/RESET**：重应用编辑视图（投影护盾天然重应用；RESET 落账点
-///   再显式补一次免一帧闪烁）。
+///   场景相机；游戏运行态用场景定义的相机，`!playing` 护盾停写 cam 节点
+///   —— UI 投影则改按 [`CamRig::active_view`] 继续每帧摆放）；
+/// - **STOP/RESET**：重应用编辑视图（投影按活动视图单点自然回位；
+///   RESET 落账点再显式补一次免一帧闪烁）。
 struct CamRig {
     /// 场景相机节点（Camera2D）。
     node: nes_scene::NodeId,
@@ -2180,6 +2197,39 @@ impl CamRig {
                 tree.remove_prop(self.node, "zoom");
             }
         }
+    }
+
+    /// **活动视图单点**（S20 运行态 UI 锚定）：本帧 UI 投影（
+    /// [`place_at_screen`] 全家 + 网格/标尺/轨迹/选中框换算）统一按它把
+    /// 屏幕槽位换算成世界位 —— 返回 `(center, zoom)`。
+    ///
+    /// - 编辑态 = [`EditorCam`] 会话态（与交互换算同源，行为零变化）；
+    /// - 运行态 = **实时读场景 cam 节点**：PLAY 已还原 stash，游戏脚本
+    ///   此后可自由驱动相机 —— UI 投影跟着真正渲染的那台相机换算
+    ///   （Godot 语义：编辑器 UI 不随游戏相机"乱飞"，钉屏幕不动）。
+    ///
+    /// 运行态读法与提取层 `camera_state_of`（渲染侧相机权威）**同源同
+    /// 序**：center 取 `tree.world` 平移分量（世界缓存 —— 投影块帧首的
+    /// `refresh_transforms` 保证与当帧写入同帧）；zoom 取 `zoom` 属性
+    ///（缺省 1；非正/非有限回 1 —— 与契约层 `effective_zoom` 归一口径
+    /// 对齐的防御路径；schema 面上 set_prop 已把 zoom 钳在 [0.05,16]，
+    /// 钳后值原样跟随 —— 读的就是渲染读的那份）。**不做**编辑器域
+    /// clamp：游戏相机不受 [`ZOOM_MIN`]..[`ZOOM_MAX`] 约束，夹了反而与
+    /// 渲染矩阵错位。读数比渲染 extract 早一段（本帧脚本随后还可能再
+    /// 动相机）—— UI 与游戏相机一帧滞后，与既有 UI 命中一帧滞后同口径。
+    fn active_view(&self, tree: &nes_scene::SceneTree, playing: bool) -> ((f32, f32), f32) {
+        if !playing {
+            return (self.cam.center, self.cam.zoom);
+        }
+        let center = tree
+            .world_position(self.node)
+            .map(|p| (p.x, p.y))
+            .unwrap_or(self.cam.center);
+        let zoom = match tree.prop(self.node, "zoom") {
+            Some(Value::F32(z)) if z.is_finite() && *z > 0.0 => *z,
+            _ => 1.0,
+        };
+        (center, zoom)
     }
 }
 
@@ -3416,6 +3466,12 @@ fn main() {
     let mut demo_zoom_label = String::new();
     let mut demo_zoom_prop: Option<f32> = None;
     let mut demo_save_pos: Option<(f32, f32)> = None;
+    // S20 运行态 UI 锚定取证闩锁（滞容口径，见循环内注）：①PLAY 窗内
+    // 网格条带整池熄灭（gizmo 退场）；②PLAY 窗内选中框隐藏（同门）；
+    // ③STOP/RESET 后网格首条带复燃（编辑视图重应用 —— 恢复无残留）。
+    let mut demo_grid_dark_play = false;
+    let mut demo_selbox_hidden_play = false;
+    let mut demo_grid_back_after_stop = false;
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -3922,6 +3978,32 @@ fn main() {
                     Some(Value::F32(z)) if (*z - 1.3225).abs() < 0.01 => Some(*z),
                     _ => None,
                 };
+            }
+        }
+        // S20 运行态 UI 锚定取证闩锁（滞容口径 —— 读上一帧投影的数据面）：
+        // PLAY 窗（帧 112..169，注入流 112 F5 / 170 Shift+F5）内 gizmo
+        // 退场：①网格条带整池熄灭（编辑态网格首条带恒点亮 —— 可对照）；
+        // ②选中框 visible=false 同门。RESET（帧 180 沿）后编辑视图重应用
+        // —— 网格首条带复燃（恢复路径无残留）。
+        if demo && (120..=168).contains(&index) && !demo_grid_dark_play {
+            let tree = rt.tree_mut();
+            let lit = |n: nes_scene::NodeId| {
+                matches!(tree.prop(n, "visible"), Some(Value::Bool(true)))
+            };
+            if grid_bars.iter().all(|&b| !lit(b)) {
+                demo_grid_dark_play = true;
+            }
+        }
+        if demo && (120..=168).contains(&index) && !demo_selbox_hidden_play {
+            let tree = rt.tree_mut();
+            if !matches!(tree.prop(sel_box, "visible"), Some(Value::Bool(true))) {
+                demo_selbox_hidden_play = true;
+            }
+        }
+        if demo && index >= 184 && !demo_grid_back_after_stop {
+            let tree = rt.tree_mut();
+            if matches!(tree.prop(grid_bars[0], "visible"), Some(Value::Bool(true))) {
+                demo_grid_back_after_stop = true;
             }
         }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
@@ -4666,6 +4748,18 @@ fn main() {
             if !play.playing {
                 rig.apply_editor(tree);
             }
+            // S20 运行态 UI 锚定：本帧全部 UI 投影换算走**活动视图单点**
+            //（[`CamRig::active_view`]）—— 编辑态 = EditorCam 会话态（与
+            // 交互同源，行为零变化）；运行态 = 实时读场景 cam 节点（UI
+            // 钉屏幕不随游戏相机飞 —— 根因修复：此前投影停用编辑视图后
+            // 仍按编辑视图摆 UI，渲染却用场景相机 ⇒ 菜单/标尺数字/面板
+            // 标题/图标列全飞）。refresh_transforms 已在上方冲洗，world
+            // 缓存与当帧写入同帧。
+            let (av_center, av_zoom) = rig.active_view(tree, play.playing);
+            let view = EditorCam {
+                center: av_center,
+                zoom: av_zoom,
+            };
             // 视带几何（S20 帧首单点算出，输入段共用同一份）：可编辑区
             // = 两面板之间再让出顶/左各 16px 标尺。
             let BandRects {
@@ -4754,7 +4848,9 @@ fn main() {
                 let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
                     Value::Vec2(nes_scene::Vec2::new(zx_in, tool_y)));
             }
-            place_at_screen(tree, zoom_label, zx_lab + 6.0, tool_y + 3.0, &rig.cam, vc);
+            place_at_screen(tree, zoom_label, zx_lab + 6.0, tool_y + 3.0, &view, vc);
+            // 百分比文本 = **编辑器** zoom（会话态读数 —— 运行态编辑视图
+            // 冻结，文本不随游戏相机变；屏位仍走活动视图钉屏）。
             let _ = tree.set_prop(
                 zoom_label,
                 PROP_LABEL_TEXT,
@@ -4786,7 +4882,7 @@ fn main() {
                 Value::Vec2(nes_scene::Vec2::new(MARGIN, fs_y)));
             let _ = tree.set_prop(fs_bg, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, fs_h)));
-            place_at_screen(tree, fs_title, MARGIN + 2.0, fs_y + 1.0, &rig.cam, vc);
+            place_at_screen(tree, fs_title, MARGIN + 2.0, fs_y + 1.0, &view, vc);
             let _ = tree.set_prop(fs_tree, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(MARGIN, fs_y + FS_TITLE_H)));
             let _ = tree.set_prop(fs_tree, PROP_CONTROL_SIZE,
@@ -4794,7 +4890,7 @@ fn main() {
             // 左面板标题（S12-5 Godot 命名，S12-8 起装配期定位 —— S20 起
             // 纯 Label 走世界变换，改每帧屏幕位反向放置，相机非恒等后
             // 跟随窗口与视图）。
-            place_at_screen(tree, hud_scene, MARGIN + 2.0, 12.0 + MENU_H, &rig.cam, vc);
+            place_at_screen(tree, hud_scene, MARGIN + 2.0, 12.0 + MENU_H, &view, vc);
             // res:// 行文本投影（投影无状态口径）：缩进树形（每层两空
             // 格，目录尾斜杠）+ 选中行下标随 fs_sel（-1 = 无选中，与
             // 层级树 selected 行高亮同款）。空列表 = 空 rows（行数 0，
@@ -4822,7 +4918,7 @@ fn main() {
             // 状态栏贴底：y = ch-20。（S20：纯 Label 走世界变换 —— 屏幕位
             // 经 place_at_screen 反向放置 + 1/zoom 反缩放，zoom=1 时与旧
             // 直写逐位同值。以下全部 UI Label 同此口径，不再重复注。）
-            place_at_screen(tree, hud_st, MARGIN, viewport.1 - 20.0, &rig.cam, vc);
+            place_at_screen(tree, hud_st, MARGIN, viewport.1 - 20.0, &view, vc);
 
             // 视口网格布线（S12-5；S20 自适应 + 相机换算）：世界可视区
             // = 标尺内侧的可编辑区。世界间距 = grid_spacing_world(zoom)
@@ -4838,12 +4934,15 @@ fn main() {
             let mut spacing = GRID_SPACING;
             // GRID 开关（S12-7）：off = 全部条带走池尾熄灭分支（布局
             // 尺寸照算，只关显示 —— 投影无状态，每帧重写一遍口径）。
-            if vx1 > vx0 && vy1 > vy0 && tool_grid_on {
-                spacing = grid_spacing_world(rig.cam.zoom);
+            // S20 运行态同门：网格是**编辑器辅助件** —— playing 时整池
+            // 熄灭（Godot 语义：运行时编辑器辅助件退场，游戏世界独占
+            // 视口），STOP 后下一帧投影自然复燃。
+            if vx1 > vx0 && vy1 > vy0 && tool_grid_on && !play.playing {
+                spacing = grid_spacing_world(view.zoom);
                 // 世界可视窗（单点换算的逆向；-1.0 与旧口径一致 —— 防
                 // 边界线上恰好压在可视区右/下缘外一根）。
-                let (wx0, wy0) = rig.cam.screen_to_world(vx0, vy0, vc);
-                let (wx1e, wy1e) = rig.cam.screen_to_world(vx1 - 1.0, vy1 - 1.0, vc);
+                let (wx0, wy0) = view.screen_to_world(vx0, vy0, vc);
+                let (wx1e, wy1e) = view.screen_to_world(vx1 - 1.0, vy1 - 1.0, vc);
                 v0 = (wx0 / spacing).ceil() as i64;
                 let v1 = (wx1e / spacing).floor() as i64;
                 h0 = (wy0 / spacing).ceil() as i64;
@@ -4856,7 +4955,7 @@ fn main() {
                     // 竖条：x 钉在 spacing 的整数倍（世界），纵贯可视区
                     // 全高（1px 屏宽 —— Godot 网格线观感）。
                     let wx = (v0 + i as i64) as f32 * spacing;
-                    let x = vc.0 + (wx - rig.cam.center.0) * rig.cam.zoom;
+                    let x = vc.0 + (wx - view.center.0) * view.zoom;
                     let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET,
                         Value::Vec2(nes_scene::Vec2::new(x, vy0)));
                     let _ = tree.set_prop(bar, PROP_CONTROL_SIZE,
@@ -4866,7 +4965,7 @@ fn main() {
                     // 横条：y 钉在 spacing 的整数倍（世界），横贯可视区
                     // 全宽。
                     let wy = (h0 + (i - nv) as i64) as f32 * spacing;
-                    let y = vc.1 + (wy - rig.cam.center.1) * rig.cam.zoom;
+                    let y = vc.1 + (wy - view.center.1) * view.zoom;
                     let _ = tree.set_prop(bar, PROP_CONTROL_OFFSET,
                         Value::Vec2(nes_scene::Vec2::new(vx0, y)));
                     let _ = tree.set_prop(bar, PROP_CONTROL_SIZE,
@@ -4906,15 +5005,19 @@ fn main() {
             // 屏位经 world_to_screen 换算 —— 平移/缩放下刻度钉在世界值
             // 上不漂移（负区间天然覆盖 —— k 可为负，数字标签 = 世界坐
             // 标值含负数）。
-            let step = ruler_step_world(rig.cam.zoom);
+            let step = ruler_step_world(view.zoom);
             // 可视世界窗（单点换算逆向；-1.0 与旧口径一致 —— 边缘根不
             // 压线）。max/floor 侧 clamp 浮点误差（刻度 1px 侵入标尺条
             // 带即不可见，纯防御）。
             let mut used = 0usize;
-            let (wx0, wy0) = rig.cam.screen_to_world(vx0, vy0, vc);
-            let (wx1e, wy1e) = rig.cam.screen_to_world(vx1 - 1.0, vy1 - 1.0, vc);
+            let (wx0, wy0) = view.screen_to_world(vx0, vy0, vc);
+            let (wx1e, wy1e) = view.screen_to_world(vx1 - 1.0, vy1 - 1.0, vc);
+            // S20 运行态 gizmo 退场：刻度/数字与网格同门 —— playing 时
+            // 跳过点亮循环（used/lab_used 恒 0 ⇒ 全池走熄灭/置空分支，
+            // 投影无状态口径天然收口），STOP 后下一帧自然复燃。
+            let gizmo_on = !play.playing;
             // 顶横刻度：世界 x = k*step ∈ 可视世界窗。
-            if vx1 > vx0 {
+            if vx1 > vx0 && gizmo_on {
                 let k0 = (wx0 / step).ceil() as i64;
                 let k1 = (wx1e / step).floor() as i64;
                 for k in k0..=k1 {
@@ -4922,7 +5025,7 @@ fn main() {
                         break;
                     }
                     let wx = k as f32 * step;
-                    let x = (vc.0 + (wx - rig.cam.center.0) * rig.cam.zoom).max(vx0);
+                    let x = (vc.0 + (wx - view.center.0) * view.zoom).max(vx0);
                     let major = k % 2 == 0; // 主刻度 = 每 2 格（数字锚位）
                     let (ty, th) = if major { (ruler_y, RULER_W) } else { (ruler_y + half, half) };
                     let tick = ruler_ticks[used];
@@ -4936,7 +5039,7 @@ fn main() {
             }
             // 左竖刻度：世界 y = k*step ∈ 可视世界窗，池接在顶横之后。
             let h_used = used;
-            if vy1 > vy0 {
+            if vy1 > vy0 && gizmo_on {
                 let k0 = (wy0 / step).ceil() as i64;
                 let k1 = (wy1e / step).floor() as i64;
                 for k in k0..=k1 {
@@ -4944,7 +5047,7 @@ fn main() {
                         break;
                     }
                     let wy = k as f32 * step;
-                    let y = (vc.1 + (wy - rig.cam.center.1) * rig.cam.zoom).max(vy0);
+                    let y = (vc.1 + (wy - view.center.1) * view.zoom).max(vy0);
                     let major = k % 2 == 0;
                     let (tx, tw) = if major { (gx0, RULER_W) } else { (gx0 + half, half) };
                     let tick = ruler_ticks[used];
@@ -4966,7 +5069,7 @@ fn main() {
             //（本地缩放 1/zoom 相抵视图缩放 —— 屏上恒定 14px 字号）。
             // zoom=1 时换算是恒等式，位与文本同旧口径逐位同值。
             let mut lab_used = 0usize;
-            if vx1 > vx0 {
+            if vx1 > vx0 && gizmo_on {
                 let k0 = (wx0 / step).ceil() as i64;
                 let k1 = (wx1e / step).floor() as i64;
                 // 首个偶数 k（主刻度位；位运算对负 k 同样正确）。
@@ -4976,16 +5079,16 @@ fn main() {
                         break;
                     }
                     let val = k as f32 * step;
-                    let x = vc.0 + (val - rig.cam.center.0) * rig.cam.zoom;
+                    let x = vc.0 + (val - view.center.0) * view.zoom;
                     let lab = ruler_labels[lab_used];
-                    place_at_screen(tree, lab, x + 2.0, ruler_y, &rig.cam, vc);
+                    place_at_screen(tree, lab, x + 2.0, ruler_y, &view, vc);
                     let _ = tree.set_prop(lab, PROP_LABEL_TEXT,
                         Value::Str((val.round() as i64).to_string()));
                     lab_used += 1;
                     k += 2;
                 }
             }
-            if vy1 > vy0 {
+            if vy1 > vy0 && gizmo_on {
                 let k0 = (wy0 / step).ceil() as i64;
                 let k1 = (wy1e / step).floor() as i64;
                 let mut k = k0 + (k0 & 1);
@@ -4994,9 +5097,9 @@ fn main() {
                         break;
                     }
                     let val = k as f32 * step;
-                    let y = vc.1 + (val - rig.cam.center.1) * rig.cam.zoom;
+                    let y = vc.1 + (val - view.center.1) * view.zoom;
                     let lab = ruler_labels[lab_used];
-                    place_at_screen(tree, lab, gx0 + 1.0, y, &rig.cam, vc);
+                    place_at_screen(tree, lab, gx0 + 1.0, y, &view, vc);
                     let _ = tree.set_prop(lab, PROP_LABEL_TEXT,
                         Value::Str((val.round() as i64).to_string()));
                     lab_used += 1;
@@ -5020,7 +5123,7 @@ fn main() {
                 Value::Vec2(nes_scene::Vec2::new(MARGIN, dock_y)));
             let _ = tree.set_prop(dock_bg, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(viewport.0 - 2.0 * MARGIN, DOCK_H)));
-            place_at_screen(tree, dock_title, MARGIN + 2.0, dock_y + 1.0, &rig.cam, vc);
+            place_at_screen(tree, dock_title, MARGIN + 2.0, dock_y + 1.0, &view, vc);
             // S19.3：标题文本随活动页签（OUTPUT 视图时与既有 "Output"
             // 逐位同 —— 行为零变化；SIGNALS 激活时标题随之，投影无状态）。
             let _ = tree.set_prop(
@@ -5135,7 +5238,7 @@ fn main() {
                 Value::Vec2(nes_scene::Vec2::new(MARGIN, tl_y)));
             let _ = tree.set_prop(tl_bg, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(tl_w, TIMELINE_H)));
-            place_at_screen(tree, tl_title, MARGIN + 2.0, tl_y + 1.0, &rig.cam, vc);
+            place_at_screen(tree, tl_title, MARGIN + 2.0, tl_y + 1.0, &view, vc);
             let _ = tree.set_prop(hud_tl, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(MARGIN + 2.0, tl_y + TL_TITLE_H)));
             let _ = tree.set_prop(hud_tl, PROP_CONTROL_SIZE,
@@ -5186,20 +5289,27 @@ fn main() {
             //（干净默认 —— 选中节点无补间不画点）。每帧覆写无历史 ——
             // 编辑器会话可视化，traj 容器已在 walk skips（树投影无感）。
             let traj_primary = sel.primary(tree);
-            let traj_from_to = traj_primary
-                .and_then(|p| tree.uid_of(p))
-                .and_then(|suid| {
-                    tree.tweens().iter().find_map(|tw| {
-                        let tid = tw.target.to_id();
-                        if tree.uid_of(tid).as_ref() != Some(&suid) {
-                            return None; // 目标不是主选中（含死句柄 —— uid 已清）。
-                        }
-                        match &tw.channel {
-                            nes_scene::TweenChannel::Pos { from, to } => Some((*from, *to)),
-                            _ => None, // 非 Pos 通道不画（P0 只做位置轨迹）。
-                        }
+            // S20 运行态 gizmo 退场：轨迹点池与网格/标尺同门 —— playing
+            // 时按"无活动 Pos 补间"收口（全池熄灭分支），编辑器会话可视化
+            // 不叠在游戏画面上。
+            let traj_from_to = if play.playing {
+                None
+            } else {
+                traj_primary
+                    .and_then(|p| tree.uid_of(p))
+                    .and_then(|suid| {
+                        tree.tweens().iter().find_map(|tw| {
+                            let tid = tw.target.to_id();
+                            if tree.uid_of(tid).as_ref() != Some(&suid) {
+                                return None; // 目标不是主选中（含死句柄 —— uid 已清）。
+                            }
+                            match &tw.channel {
+                                nes_scene::TweenChannel::Pos { from, to } => Some((*from, *to)),
+                                _ => None, // 非 Pos 通道不画（P0 只做位置轨迹）。
+                            }
+                        })
                     })
-                });
+            };
             let traj_base = traj_primary
                 .and_then(|p| tree.parent(p))
                 .and_then(|pp| tree.world_position(pp))
@@ -5215,7 +5325,7 @@ fn main() {
                         let t = i as f32 / (TRAJ_POOL - 1) as f32;
                         let px = traj_base.x + from.x + (to.x - from.x) * t;
                         let py = traj_base.y + from.y + (to.y - from.y) * t;
-                        let (sx, sy) = rig.cam.world_to_screen(px, py, vc);
+                        let (sx, sy) = view.world_to_screen(px, py, vc);
                         let _ = tree.set_prop(dot, PROP_CONTROL_OFFSET,
                             Value::Vec2(nes_scene::Vec2::new(sx, sy)));
                         let _ = tree.set_prop(dot, "visible", Value::Bool(true));
@@ -5230,9 +5340,9 @@ fn main() {
             // 通道按钮 * 后缀 = 当前选中通道（工具栏 SEL/SNAP 同款口径）；
             // 缓动/模式按钮文本 = 当前档名（循环点按换档，落账段翻下标）。
             let tl_ctl_y = tl_y + TL_TITLE_H + TL_LIST_H + SPACE_S;
-            place_at_screen(tree, tl_new_label, MARGIN + TL_CTL_X, tl_ctl_y + 3.0, &rig.cam, vc);
-            place_at_screen(tree, tl_to_label, MARGIN + TL_CTL_X + 194.0, tl_ctl_y + 3.0, &rig.cam, vc);
-            place_at_screen(tree, tl_ms_label, MARGIN + TL_CTL_X + 306.0, tl_ctl_y + 3.0, &rig.cam, vc);
+            place_at_screen(tree, tl_new_label, MARGIN + TL_CTL_X, tl_ctl_y + 3.0, &view, vc);
+            place_at_screen(tree, tl_to_label, MARGIN + TL_CTL_X + 194.0, tl_ctl_y + 3.0, &view, vc);
+            place_at_screen(tree, tl_ms_label, MARGIN + TL_CTL_X + 306.0, tl_ctl_y + 3.0, &view, vc);
             const TL_BTN_LAYOUT_IDX: [usize; 6] = [0, 1, 2, 6, 7, 8];
             let ch = |i: usize, name: &str| {
                 if tl_channel == i {
@@ -5287,7 +5397,7 @@ fn main() {
             for (i, &l) in menu_labels.iter().enumerate() {
                 // S20：顶层项 Label 走世界变换 —— 屏幕位反向放置（装配期
                 // 定位退役 —— 相机非恒等后每个 Label 都要每帧跟随）。
-                place_at_screen(tree, l, MENU_ITEM_X[i], 3.0, &rig.cam, vc);
+                place_at_screen(tree, l, MENU_ITEM_X[i], 3.0, &view, vc);
                 let _ = tree.set_prop(l, "color_slot", Value::Str(if open_menu == Some(i) {
                     SLOT_ACCENT_NAME
                 } else {
@@ -5328,7 +5438,7 @@ fn main() {
                         }));
                     let _ = tree.set_prop(plate, "visible", Value::Bool(true));
                     let lab = menu_item_labels[i];
-                    place_at_screen(tree, lab, px + 8.0, ry + 2.0, &rig.cam, vc);
+                    place_at_screen(tree, lab, px + 8.0, ry + 2.0, &view, vc);
                     let _ = tree.set_prop(lab, PROP_LABEL_TEXT, Value::Str(text.clone()));
                     let _ = tree.set_prop(lab, "visible", Value::Bool(true));
                     menu_item_rows.push((px + 2.0, ry, m, i));
@@ -5466,7 +5576,7 @@ fn main() {
                         // S20：图标是 Sprite2D（走世界变换、吃视图矩阵）——
                         // 屏幕位反向放置 + 本地缩放 1/zoom（屏上恒定 16px
                         // 方格；zoom=1 时位与旧直写逐位同值）。
-                        place_at_screen(tree, ic, MARGIN + ICON_COL_INSET, icon_y, &rig.cam, vc);
+                        place_at_screen(tree, ic, MARGIN + ICON_COL_INSET, icon_y, &view, vc);
                         let _ = tree.set_prop(ic, "frame", Value::I64(f));
                         let _ = tree.set_prop(ic, "visible", Value::Bool(true));
                     }
@@ -5508,7 +5618,7 @@ fn main() {
                     // "-" 展开 / "+" 折叠（S19.2 蓝图口径），text_dim 色
                     //（装配期定槽，此处只翻文本）。
                     title_rows.push((ins_x, 12.0 + MENU_H + INS_ROW_H, 0));
-                    place_at_screen(tree, ins_tf_title, ins_x, 12.0 + MENU_H + INS_ROW_H, &rig.cam, vc);
+                    place_at_screen(tree, ins_tf_title, ins_x, 12.0 + MENU_H + INS_ROW_H, &view, vc);
                     let _ = tree.set_prop(ins_tf_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT,
                         Value::Str(if tf_open { "Transform -" } else { "Transform +" }.into()));
@@ -5532,7 +5642,7 @@ fn main() {
                     let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
                     // 标题/信息 Label 每帧投影到右面板顶（x = cw-190，
                     // 随面板走 —— S12-6 修"标题被表面边缘裁剪"口径）。
-                    place_at_screen(tree, hud_ins, ins_x, 12.0 + MENU_H, &rig.cam, vc);
+                    place_at_screen(tree, hud_ins, ins_x, 12.0 + MENU_H, &view, vc);
 
                     // 改名输入框 = Transform 组成员：折叠即隐藏；展开时
                     // 槽位紧跟组行（行高 INS_ROW_H —— 不再是装配期写死的
@@ -5560,7 +5670,7 @@ fn main() {
                     // 型 = (n/a)。正文行数进布局游标（折叠 = 0 行）。
                     let ap_y = input_y + 20.0 + 4.0;
                     title_rows.push((ins_x, ap_y, 1));
-                    place_at_screen(tree, ins_ap_title, ins_x, ap_y, &rig.cam, vc);
+                    place_at_screen(tree, ins_ap_title, ins_x, ap_y, &view, vc);
                     let _ = tree.set_prop(ins_ap_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_ap_title, PROP_LABEL_TEXT,
                         Value::Str(if ap_open { "Appearance -" } else { "Appearance +" }.into()));
@@ -5570,7 +5680,7 @@ fn main() {
                         Vec::new()
                     };
                     if ap_open {
-                        place_at_screen(tree, ins_appearance, ins_x, ap_y + INS_ROW_H, &rig.cam, vc);
+                        place_at_screen(tree, ins_appearance, ins_x, ap_y + INS_ROW_H, &view, vc);
                         let _ = tree.set_prop(ins_appearance, "visible", Value::Bool(true));
                         let _ = tree.set_prop(ins_appearance, PROP_LABEL_TEXT,
                             Value::Str(ap_lines.join("\n")));
@@ -5586,7 +5696,7 @@ fn main() {
                     // 预算内（S12-6 口径），候选文件名超宽截断。
                     let sc_y = ap_y + INS_ROW_H + ap_lines.len() as f32 * INS_ROW_H;
                     title_rows.push((ins_x, sc_y, 2));
-                    place_at_screen(tree, ins_sc_title, ins_x, sc_y, &rig.cam, vc);
+                    place_at_screen(tree, ins_sc_title, ins_x, sc_y, &view, vc);
                     let _ = tree.set_prop(ins_sc_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_sc_title, PROP_LABEL_TEXT,
                         Value::Str(if sc_open { "Script -" } else { "Script +" }.into()));
@@ -5609,7 +5719,7 @@ fn main() {
                             "enabled: {}",
                             if !mounted { "-" } else if enabled { "Y" } else { "N" },
                         ));
-                        place_at_screen(tree, ins_script, ins_x, sc_y + INS_ROW_H, &rig.cam, vc);
+                        place_at_screen(tree, ins_script, ins_x, sc_y + INS_ROW_H, &view, vc);
                         let _ = tree.set_prop(ins_script, "visible", Value::Bool(true));                        let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT,
                             Value::Str(body.join("\n")));
                     } else {
@@ -5619,7 +5729,7 @@ fn main() {
                 None => {
                     ins_text.push_str("\n(none)");
                     let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
-                    place_at_screen(tree, hud_ins, ins_x, 12.0 + MENU_H, &rig.cam, vc);
+                    place_at_screen(tree, hud_ins, ins_x, 12.0 + MENU_H, &view, vc);
                     // 无选中：分区/输入框全部隐藏（Godot 空面板直感）。
                     for n in [ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script] {
                         let _ = tree.set_prop(n, "visible", Value::Bool(false));
@@ -5680,18 +5790,23 @@ fn main() {
             match sel.primary(tree) {
                 Some(p) => {
                     let w = tree.world(p).unwrap_or_default();
-                    let (sx, sy) = rig.cam.world_to_screen(w.tx, w.ty, vc);
-                    let pad = 2.0 * rig.cam.zoom;
+                    let (sx, sy) = view.world_to_screen(w.tx, w.ty, vc);
+                    let pad = 2.0 * view.zoom;
                     let _ = tree.set_prop(sel_box, PROP_CONTROL_OFFSET,
                         Value::Vec2(nes_scene::Vec2::new(sx - pad, sy - pad)));
                     let _ = tree.set_prop(sel_box, PROP_CONTROL_SIZE,
-                        Value::Vec2(nes_scene::Vec2::new(20.0 * rig.cam.zoom, 20.0 * rig.cam.zoom)));
+                        Value::Vec2(nes_scene::Vec2::new(20.0 * view.zoom, 20.0 * view.zoom)));
                 }
                 None => {
                     let _ = tree.set_prop(sel_box, PROP_CONTROL_OFFSET,
                         Value::Vec2(nes_scene::Vec2::new(-100.0, -100.0)));
                 }
             }
+            // S20 运行态 gizmo 退场收尾（选中框）：与网格/标尺/轨迹同门
+            // —— playing 时 visible=false（选中高亮框不叠在游戏画面上；
+            // 精灵 z=5 高亮是引擎机制不在此列），STOP 后下一帧复燃。
+            // 投影尾段统一显隐（照 icons 池先例 —— 投影无状态，每帧重写）。
+            let _ = tree.set_prop(sel_box, "visible", Value::Bool(!play.playing));
 
             // 重命名输入框投影：有选中 → 可见且 text 绑定选中节点名。
             // 换绑**不再等失焦**（S12-4 ②③ —— 旧口径"编辑会话中不换
@@ -6425,6 +6540,22 @@ fn main() {
                 "保存后编辑视图未重应用（cam.zoom 应 = 编辑 zoom）：{zoom_prop:?}"
             );
         }
+        // S20 运行态 UI 锚定取证：PLAY 窗内 gizmo 退场（网格整池熄灭 +
+        // 选中框隐藏 —— Godot 语义：运行时编辑器辅助件不叠在游戏画面
+        // 上）；STOP/RESET 重应用编辑视图后网格首条带复燃（恢复路径无
+        // 残留 —— UI 投影按活动视图单点自然回位）。
+        assert!(
+            demo_grid_dark_play,
+            "PLAY 窗内网格未整池熄灭（gizmo 退场失效）：{lines:?}"
+        );
+        assert!(
+            demo_selbox_hidden_play,
+            "PLAY 窗内选中框未隐藏（gizmo 退场失效）"
+        );
+        assert!(
+            demo_grid_back_after_stop,
+            "STOP/RESET 后网格未复燃（恢复路径残留）"
+        );
         let saved_path = assets.join(SCENE_SAVE_REL);
         assert!(
             saved_path.is_file(),
@@ -6433,7 +6564,7 @@ fn main() {
         );
         let saved_text = std::fs::read_to_string(&saved_path).expect("读保存场景");
         assert!(saved_text.contains("cam"), "保存场景缺 cam 节点");
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.5 轨迹三态/S19.6 真图标集/S20 滚轮缩放朝光标+中键平移+受保护保存冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.5 轨迹三态/S19.6 真图标集/S20 滚轮缩放朝光标+中键平移+受保护保存+运行态 UI 锚定（gizmo 退场/复燃）冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
     let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
@@ -6635,5 +6766,122 @@ mod s20_viewport_tests {
         assert!(!b.in_editable(400.0, 396.0), "底部 dock 不在可编辑区");
         assert!(!b.in_editable(400.0, 292.0), "时间轴 dock 不在可编辑区");
         assert!(!b.in_editable(240.0, 70.0), "工具带/标尺带不在可编辑区");
+    }
+
+    /// 活动视图单点（S20 运行态 UI 锚定的语义核心）：编辑态 =
+    /// EditorCam 会话态（交互换算同源，行为零变化）；运行态 = 实时读
+    /// 场景 cam 节点（world 平移作 center、zoom 属性作 zoom —— 与提取
+    /// 层 `camera_state_of` 同源读面）—— PLAY 还原 stash 后
+    /// active_view 跟随场景值（非编辑视图），游戏脚本动相机当帧跟随，
+    /// 污染 zoom 与契约层 `effective_zoom` 同口径归一，STOP 重应用编辑
+    /// 视图后回位（恢复路径无残留）。
+    #[test]
+    fn active_view_follows_scene_camera_when_playing() {
+        let mut tree = nes_scene::SceneTree::new("root");
+        let cam = tree.add_node(tree.root(), "cam", NodeKind::Camera2D);
+        // 场景定义相机：非缺省位 (500,-80) + zoom 1.5 —— 与编辑视图可判
+        // 然区分。
+        tree.set_local(cam, Transform2D::from_pos(500.0, -80.0));
+        tree.set_prop(cam, "zoom", Value::F32(1.5));
+        tree.apply_pending();
+        let edit = EditorCam {
+            center: (123.5, 45.0),
+            zoom: 2.0,
+        };
+        let rig = CamRig::capture(&tree, cam, edit);
+        // 编辑态：active_view == EditorCam 会话态。
+        assert_eq!(rig.active_view(&tree, false), ((123.5, 45.0), 2.0));
+        // PLAY 时机：还原场景相机（stash 写回）→ 运行态 active_view ==
+        // 场景 cam（stash 还原值）—— 旧缺陷路径（按编辑视图摆 UI）由此
+        // 断绝。
+        rig.restore_scene(&mut tree);
+        tree.refresh_transforms();
+        assert_eq!(rig.active_view(&tree, true), ((500.0, -80.0), 1.5));
+        // 游戏脚本动相机（运行态写 local/zoom 属性）→ active_view 当帧
+        // 跟随（refresh_transforms 后 world 缓存与写入同帧 —— UI 投影
+        // 帧首先冲洗，与真实帧序同源）。
+        tree.set_local(cam, Transform2D::from_pos(-10.0, 20.0));
+        tree.set_prop(cam, "zoom", Value::F32(0.5));
+        tree.refresh_transforms();
+        assert_eq!(rig.active_view(&tree, true), ((-10.0, 20.0), 0.5));
+        // 污染值面（与数据面同源核对）：schema 把 zoom 夹在
+        // [0.05,16]（set_prop 校验钳制）—— active_view 读到的与提取层
+        // `camera_state_of` 读到的是**同一份**钳后值，UI 换算与渲染矩阵
+        // 恒一致；合法越编辑域上界（ZOOM_MAX=8）的游戏 zoom（如 16）不
+        // 被编辑器域夹紧 —— active_view 原样跟随。
+        tree.set_prop(cam, "zoom", Value::F32(-3.0));
+        tree.refresh_transforms();
+        assert_eq!(rig.active_view(&tree, true).1, 0.05, "schema 下界钳制值原样跟随");
+        tree.set_prop(cam, "zoom", Value::F32(20.0));
+        tree.refresh_transforms();
+        assert_eq!(rig.active_view(&tree, true).1, 16.0, "schema 上界钳制值原样跟随");
+        // 裸通道（set_prop_raw 绕过 schema）写入非有限值 —— 防御路径归一
+        //（与契约层 effective_zoom 非正→1 同口径；schema 面上不可达）。
+        tree.set_prop_raw(cam, "zoom", Value::F32(f32::NAN));
+        tree.refresh_transforms();
+        assert_eq!(rig.active_view(&tree, true).1, 1.0);
+        // STOP：重应用编辑视图 → active_view 回编辑视图。
+        rig.apply_editor(&mut tree);
+        tree.refresh_transforms();
+        assert_eq!(rig.active_view(&tree, false), ((123.5, 45.0), 2.0));
+    }
+
+    /// UI 摆位投影量化证据（乱飞修复）：编辑视图 zoom=2 平移后 PLAY
+    /// —— 菜单 Label 的 world 位必须 == 屏幕槽位经**活动视图**（场景
+    /// cam，恒等映射）的换算值（place_at_screen 单点公式），而非编辑视
+    /// 图换算值（旧缺陷路径）。headless 用 cam 节点读面（tree.world /
+    /// zoom 属性）取活动视图，与帧循环同一条函数链。
+    #[test]
+    fn ui_label_lands_on_active_view_slot_when_playing() {
+        let mut tree = nes_scene::SceneTree::new("root");
+        let cam = tree.add_node(tree.root(), "cam", NodeKind::Camera2D);
+        // 场景定义相机 = 恒等映射（pos = 客户区中心、zoom 1）。
+        tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
+        tree.apply_pending();
+        let vc = (384.0f32, 216.0f32);
+        // 编辑视图：zoom=2 + 平移（非恒等 —— 旧缺陷按它摆 UI，PLAY 后
+        // 渲染用场景相机 ⇒ 全飞）。
+        let edit = EditorCam {
+            center: (300.0, 250.0),
+            zoom: 2.0,
+        };
+        let rig = CamRig::capture(&tree, cam, edit);
+        rig.restore_scene(&mut tree); // PLAY 时机（stash 写回）。
+        tree.refresh_transforms();
+        let (ac, az) = rig.active_view(&tree, true);
+        let view = EditorCam {
+            center: ac,
+            zoom: az,
+        };
+        // 菜单栏 Scene 项屏幕槽位（MENU_ITEM_X[0], y=3 —— 与帧循环同源
+        // 常量）；标签节点照 place_at_screen 摆放。
+        let (sx, sy) = (MENU_ITEM_X[0], 3.0f32);
+        let label = tree.add_node(tree.root(), "menu_scene", NodeKind::Label);
+        tree.apply_pending();
+        place_at_screen(&mut tree, label, sx, sy, &view, vc);
+        let (wx, wy) = {
+            let p = tree.local(label).unwrap_or_default().pos;
+            (p.x, p.y)
+        };
+        // 活动视图换算：场景 cam 恒等映射下 world == 屏幕槽位本身
+        //（渲染侧视图矩阵再把 world 投回同一屏位 —— 钉屏闭合）。
+        assert!(
+            (wx - sx).abs() < 1e-4 && (wy - sy).abs() < 1e-4,
+            "label world should equal screen slot under play view: ({wx},{wy})"
+        );
+        // 反证（断言非空转）：按编辑视图（旧缺陷路径）换算会落在别处
+        // —— 两换算值与槽位可判然不同。
+        let (bx, by) = edit.screen_to_world(sx, sy, vc);
+        assert!(
+            (bx - wx).abs() > 1.0 || (by - wy).abs() > 1.0,
+            "edit-view placement must differ from active-view one (vacuous guard)"
+        );
+        // 渲染闭合核对：活动视图 world_to_screen 把 label world 位投回
+        // 屏幕槽位（提取层 camera_state_of 同源读面 —— world + zoom 属性）。
+        let (rx, ry) = view.world_to_screen(wx, wy, vc);
+        assert!(
+            (rx - sx).abs() < 1e-3 && (ry - sy).abs() < 1e-3,
+            "world -> screen roundtrip must land on slot: ({rx},{ry})"
+        );
     }
 }
