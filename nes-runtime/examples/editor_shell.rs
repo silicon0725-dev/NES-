@@ -243,6 +243,29 @@
 //! **行为零变化**：OUTPUT 页签内容/断言照旧；SIGNALS 纯只读观测
 //!（无写入路径、无日志灌水 —— 页签切换不落 Output 行）。
 //!
+//! S19.4（**Scene 树类型标记**，蓝图 §3.3 + Q2 口径）：层级树行加类型
+//! 前缀（等宽字体的极简图标观，`* ` 选中标记同款形态 —— 前缀段固定
+//! 3 字符 + 空格）：`[S] ` Sprite2D / `[C] ` Camera2D / `[T] ` Label /
+//! `[B] ` Button / `[X] ` TextInput / `[J] ` Script / `[H] ` Theme；
+//! 容器类（Node/Node2D/Control/ScrollView/ListView/Tabs）无前缀 =
+//! Q2 "无前缀 = 容器" 口径。行格式 `{indent}{* 或 空格}{prefix}{name}`
+//! —— 只在前缀段插入，缩进/选中标记/行→uid 映射三逻辑不动。真位图
+//! 图标归 icon 集里程碑（蓝图 §3.3 原文）。
+//!
+//! S19.5（**补间轨迹预览**，蓝图 §4.5）：主选中节点的活动 **Pos 通道**
+//! 补间 → 视口内画轨迹点。点池 = 12 枚 2x2px Control（accent 槽填充、
+//! visible=false 备用，照网格条带池纪律），挂 "traj" 容器 —— walk skips
+//! 整子树不进层级树（观感节点同 grid/ruler/dock 纪律）；精灵命中只滤
+//! Sprite2D、traj 点不进 over_ui 护盾（照 grid 先例 —— 注记不拦编辑
+//! 点击）。每帧投影：沿 from→to 线段等距铺 12 点（含两端）；无活动
+//! Pos 补间 = 池整体熄灭（干净默认）；多补间只画登记序第一条（P0）。
+//! 语义边界：轨迹是**编辑器会话可视化** —— Control 池不进树逻辑语义
+//!、不进场景保存（编辑器 P0 无保存路径）、位置每帧覆写无历史；z=6
+//! 垫在精灵（0）与选中高亮（5）之上、菜单弹层（90）/框选（100）之下。
+//! 同轮查证（S19.5 遗留收口）：九宫格面板实时预览由既有链路天然达成
+//!（ns_* 属性每帧投影 → 提取层每帧 `nine_slice_of` 读 → SetNineSlice
+//! 每帧推 —— 全量快照口径，改属性即下一帧反映），零新代码。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -624,6 +647,43 @@ fn tl_row_text(r: &nes_scene::TweenRow) -> String {
         r.elapsed_ms as i64,
         r.duration_ms as i64,
     )
+}
+
+// ---- S19.5 补间轨迹预览（蓝图 §4.5）----
+//
+// 点池常量与类型前缀单点出（照 GRID_POOL/TL_BARS 纪律：控件数恒定
+// 有界，提取/渲染成本有界）。
+
+/// 轨迹点池上限：from→to 线段等距铺点数（**含两端** —— 12 点 = 11 段，
+/// t = i/11）。2x2px Control，accent 槽填充，visible=false 备用（每帧
+/// 投影布线，照网格条带池纪律）。
+const TRAJ_POOL: usize = 12;
+/// 轨迹点 z_index（set_prop_raw 前向通道 —— Control 继承链无 z schema
+/// 键，提取层 z_of 直读属性表）。查证后的取值：精灵缺省 0、选中高亮 5
+/// **之上**（轨迹注记盖过精灵可见），菜单弹层 90 / 框选 100 **之下**
+///（永不盖编辑器顶层覆盖件）。底部 dock 系面板（-80..-60）按既有
+/// "场景对象盖过观感" 纪律本就低于精灵层，与轨迹点无交叠争议。
+const TRAJ_Z: i64 = 6;
+
+/// S19.4 类型前缀（蓝图 §3.3 + Q2 字符集）：行文本前缀段，等宽字体
+/// 极简图标观、`* ` 选中标记同款形态（3 字符 + 空格）。容器类无前缀
+/// = Q2 口径；Theme 在壳层 skips 里（皮肤节点不进列表）但映射照给
+/// —— 用户场景里的 Theme 节点经 walk 照实标记。真位图图标归 icon
+/// 集里程碑。
+fn kind_prefix(tag: Option<nes_scene::NodeKindTag>) -> &'static str {
+    use nes_scene::NodeKindTag as T;
+    match tag {
+        Some(T::Sprite2D) => "[S] ",
+        Some(T::Camera2D) => "[C] ",
+        Some(T::Label) => "[T] ",
+        Some(T::Button) => "[B] ",
+        Some(T::TextInput) => "[X] ",
+        Some(T::Script) => "[J] ",
+        Some(T::Theme) => "[H] ",
+        // Node/Node2D/Control/ScrollView/ListView/Tabs = 容器无前缀
+        //（含 kind_tag 取不到的死节点 —— 理论不可达，walk 只访存活）。
+        _ => "",
+    }
 }
 
 // ---- S19.1 顶部菜单栏（蓝图 §4.1）----
@@ -1677,7 +1737,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -2213,6 +2273,26 @@ fn main() {
         tree.set_prop_raw(sel_box, "border_w", Value::F32(2.0));
         tree.set_prop_raw(sel_box, "z_index", Value::I64(100));
 
+        // 补间轨迹点池（S19.5）：主选中节点的活动 Pos 补间 from→to 线段
+        // 等距铺 12 点（含两端，见循环内轨迹段）。挂在 "traj" 容器下：
+        // 层级树 walk 整子树跳过（编辑器会话可视化不是场景对象，同
+        // grid/ruler/dock 纪律）；精灵命中只滤 Sprite2D、traj 点不进
+        // over_ui 护盾（照 grid 先例 —— 注记不拦编辑点击）。z_index=6
+        //（TRAJ_Z 注：精灵/选中高亮之上、菜单弹层与框选之下）。2x2px
+        // accent 点，visible=false 备用（每帧投影覆写，无历史）。
+        let traj = tree.add_node(root, "traj", NodeKind::Node);
+        let mut traj_dots = Vec::with_capacity(TRAJ_POOL);
+        for _ in 0..TRAJ_POOL {
+            let dot = tree.add_node(traj, "traj_dot", NodeKind::Control);
+            let _ = tree.set_prop(dot, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(dot, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(dot, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(2.0, 2.0)));
+            let _ = tree.set_prop(dot, "fill_slot", Value::Str(SLOT_ACCENT_NAME.into()));
+            let _ = tree.set_prop(dot, "visible", Value::Bool(false));
+            tree.set_prop_raw(dot, "z_index", Value::I64(TRAJ_Z));
+            traj_dots.push(dot);
+        }
+
         // 左面板标题（S12-5 Godot 命名）：与右侧 Inspector 标题同款 Label。
         // 左面板 x 恒定（MARGIN）；y = 12 + MENU_H（S19.1：菜单栏置顶后
         // 标题随面板整体下移一行 —— 恒定位置，装配期一次写定即可）。
@@ -2271,7 +2351,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -2580,6 +2660,15 @@ fn main() {
     // 标记（OUTPUT* —— 页签切换链路双向各走一次的凭证）。
     let mut demo_signals_rows = String::new();
     let mut demo_tab_back_text = String::new();
+    // S19.4/S19.5 轨迹取证闩锁（与时间轴闩锁同款滞容口径）：①APPLY 前
+    // 窗（240..=280 —— obj1 恒主选中、无补间）闩"轨迹全灭"（干净默认）；
+    // ②活动窗（帧 ≥284、登记表出现 Pos 补间时）闩"轨迹点亮且端点对位"
+    //（dot0=from=登记处 obj1 实际位 (280,130)、dot11=to=(2,4) —— 演示流
+    // 未挪 obj1，from 即装配位）；③到站后（demo_tl_seen_done 闩住后）
+    // 闩"轨迹复灭"。三态各一次，帧率无关。
+    let mut demo_traj_dark_before = false;
+    let mut demo_traj_seen_on = false;
+    let mut demo_traj_seen_off = false;
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -2849,6 +2938,55 @@ fn main() {
                     _ => None,
                 })
                 .unwrap_or_default();
+        }
+        // S19.5 轨迹闩锁（窗口口径见上方声明注；读树节点 visible/offset
+        // —— traj 池是真实树节点，位置/可见性与精灵同数据面，可断言）。
+        // 注意读面是上一帧投影（闩锁段先于帧尾投影块执行）—— 滞容口径
+        // 吸收这一帧滞后（活动窗持续 ~30 帧，单帧滞后无碍）。
+        if demo && (240..=280).contains(&index) && !demo_traj_dark_before {
+            let tree = rt.tree_mut();
+            if traj_dots.iter().all(
+                |&d| matches!(tree.prop(d, "visible"), None | Some(Value::Bool(false))),
+            ) {
+                demo_traj_dark_before = true;
+            }
+        }
+        if demo && index >= 284 && !demo_traj_seen_on {
+            let tree = rt.tree_mut();
+            let active = tree
+                .tweens()
+                .iter()
+                .any(|tw| matches!(tw.channel, nes_scene::TweenChannel::Pos { .. }));
+            if active {
+                let off = |d: nes_scene::NodeId| -> (f32, f32) {
+                    match tree.prop(d, PROP_CONTROL_OFFSET) {
+                        Some(Value::Vec2(v)) => (v.x, v.y),
+                        _ => (f32::NAN, f32::NAN),
+                    }
+                };
+                let vis =
+                    |d: nes_scene::NodeId| matches!(tree.prop(d, "visible"), Some(Value::Bool(true)));
+                let (x0, y0) = off(traj_dots[0]);
+                let (x1, y1) = off(traj_dots[TRAJ_POOL - 1]);
+                // 端点对位断言（0.5px 容差 = 投影浮点分量直写，无取整）。
+                if vis(traj_dots[0])
+                    && vis(traj_dots[TRAJ_POOL - 1])
+                    && (x0 - 280.0).abs() < 0.5
+                    && (y0 - 130.0).abs() < 0.5
+                    && (x1 - 2.0).abs() < 0.5
+                    && (y1 - 4.0).abs() < 0.5
+                {
+                    demo_traj_seen_on = true;
+                }
+            }
+        }
+        if demo && demo_tl_seen_done && !demo_traj_seen_off {
+            let tree = rt.tree_mut();
+            if traj_dots.iter().all(
+                |&d| matches!(tree.prop(d, "visible"), None | Some(Value::Bool(false))),
+            ) {
+                demo_traj_seen_off = true;
+            }
         }
         // S19.1 菜单取证（滞容闩锁，见上方声明注）：Debug/Help 开合窗
         // （~303..~327 与 ~335..~349 两段）内弹层可见即闩"曾可见"；
@@ -4037,6 +4175,49 @@ fn main() {
                     let _ = tree.set_prop(bar, "visible", Value::Bool(false));
                 }
             }
+            // 补间轨迹投影（S19.5）：主选中节点的活动 **Pos 通道** 补间
+            //（`tweens()` 登记序过滤 target uid + 通道 —— 多条只画第一条，
+            // P0 口径）→ from→to 线段等距铺 12 点（含两端）。点位 =
+            // 补间登记的 from/to（目标本地坐标）+ 父世界平移（traj 容器
+            // 挂 root，根坐标系下对位）。无活动 Pos 补间 = 池整体熄灭
+            //（干净默认 —— 选中节点无补间不画点）。每帧覆写无历史 ——
+            // 编辑器会话可视化，traj 容器已在 walk skips（树投影无感）。
+            let traj_primary = sel.primary(tree);
+            let traj_from_to = traj_primary
+                .and_then(|p| tree.uid_of(p))
+                .and_then(|suid| {
+                    tree.tweens().iter().find_map(|tw| {
+                        let tid = tw.target.to_id();
+                        if tree.uid_of(tid).as_ref() != Some(&suid) {
+                            return None; // 目标不是主选中（含死句柄 —— uid 已清）。
+                        }
+                        match &tw.channel {
+                            nes_scene::TweenChannel::Pos { from, to } => Some((*from, *to)),
+                            _ => None, // 非 Pos 通道不画（P0 只做位置轨迹）。
+                        }
+                    })
+                });
+            let traj_base = traj_primary
+                .and_then(|p| tree.parent(p))
+                .and_then(|pp| tree.world_position(pp))
+                .unwrap_or(nes_scene::Vec2::ZERO);
+            for (i, &dot) in traj_dots.iter().enumerate() {
+                match traj_from_to {
+                    Some((from, to)) => {
+                        // t = i/11：两端全含的等距取样（Vec2 无算子重载，
+                        // 分量手写插值 —— nes-scene 数学面零改动）。
+                        let t = i as f32 / (TRAJ_POOL - 1) as f32;
+                        let px = traj_base.x + from.x + (to.x - from.x) * t;
+                        let py = traj_base.y + from.y + (to.y - from.y) * t;
+                        let _ = tree.set_prop(dot, PROP_CONTROL_OFFSET,
+                            Value::Vec2(nes_scene::Vec2::new(px, py)));
+                        let _ = tree.set_prop(dot, "visible", Value::Bool(true));
+                    }
+                    None => {
+                        let _ = tree.set_prop(dot, "visible", Value::Bool(false));
+                    }
+                }
+            }
             // 创建控制行：说明标签 + 六按钮（九宫格底板随行布线）+ 三输
             // 入框。行 y 每帧重写；x 来自 TL_CTL_LAYOUT 单点表（恒定）。
             // 通道按钮 * 后缀 = 当前选中通道（工具栏 SEL/SNAP 同款口径）；
@@ -4162,16 +4343,20 @@ fn main() {
             }
 
             // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
-            // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
-            // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与
-            // 行点击回调都按这份映射结算 —— 投影与交互同源。存活节点
-            // 必有 uid（add_node 即发、walk 只访问存活节点），行与映射
-            // 严格同长同序；无"悬垂行"可言（删除即整行消失）。
+            // 标记 * + S19.4 类型前缀，缩进用 ASCII 空格 —— 行文本经默认
+            // 字体等宽渲染）。行→节点映射平行重建（walk 顺序即行序）：
+            // 主选中行下标与行点击回调都按这份映射结算 —— 投影与交互同
+            // 源。存活节点必有 uid（add_node 即发、walk 只访问存活节点），
+            // 行与映射严格同长同序；无"悬垂行"可言（删除即整行消失）。
             // S12-5：walk 跳过 "grid" 容器整棵子树；S12-6 沿用同一过滤
             // 先例加 "ruler"/"dock" —— 网格/标尺/Output dock 都是观感
             // 节点不是可编辑对象，不进行列表；过滤在 walk 单点做，行
             // 文本与行→uid 映射天然同源（同一次遍历产出，映射不会被
             // 观感节点污染）。
+            // S19.4：行格式扩成 `{indent}{* 或 空格}{prefix}{name}` ——
+            // 类型前缀（kind_prefix 单点映射，Q2 字符集）只插在前缀段，
+            // 缩进/选中标记/行→uid 映射三逻辑逐位不动（行点击按映射查
+            // uid，行文本只是视图）。
             let mut lines: Vec<String> = Vec::new();
             let mut row_map: Vec<Uid> = Vec::new();
             let sel_uids: Vec<Uid> = sel.uids().to_vec();
@@ -4185,13 +4370,20 @@ fn main() {
                 skips: &[nes_scene::NodeId],
             ) {
                 if skips.contains(&id) {
-                    return; // 观感容器（网格/标尺/dock）：整子树不进层级树。
+                    return; // 观感容器（网格/标尺/dock/轨迹）：整子树不进层级树。
                 }
                 let name = tree.name(id).unwrap_or("?");
                 let uid = tree.uid_of(id);
                 let mark = uid.as_ref().map(|u| sel.contains(u)).unwrap_or(false);
                 let indent = "  ".repeat(depth);
-                out.push(format!("{}{}{}", indent, if mark { "* " } else { "  " }, name));
+                let prefix = kind_prefix(tree.kind_tag(id));
+                out.push(format!(
+                    "{}{}{}{}",
+                    indent,
+                    if mark { "* " } else { "  " },
+                    prefix,
+                    name
+                ));
                 if let Some(u) = uid {
                     map.push(u);
                 }
@@ -4204,8 +4396,9 @@ fn main() {
             // S18.1 起 skips 再加 tldock：时间轴是观感/工具（补间可视化 +
             // 创建控制），不是场景对象 —— 整子树不进层级树。S19.1 起再
             // 加 menubar：菜单栏与下拉弹层是壳层件（含播放组按钮 —— 按
-            // 钮不是场景对象），整子树不进层级树。
-            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar];
+            // 钮不是场景对象），整子树不进层级树。S19.5 起再加 traj：
+            // 补间轨迹点池是视口注记（编辑器会话可视化），不是场景对象。
+            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar, traj];
             walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, &skips);
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
@@ -4958,6 +5151,17 @@ fn main() {
             demo_tl_seen_done,
             "补间未见到站移除（ms=500 应在演示窗内自然完成）"
         );
+        // S19.4/S19.5：轨迹三态闩锁（APPLY 前全灭 / 活动期点亮且端点
+        // 对位 from=(280,130)→to=(2,4) / 到站后复灭）。
+        assert!(
+            demo_traj_dark_before,
+            "选中无补间时轨迹应全灭（APPLY 前窗）"
+        );
+        assert!(
+            demo_traj_seen_on,
+            "活动 Pos 补间期轨迹点未按端点对位点亮"
+        );
+        assert!(demo_traj_seen_off, "补间到站后轨迹未复灭");
         // S19.1：菜单全链路 —— Debug 下拉出现（弹层 Control 可见面 +
         // 项文本状态后缀）→ 外点只收菜单（Help 开着点视口空白后弹层
         // 不可见）→ Shortcut Table 项 → Output 快捷键表行。
@@ -5023,6 +5227,36 @@ fn main() {
             "卸载 = registry_key 回空串"
         );
         assert_eq!(tree.prop(kids[0], "enabled"), Some(&Value::Bool(false)));
+        // S19.4：Scene 行类型前缀取证（walk 投影行文本 —— 每类前缀逐个
+        // 对位）+ 容器行无前缀 + traj 容器整子树不进层级树（观感纪律同
+        // grid/ruler/dock —— walk skips 生效面）。行点击交互走行→uid
+        // 映射不读文本，前缀只进视图（选中标记/缩进/映射逻辑零改动）。
+        let scene_rows = tree
+            .prop(hud_tree, "rows")
+            .and_then(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(scene_rows.contains("[S] obj1"), "Scene 行缺 Sprite2D 前缀：{scene_rows:?}");
+        assert!(scene_rows.contains("[C] cam"), "Scene 行缺 Camera2D 前缀：{scene_rows:?}");
+        assert!(scene_rows.contains("[J] spin"), "Scene 行缺 Script 前缀：{scene_rows:?}");
+        assert!(
+            scene_rows.contains("[X] name_input"),
+            "Scene 行缺 TextInput 前缀：{scene_rows:?}"
+        );
+        assert!(
+            scene_rows.contains("[T] hud_scene"),
+            "Scene 行缺 Label 前缀：{scene_rows:?}"
+        );
+        assert!(
+            scene_rows.contains("    hud_tree"),
+            "容器行（ListView）不应带前缀（行文本 = 缩进+标记+名字）：{scene_rows:?}"
+        );
+        assert!(
+            !scene_rows.contains("traj"),
+            "traj 容器漏进层级树（walk skips 失效）：{scene_rows:?}"
+        );
         // S19.1 收尾互证：菜单外点收起不产生编辑动作 —— obj1 仍是主选
         // 中（若第一击漏进编辑路径，视口空白点击会清空 Selection）。
         {
@@ -5035,8 +5269,8 @@ fn main() {
                 "menu outside-click must not change selection (got {prim:?})"
             );
         }
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.4 类型标记与 S19.5 轨迹三态冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
 }
