@@ -180,6 +180,23 @@
 //! 编辑器创建的补间与脚本 Cmd 同一登记表 = 编辑态会话态（不进 RON、
 //! 编辑器不参与 headless 指纹 —— S18.1 文档 §3）。
 //!
+//! S19.1（**顶部菜单栏**，蓝图 §4.1）：窗口顶 20px 全宽条（fill_slot
+//! panel 铺底 + 底缘 1px border 分隔线 —— 与视口工具带同语言；九宫格
+//! 皮肤在 20px 高度下边带占比过大，观感不稳，弃用）+ 四个顶层菜单项
+//! Label（Scene/Project/Debug/Help，MENU_ITEM_X 冻结位）+ **右端播放
+//! 组迁入**（PLAY/STOP/RESET 自视口工具栏迁到菜单栏右缘，Godot 播放
+//! 按钮位；视口工具带只剩 SEL/SNAP/GRID）。布局下移连锁：标尺/视口/
+//! 左右面板的顶部让位从 TOP_BAND(40) 变为 MENU_H+TOP_BAND(60) 起。
+//!
+//! 下拉菜单：开合状态 = 编辑器会话态（`open_menu: Option<usize>`，不进
+//! 树不进指纹）。点击顶层项切换 open；下拉面板 = 九宫格小面板铺底 +
+//! 项底板/文本池（悬停项 fill_slot selected —— 按钮 hover 通道的宿主
+//! 版），宽 MENU_W、锚在菜单项下缘。**命中序**：菜单命中（顶层项带/
+//! 下拉项/收起）先于一切编辑点击路径 —— 菜单开着时视口第一击只收菜单
+//! 不产生编辑动作（Godot 口径）。菜单内容 P0 全部为已有功能的菜单化
+//! （无既有能力者如实报 "not in beta"，照 S12-8 .ron 双击先例）；
+//! 快捷键全部照旧 —— 菜单只是快捷键的可视化入口，不改键位。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -258,6 +275,8 @@ mod editor_theme {
     pub const SLOT_PANEL_NAME: &str = "panel";
     /// 边框槽。
     pub const SLOT_BORDER_NAME: &str = "border";
+    /// 正文槽（S19.1 菜单顶层项色槽）。
+    pub const SLOT_TEXT_NAME: &str = "text";
     /// 强调槽。
     pub const SLOT_ACCENT_NAME: &str = "accent";
     /// 次级文字槽。
@@ -292,6 +311,21 @@ mod editor_theme {
     pub const TL_LIST_H: f32 = 58.0;
     /// 视口工具栏高。
     pub const TOOLBAR_H: f32 = 24.0;
+    /// 顶部菜单栏高（S19.1，蓝图 §4.1：窗口顶 20px 全宽条）。
+    pub const MENU_H: f32 = 20.0;
+    /// 下拉面板宽（蓝图 "~160px" 口径放余量：最长项
+    /// "Load via FileSystem (F9)" 真字体 14px 逐字宽 ≈160px，加 8px
+    /// 内衬后 160 会贴/溢边 —— 位图回退 16px 等宽 24 字 = 384px 更宽，
+    /// 截断不做的 P0 下取"两种模式都安全"的界：176 只保真字体模式
+    /// 不溢、位图模式如实溢出面板（位图是降级路径，不破功能）。
+    pub const MENU_W: f32 = 176.0;
+    /// 顶层菜单项 x 起点（蓝图 §4.1 冻结位：Scene/Project/Debug/Help）。
+    pub const MENU_ITEM_X: [f32; 4] = [16.0, 88.0, 184.0, 264.0];
+    /// 末位菜单项（Help）的命中带宽 —— 相邻项间距推不出末带宽，单点出。
+    pub const MENU_HIT_LAST_W: f32 = 72.0;
+    /// 下拉项池上限（四菜单最长 Scene 3 项 + 1 备用 —— 控件数恒定有界，
+    /// 照网格/标尺/进度条池纪律）。
+    pub const MENU_ITEM_POOL: usize = 4;
     /// 工具栏按钮尺寸与步进。
     pub const TOOLBAR_BTN_W: f32 = 48.0;
     pub const TOOLBAR_BTN_H: f32 = 20.0;
@@ -328,10 +362,11 @@ mod editor_theme {
 // 短名别名：既有引用面（MARGIN/LEFT_PANEL_W/...）逐字保留，定义单一出口。
 use editor_theme::{
     DOCK_H, DOCK_ROW_H, DOCK_TITLE_H, FS_ROW_H, FS_SEP_H, FS_TITLE_H, INS_ROW_H, INSPECTOR_INSET,
-    INSPECTOR_W, LEFT_PANEL_W, MARGIN, PALETTE, RULER_W, SKIN_BTN_MARGIN, SKIN_PANEL_MARGIN,
-    SPACE_S, SLOT_ACCENT_NAME, SLOT_BORDER_NAME, SLOT_PANEL_NAME, SLOT_SELECTED_NAME,
-    SLOT_TEXT_DIM_NAME, STATUS_BAND, TL_LIST_H, TL_TITLE_H, TIMELINE_H, TOOLBAR_BTN_H,
-    TOOLBAR_BTN_STEP, TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
+    INSPECTOR_W, LEFT_PANEL_W, MARGIN, MENU_H, MENU_HIT_LAST_W, MENU_ITEM_POOL, MENU_ITEM_X,
+    MENU_W, PALETTE, RULER_W, SKIN_BTN_MARGIN, SKIN_PANEL_MARGIN, SPACE_S, SLOT_ACCENT_NAME,
+    SLOT_BORDER_NAME, SLOT_PANEL_NAME, SLOT_SELECTED_NAME, SLOT_TEXT_DIM_NAME, SLOT_TEXT_NAME,
+    STATUS_BAND, TL_LIST_H, TL_TITLE_H, TIMELINE_H, TOOLBAR_BTN_H, TOOLBAR_BTN_STEP,
+    TOOLBAR_BTN_W, TOOLBAR_H, TOP_BAND, UI_FONT_SIZE,
 };
 
 fn solid_rgba(r: u8, g: u8, b: u8) -> Vec<u8> {
@@ -477,8 +512,10 @@ fn load_user_music(
 /// 切换，既有断言行的窗口余量照旧保住。S15 起 29 行：视频接入再加
 /// 2 行（video on / video stopped）+ 1 行 F9 分割切换（Media/ 目录把
 /// spin.nes 挤出 fs 可见窗 —— 冒烟先切 files 档再加双击，见注入段），
-/// 余量口径不变。
-const EDITOR_LOG_KEEP: usize = 29;
+/// 余量口径不变。S19.1 起 48 行：菜单帮助表（Shortcut Table，9 行）
+/// 加菜单操作行（开合/诊断/清单，约 6 行）再进 —— 既有断言行（约 30
+/// 行）与音乐/扩展行的窗口余量照旧保住。
+const EDITOR_LOG_KEEP: usize = 48;
 /// dock 行显示截宽（字符数）：Output dock 是 ListView 行（ListState
 /// **位图路径**，S12-11 壳层接入不改 —— 见模块头），等宽 advance=16
 /// 不随真字体装载变化，40 字 × 16px = 640px，最小窗 768 下 dock 内衬
@@ -535,6 +572,59 @@ fn tl_row_text(r: &nes_scene::TweenRow) -> String {
         r.elapsed_ms as i64,
         r.duration_ms as i64,
     )
+}
+
+// ---- S19.1 顶部菜单栏（蓝图 §4.1）----
+//
+// 菜单内容 P0 = **已有功能的菜单化**（不新增行为）：Scene=新建/保存
+// 场景/装载（前两者无既有能力，如实报 not in beta —— 照 S12-8 .ron
+// 双击先例）；Project=音频开关/扩展清单；Debug=诊断段开关；Help=
+// 快捷键表。菜单只是快捷键的可视化入口，不改任何键位。
+
+/// 顶层菜单名（下标即 [`MENU_ITEM_X`] 与 open_menu 会话态的下标）。
+const MENUS: [&str; 4] = ["Scene", "Project", "Debug", "Help"];
+
+/// Help > Shortcut Table 的 Output 输出（全 ASCII —— 冒烟按行断言）。
+/// 快捷键与既有实现逐一对应（见模块头操作注），菜单化不改键位。
+const SHORTCUT_TABLE: [&str; 9] = [
+    "shortcut table (editor):",
+    "F5=play/restart  Shift+F5=stop",
+    "F6=candidate  F7=groups  F8=scan  F9=split",
+    "Enter=mount  U=unmount  E=enable",
+    "Ctrl+Z=undo  Ctrl+Y=redo  Delete=del subtree",
+    "Tab=cycle  Arrows=move  Click=select  Drag=box",
+    "Ctrl+drag=snap  0=music cycle  Esc=cancel draft",
+    "menu: click item / click elsewhere to close",
+    "shortcuts unchanged by menu (visual entry only)",
+];
+
+/// 下拉项文本表（每帧投影取用；音频/诊断两项带现态后缀 —— 显示当前
+/// 态是会话态投影，不进树）。P0 语义：
+/// - Scene/New|Save：无既有能力，点击如实报 "not in beta"；
+/// - Scene/Load：切 F9 files 档（既有行为），提示用 FileSystem dock；
+/// - Project/Audio：open_audio 幂等开（无关闭 API —— On 态点击只报
+///   一行，见执行处；如实）；
+/// - Project/Extensions：点击 Output 列已装载清单（宿主装载时收集）；
+/// - Debug/Diagnostics：状态栏诊断段开关（underruns/extension_faults/
+///   扩展数 —— 运行时读面可达，已接线）；
+/// - Help/Shortcut Table：Output 打印快捷键表（[`SHORTCUT_TABLE`]）。
+fn menu_items(m: usize, audio_on: bool, diag_on: bool, ext_count: usize) -> Vec<String> {
+    match m {
+        0 => vec![
+            "New Scene".into(),
+            "Save Scene".into(),
+            "Load via FileSystem (F9)".into(),
+        ],
+        1 => vec![
+            format!("Audio: {}", if audio_on { "On" } else { "Off" }),
+            format!("Extensions: {ext_count} loaded"),
+        ],
+        2 => vec![format!(
+            "Show Diagnostics: {}",
+            if diag_on { "On" } else { "Off" }
+        )],
+        _ => vec!["Shortcut Table".into()],
+    }
 }
 
 /// 文件系统 dock（S12-8，Godot 左下 res:// 面板）布局常量：
@@ -1229,7 +1319,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -1501,6 +1591,98 @@ fn main() {
         let tl_x_in = mk_tl_input(tree, "tl_x_in", 3, "0");
         let tl_y_in = mk_tl_input(tree, "tl_y_in", 4, "0");
         let tl_ms_in = mk_tl_input(tree, "tl_ms_in", 5, "500");
+        // 顶部菜单栏（S19.1，蓝图 §4.1）：窗口顶 20px 全宽条 —— fill_slot
+        // panel 铺底 + 底缘 1px border 分隔线（与视口工具带同语言；九宫
+        // 格皮肤在 20px 高度下上下边带吃掉 16px，观感不稳，弃用 —— 文档
+        // §1）。四个顶层菜单项 Label（MENU_ITEM_X 冻结位、text 槽色）+
+        // 右端播放组（PLAY/STOP/RESET 自视口工具栏迁入 —— Godot 播放按
+        // 钮位；底板仍用 tool_plates 池后三位）。挂 "menubar" 容器：walk
+        // 整子树跳过（菜单是壳层件不是场景对象）。z=-70（工具带同款纪
+        // 律：场景对象优先于观感）；下拉弹层是显式例外（瞬时 UI 盖过场
+        // 景 —— Godot popup 口径，z=90，见下）。
+        let menubar = tree.add_node(root, "menubar", NodeKind::Node);
+        let menu_bg = tree.add_node(menubar, "menu_bg", NodeKind::Control);
+        let _ = tree.set_prop(menu_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(menu_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(menu_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, MENU_H)));
+        let _ = tree.set_prop(menu_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+        tree.set_prop_raw(menu_bg, "z_index", Value::I64(-70));
+        let menu_sep = tree.add_node(menubar, "menu_sep", NodeKind::Control);
+        let _ = tree.set_prop(menu_sep, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(menu_sep, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(0.0, MENU_H - 1.0)));
+        let _ = tree.set_prop(menu_sep, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 1.0)));
+        let _ = tree.set_prop(menu_sep, "fill_slot", Value::Str(SLOT_BORDER_NAME.into()));
+        tree.set_prop_raw(menu_sep, "z_index", Value::I64(-70));
+        // 顶层菜单项 Label ×4：位置装配期写定（x = MENU_ITEM_X 冻结位，
+        // y=3 使 14px 文本行在 20px 条带内垂直居中）；文本固定，色槽每
+        // 帧投影翻开合态（打开项 accent 色 —— 会话态投影，不进树）。
+        let mut menu_labels = Vec::with_capacity(MENUS.len());
+        for (i, name) in MENUS.iter().enumerate() {
+            let l = tree.add_node(menubar, "menu_item", NodeKind::Label);
+            tree.set_local(l, Transform2D::from_pos(MENU_ITEM_X[i], 3.0));
+            let _ = tree.set_prop(l, PROP_LABEL_TEXT, Value::Str((*name).to_string()));
+            let _ = tree.set_prop(l, "font_size", Value::I64(UI_FONT_SIZE));
+            let _ = tree.set_prop(l, "color_slot", Value::Str(SLOT_TEXT_NAME.into()));
+            tree.set_prop_raw(l, "z_index", Value::I64(-70));
+            menu_labels.push(l);
+        }
+        // 下拉弹层（P0 常量池）：九宫格小面板铺底（弹层高 28..68px，皮
+        // 肤边带比例健康 —— 与 dock 同观感语言）+ 项底板/项文本池 ×4
+        //（MENU_ITEM_POOL 上限 —— Scene 菜单 3 项最长 + 1 备用）。项悬
+        // 停 = 底板 fill_slot 翻 selected 槽（按钮 hover 通道的宿主版
+        // —— 命中用本帧鼠标位，几何用本帧投影矩形）。visible=false 备
+        // 用，开合投影每帧重写（投影无状态口径）。z=90：瞬时弹层盖过
+        // 场景对象（Godot popup 口径 —— 常驻观感件"场景优先"纪律的显
+        // 式例外；仍压不过选中框 z=100）。
+        let menu_pop_bg = tree.add_node(menubar, "menu_pop_bg", NodeKind::Control);
+        let _ = tree.set_prop(menu_pop_bg, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+        let _ = tree.set_prop(menu_pop_bg, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-1000.0, -1000.0)));
+        let _ = tree.set_prop(menu_pop_bg, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(MENU_W, 1.0)));
+        let _ = tree.set_prop(menu_pop_bg, "fill_slot", Value::Str(SLOT_PANEL_NAME.into()));
+        skin_panel(tree, menu_pop_bg);
+        let _ = tree.set_prop(menu_pop_bg, "visible", Value::Bool(false));
+        tree.set_prop_raw(menu_pop_bg, "z_index", Value::I64(90));
+        let mut menu_item_plates = Vec::with_capacity(MENU_ITEM_POOL);
+        for _ in 0..MENU_ITEM_POOL {
+            let p = tree.add_node(menubar, "menu_pop_plate", NodeKind::Control);
+            let _ = tree.set_prop(p, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(p, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-1000.0, -1000.0)));
+            let _ = tree.set_prop(p, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(MENU_W - 4.0, INS_ROW_H)));
+            // fill_slot 置空 = 透明底（悬停时投影翻 selected 槽 —— 照按
+            // 钮"fill 置空 + 状态换槽"的 S18 口径）。
+            let _ = tree.set_prop(p, "fill_slot", Value::Str(String::new()));
+            let _ = tree.set_prop(p, "visible", Value::Bool(false));
+            tree.set_prop_raw(p, "z_index", Value::I64(90));
+            menu_item_plates.push(p);
+        }
+        let mut menu_item_labels = Vec::with_capacity(MENU_ITEM_POOL);
+        for _ in 0..MENU_ITEM_POOL {
+            let l = tree.add_node(menubar, "menu_pop_label", NodeKind::Label);
+            tree.set_local(l, Transform2D::from_pos(-1000.0, -1000.0));
+            let _ = tree.set_prop(l, PROP_LABEL_TEXT, Value::Str(String::new()));
+            let _ = tree.set_prop(l, "font_size", Value::I64(UI_FONT_SIZE));
+            let _ = tree.set_prop(l, "visible", Value::Bool(false));
+            tree.set_prop_raw(l, "z_index", Value::I64(90));
+            menu_item_labels.push(l);
+        }
+        // 播放组三键（S12-9 语义原样，S19.1 迁位）：Button 本体挂在
+        // menubar 下，offset 装配期占位、每帧布局投影右缘锚定重写（见
+        // 投影块 play 组循环）。字号/透明底口径与工具栏五键逐位同源。
+        let mk_play_btn = |tree: &mut nes_scene::SceneTree, name: &str, text: &str| {
+            let b = tree.add_node(menubar, name, NodeKind::Button);
+            let _ = tree.set_prop(b, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
+            let _ = tree.set_prop(b, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-1000.0, -1000.0)));
+            let _ = tree.set_prop(b, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
+            let _ = tree.set_prop(b, "text", Value::Str(text.to_string()));
+            // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽）。
+            tree.set_prop_raw(b, "font_size", Value::I64(UI_FONT_SIZE));
+            // S18：fill_slot 置空 = 透明底（九宫格底板纹理透出）。
+            tree.set_prop_raw(b, "fill_slot", Value::Str(String::new()));
+            b
+        };
+        let tool_play = mk_play_btn(tree, "tool_play", "PLAY");
+        let tool_stop = mk_play_btn(tree, "tool_stop", "STOP");
+        let tool_reset = mk_play_btn(tree, "tool_reset", "RESET");
         // 视口工具栏（S12-7/F-4，Godot 2D 视口顶部工具条观感）：标尺
         // 之上一条 24px 工具带 —— panel 槽铺底 + 底缘 1px border 分隔
         // 线 + SEL/SNAP/GRID 三个开关按钮（UiVm on_activate 已通）。
@@ -1572,35 +1754,10 @@ fn main() {
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_grid, "font_size", Value::I64(UI_FONT_SIZE));
         tree.set_prop_raw(tool_grid, "fill_slot", Value::Str(String::new()));
-        // S12-9：PLAY / STOP / RESET（Godot 视口工具栏右上角的运行三键
-        // 直感，P0 摆在编辑三键右侧同一工具带）。文本投影每帧重写
-        //（PLAY 运行中带 * 后缀），offset 装配期占位、每帧布局投影重写。
-        let tool_play = tree.add_node(toolbar, "tool_play", NodeKind::Button);
-        let _ = tree.set_prop(tool_play, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
-        let _ = tree.set_prop(tool_play, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 3.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
-        let _ = tree.set_prop(tool_play, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
-        let _ = tree.set_prop(tool_play, "text", Value::Str("PLAY".into()));
-        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
-        tree.set_prop_raw(tool_play, "font_size", Value::I64(UI_FONT_SIZE));
-        tree.set_prop_raw(tool_play, "fill_slot", Value::Str(String::new()));
-        let tool_stop = tree.add_node(toolbar, "tool_stop", NodeKind::Button);
-        let _ = tree.set_prop(tool_stop, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
-        let _ = tree.set_prop(tool_stop, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 4.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
-        let _ = tree.set_prop(tool_stop, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
-        let _ = tree.set_prop(tool_stop, "text", Value::Str("STOP".into()));
-        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
-        tree.set_prop_raw(tool_stop, "font_size", Value::I64(UI_FONT_SIZE));
-        tree.set_prop_raw(tool_stop, "fill_slot", Value::Str(String::new()));
-        let tool_reset = tree.add_node(toolbar, "tool_reset", NodeKind::Button);
-        let _ = tree.set_prop(tool_reset, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
-        let _ = tree.set_prop(tool_reset, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(192.0 + 5.0 * TOOLBAR_BTN_STEP, TOP_BAND + 2.0)));
-        let _ = tree.set_prop(tool_reset, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
-        let _ = tree.set_prop(tool_reset, "text", Value::Str("RESET".into()));
-        // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
-        tree.set_prop_raw(tool_reset, "font_size", Value::I64(UI_FONT_SIZE));
-        // S18：fill_slot 置空 = 按钮本体透明底（槽解析对空名不覆盖），
-        // 九宫格底板纹理透出（hover/pressed 的 accent 换档照常叠加）。
-        tree.set_prop_raw(tool_reset, "fill_slot", Value::Str(String::new()));
+        // S12-9：PLAY / STOP / RESET 三键 S19.1 起迁入顶部菜单栏右端
+        //（创建移至下方 menubar 段 —— Godot 播放按钮位），视口工具带
+        // 只剩 SEL/SNAP/GRID 编辑三键。底板池 tool_plates 仍开 6 槽：
+        // 前 3 槽随编辑三键、后 3 槽随播放组（投影每帧按位布线）。
         let cam = tree.add_node(root, "cam", NodeKind::Camera2D);
         tree.set_local(cam, Transform2D::from_pos(384.0, 216.0));
         // 演示对象 y=130（S18.1 起：时间轴 dock 让走了下方 ~110px ——
@@ -1621,7 +1778,8 @@ fn main() {
         //（S12-4 自适应：高度 = ch-64，宽恒 180）。
         let hud_tree = tree.add_node(root, "hud_tree", NodeKind::ListView);
         tree.set_prop(hud_tree, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::new(0.0, 0.0))).unwrap();
-        tree.set_prop(hud_tree, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, TOP_BAND))).unwrap();
+        // S19.1：y 让位菜单栏（MENU_H + TOP_BAND；投影块每帧重写）。
+        tree.set_prop(hud_tree, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(MARGIN, MENU_H + TOP_BAND))).unwrap();
         tree.set_prop(hud_tree, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, 360.0))).unwrap();
         tree.set_prop(hud_tree, "rows", Value::Str(String::new())).unwrap();
         tree.set_prop(hud_tree, "row_h", Value::I64(18)).unwrap();
@@ -1659,9 +1817,10 @@ fn main() {
         tree.set_prop_raw(sel_box, "z_index", Value::I64(100));
 
         // 左面板标题（S12-5 Godot 命名）：与右侧 Inspector 标题同款 Label。
-        // 左面板 x 恒定（MARGIN），位置装配期一次写定即可，无需每帧投影。
+        // 左面板 x 恒定（MARGIN）；y = 12 + MENU_H（S19.1：菜单栏置顶后
+        // 标题随面板整体下移一行 —— 恒定位置，装配期一次写定即可）。
         let hud_scene = tree.add_node(root, "hud_scene", NodeKind::Label);
-        tree.set_local(hud_scene, Transform2D::from_pos(MARGIN + 2.0, 12.0));
+        tree.set_local(hud_scene, Transform2D::from_pos(MARGIN + 2.0, 12.0 + MENU_H));
         tree.set_prop(hud_scene, PROP_LABEL_TEXT, Value::Str("Scene".into())).unwrap();
         let _ = tree.set_prop(hud_scene, "font_size", Value::I64(UI_FONT_SIZE));
 
@@ -1704,7 +1863,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -1753,6 +1912,15 @@ fn main() {
     let mut tl_x = String::from("0");
     let mut tl_y = String::from("0");
     let mut tl_ms = String::from("500");
+    // S19.1 菜单会话态（不进树、不进指纹 —— 与工具栏开关/分割档同一
+    // 纪律）：open_menu = 开合的下拉菜单下标（None = 全收）；下拉项矩
+    // 形表（上一帧投影产出 -> 帧首命中，一帧滞后与既有 UI 命中同口径）
+    // ；诊断段开关（状态栏追加段）；启动装载成功的扩展名清单（Project
+    // 菜单清单项的数据面 —— 宿主装载时收集，与运行时计数互为对照）。
+    let mut open_menu: Option<usize> = None;
+    let mut menu_item_rows: Vec<(f32, f32, usize, usize)> = Vec::new();
+    let mut diag_on = false;
+    let mut ext_loaded: Vec<String> = Vec::new();
 
     // 状态栏的 undo/redo 键按下沿检测。
     let mut prev_z = false;
@@ -1791,6 +1959,10 @@ fn main() {
                     Ok(id) => {
                         println!("[扩展] 已装载 {id} <- {}", f.display());
                         log_line(&editor_log, format!("ext loaded {id}"));
+                        // S19.1：Project > Extensions 清单项的数据面（点击
+                        // 逐行列出 —— 宿主装载视角，与 rt.extension_count
+                        // 计数互为对照）。
+                        ext_loaded.push(base_name(&f.to_string_lossy()).to_string());
                     }
                     Err(e) => {
                         eprintln!("[扩展] 装载失败（{}）：{e} —— 跳过", f.display());
@@ -1966,6 +2138,13 @@ fn main() {
     let mut demo_tl_rows = String::new();
     let mut demo_tl_seen_active = false;
     let mut demo_tl_seen_done = false;
+    // S19.1 菜单取证闩锁（与时间轴闩锁同款滞容口径 —— 注入到达帧有
+    // 抖动，固定帧号采样会偶发扑空）：①下拉曾可见（弹层 Control
+    // visible 沿）；②Debug 项文本（状态后缀投影取证）；③外点收起曾
+    // 不可见（Help 开着点视口空白后）。
+    let mut demo_menu_open_seen = false;
+    let mut demo_menu_item0 = String::new();
+    let mut demo_menu_closed_seen = false;
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -2016,13 +2195,15 @@ fn main() {
                 // S12-8：FileSystem 双击挂载 —— 鼠标先移到 fs 树
                 // spin.nes 行（768x432 客户区）。S15 起 res:// 树多出
                 // Media/（演示视频目录 + 条目两行）；S18.1 起时间轴 dock
-                // 又让走 110px —— 左栏可用高 162，files 档 fs 列表仅
-                // ~4.3 行可见（顶 y=123.2），spin.nes（Media 在场时行 7）
-                // 在可见窗之外：先在 fs 树上滚轮下滚 4 格（ListView 步长
-                // = row_h 18；scroll 钳到 scroll_max ≈ 73），spin 行落进
-                // 窗内（屏上 y ≈ 181/180）再双击（两次点击沿间隔 <30 帧
-                // = 双击裁决窗）。Media/ 缺席的机器保持默认档布局，行 5
-                // 同法可达 —— 断言面（fs open / mount 行）两种形态都成立。
+                // 又让走 110px；S19.1 起菜单栏再让走 20px —— 左栏可用高
+                // 142，files 档 fs 列表仅 ~3.7 行可见（顶 y=135.2），
+                // spin.nes（Media 在场时行 7）在可见窗之外：先在 fs 树上
+                // 滚轮下滚 4 格（ListView 步长 = row_h 18），spin 行顶
+                // y = 135.2+4+7*18-72 = 193.2 —— 点 y=198（行带内、列表
+                // 底 202 之上）再双击（两次点击沿间隔 <30 帧 = 双击裁决
+                // 窗）。Media/ 缺席的机器保持默认档布局（fs 顶 155.9、
+                // 行 5 顶 177.9），点 y=188 同法可达 —— 断言面（fs open
+                // / mount 行）两种形态都成立。
                 74 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: true }),
                 76 if video_present => inject_input(InputEvent::Key { key: Key::Other(VK_F9), down: false }),
                 78 => inject_input(InputEvent::MouseMove { x: 60.0, y: 160.0 }),
@@ -2032,7 +2213,7 @@ fn main() {
                 86 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
                 88 => inject_input(InputEvent::MouseMove {
                     x: 60.0,
-                    y: if video_present { 189.0 } else { 188.0 },
+                    y: if video_present { 198.0 } else { 188.0 },
                 }),
                 90 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 92 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
@@ -2043,9 +2224,10 @@ fn main() {
                 // S12-9：play-in-editor 全链路 —— Enter 重挂 spin.nes
                 //（上面 100 的 U 已卸载；fs 单击已把候选指回 spin.nes）
                 //→ F5 PLAY → 跑约 56 帧（spin 脚本每帧右移 0.3）→
-                // Shift+F5 STOP → 点工具栏 RESET（第 6 个按钮：768 宽
-                // 客户区下 gx0=188，x = 188+4+5*52 = 452..500，取中
-                // (476, 52)）→ U 卸载回空 registry_key（树形态断言兼容）。
+                // Shift+F5 STOP → 点菜单栏右端 RESET（S19.1 播放组迁入
+                // 菜单栏：768 宽客户区下 x = 768-4-48 = 716..764，y
+                // 0..20，取中 (740, 10)）→ U 卸载回空 registry_key（树
+                // 形态断言兼容）。
                 104 => inject_input(InputEvent::Key { key: Key::Enter, down: true }),
                 106 => inject_input(InputEvent::Key { key: Key::Enter, down: false }),
                 112 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
@@ -2054,7 +2236,7 @@ fn main() {
                 170 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
                 172 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
                 174 => inject_input(InputEvent::Key { key: Key::LShift, down: false }),
-                178 => inject_input(InputEvent::MouseMove { x: 476.0, y: 52.0 }),
+                178 => inject_input(InputEvent::MouseMove { x: 740.0, y: 10.0 }),
                 180 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 182 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 190 => inject_input(InputEvent::Key { key: Key::U, down: true }),
@@ -2062,12 +2244,13 @@ fn main() {
                 // IME 第 1 期冒烟（真人在改名框打中文留人工 —— 自动化只
                 // 钉"Unicode 字符入草稿"链路）：点击改名输入框（768x432
                 // 客户区、obj1 选中、Transform 组展开：S12-11 起行步进
-                // INS_ROW_H=20，offset = (568,136) 尺寸 (178,20)，取
-                // (600,145)）夺焦 → 注入 Char(0x4E2D)（'中'，走
+                // INS_ROW_H=20，S19.1 起基点再让位菜单栏 20px ——
+                // offset = (568,156) 尺寸 (178,20)，取 (600,166)）
+                // 夺焦 → 注入 Char(0x4E2D)（'中'，走
                 // inject_input 同队列通道 = WM_CHAR 直投口径，不经系统
                 // IME 合成 —— 与环境键盘布局无关，t_in_01 同款确定性）
                 // → 帧 214 取证草稿。
-                200 => inject_input(InputEvent::MouseMove { x: 600.0, y: 145.0 }),
+                200 => inject_input(InputEvent::MouseMove { x: 600.0, y: 166.0 }),
                 202 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 204 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 210 => inject_input(InputEvent::Char(0x4E2D)),
@@ -2112,6 +2295,31 @@ fn main() {
                 278 => inject_input(InputEvent::MouseMove { x: 544.0, y: 292.0 }),
                 280 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 282 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                // S19.1 菜单全链路取证（768x432 客户区；菜单栏 y 0..20，
+                // 顶层项带 Scene 16..88 / Project 88..184 / Debug 184..264
+                // / Help 264..328；下拉面板锚在项下缘 y=20 起，行高 20，
+                // 宽 176，内衬 4）：① 点 Debug（192,10）开下拉（项
+                // "Show Diagnostics: Off"，取证弹层 Control 可见面 + 项
+                // 文本）；② 点 Help（272,10）切换下拉；③ 点视口空白
+                //（520,170 —— 可编辑区内、无精灵处）→ 第一击只收菜单不
+                // 产生编辑动作（Godot 口径，循环尾断言选中未被清）；④
+                // 再点 Help 重开 → 点 Shortcut Table 项（300,34 —— 弹层
+                // 第一行中点）→ Output 打印快捷键表（循环尾按行断言）。
+                300 => inject_input(InputEvent::MouseMove { x: 192.0, y: 10.0 }),
+                302 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                304 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                312 => inject_input(InputEvent::MouseMove { x: 272.0, y: 10.0 }),
+                314 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                316 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                322 => inject_input(InputEvent::MouseMove { x: 520.0, y: 170.0 }),
+                324 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                326 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                332 => inject_input(InputEvent::MouseMove { x: 272.0, y: 10.0 }),
+                334 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                336 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
+                344 => inject_input(InputEvent::MouseMove { x: 300.0, y: 34.0 }),
+                346 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
+                348 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
                 _ => {}
             }
         }
@@ -2195,6 +2403,37 @@ fn main() {
                 })
                 .unwrap_or_default();
         }
+        // S19.1 菜单取证（滞容闩锁，见上方声明注）：Debug/Help 开合窗
+        // （~303..~327 与 ~335..~349 两段）内弹层可见即闩"曾可见"；
+        // Debug 开着窗（~303..~317）内读第一项文本（"Show Diagnostics:
+        // Off"）；Help 开着点视口空白（~325 收起）后的窗内不可见即闩
+        // "外点收起"。
+        if demo && (306..=348).contains(&index) && !demo_menu_open_seen {
+            let vis = rt
+                .tree_mut()
+                .prop(menu_pop_bg, "visible")
+                .and_then(Value::as_bool);
+            if vis == Some(true) {
+                demo_menu_open_seen = true;
+            }
+        }
+        if demo && (306..=316).contains(&index) && demo_menu_item0.is_empty() {
+            if let Some(Value::Str(s)) = rt.tree_mut().prop(menu_item_labels[0], PROP_LABEL_TEXT)
+            {
+                if s.contains("Show Diagnostics") {
+                    demo_menu_item0 = s.clone();
+                }
+            }
+        }
+        if demo && (330..=340).contains(&index) && !demo_menu_closed_seen {
+            let vis = rt
+                .tree_mut()
+                .prop(menu_pop_bg, "visible")
+                .and_then(Value::as_bool);
+            if vis == Some(false) {
+                demo_menu_closed_seen = true;
+            }
+        }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
         // 运行态（S12-9）：编辑交互整体让路 —— Tab 循环也一样。
         if !play.playing && tab_now && !prev_tab {
@@ -2243,7 +2482,112 @@ fn main() {
                 mx >= *rx && mx < *rx + INSPECTOR_W && my >= *ry && my < *ry + INS_ROW_H
             })
             .map(|(_, _, gi)| *gi);
-        if mouse_left_held && !prev_click && title_click.is_none() && tool_sel_on && !play.playing {
+        // ---- S19.1 菜单命中（先于一切编辑点击路径）----
+        // Godot 口径：弹出菜单吃掉第一击。三段判定序（点下沿才结算）：
+        // ① 顶层项带命中（MENU_ITEM_X 相邻区间 × 菜单栏高）→ 开合切换
+        //   （同项再点 = 收起，异项 = 切换 —— 开合状态机）；
+        // ② 下拉项命中（上一帧投影矩形 + open_menu 匹配）→ 执行菜单项
+        //   （P0 = 已有能力菜单化，见 match 表）并收起；
+        // ③ 其余任何落点（视口/其它 UI/空白）→ 只收菜单不产生编辑动作
+        //   （menu_ate_click 消费本次按下 —— 框选/选中/标题折叠全部
+        //   让路；"点外部关菜单不产生编辑动作"）。
+        let click_edge = mouse_left_held && !prev_click;
+        let mut menu_ate_click = false;
+        if click_edge {
+            let bar_hit = MENUS.iter().enumerate().find(|(i, _)| {
+                let x0 = MENU_ITEM_X[*i];
+                let x1 = MENU_ITEM_X.get(i + 1).copied().unwrap_or(x0 + MENU_HIT_LAST_W);
+                (0.0..MENU_H).contains(&my) && mx >= x0 && mx < x1
+            });
+            if let Some((mi, _)) = bar_hit {
+                open_menu = if open_menu == Some(mi) { None } else { Some(mi) };
+                menu_ate_click = true;
+            } else if let Some(&(_, _, m, ri)) = menu_item_rows
+                .iter()
+                .find(|&&(rx, ry, mm, _)| {
+                    open_menu == Some(mm)
+                        && mx >= rx
+                        && mx < rx + MENU_W - 2.0 * SPACE_S
+                        && my >= ry
+                        && my < ry + INS_ROW_H
+                })
+            {
+                // 菜单项执行（P0 行为映射 —— 全 ASCII 日志，冒烟按行断言）：
+                match (m, ri) {
+                    (0, 0) => {
+                        // 清空树重建初始：无既有能力（树重建会换 NodeId，
+                        // 壳层手柄/行映射全散 —— S12-9 RESET 已裁决过同款
+                        // 边界），如实报 not in beta，不落账。
+                        log_line(&editor_log, "new scene: not in beta (P0)".into());
+                    }
+                    (0, 1) => {
+                        // 保存场景：rt.save_scene API 在，但编辑器无既有
+                        // Ctrl+S 接线、保存路径口径未冻结 —— P0 如实报。
+                        log_line(&editor_log, "save scene: not in beta (P0)".into());
+                    }
+                    (0, 2) => {
+                        // 装载 = 切 F9 files 档（既有行为），提示用
+                        // FileSystem dock 双击 .ron/.nes。
+                        fs_focus = true;
+                        log_line(&editor_log, "load: FileSystem dock (F9 -> files)".into());
+                    }
+                    (1, 0) => {
+                        // 音频：open_audio 幂等开（既有 API）；无关闭 API
+                        // —— On 态点击如实报一行（P0 不新增行为）。
+                        if rt.audio_open() {
+                            log_line(&editor_log, "audio: close not in P0 (no api)".into());
+                        } else {
+                            match rt.open_audio() {
+                                Ok(()) => log_line(&editor_log, "audio on".into()),
+                                Err(e) => log_line(&editor_log, format!("audio: {e}")),
+                            }
+                        }
+                    }
+                    (1, 1) => {
+                        log_line(
+                            &editor_log,
+                            format!("extensions: {} loaded", ext_loaded.len()),
+                        );
+                        for name in &ext_loaded {
+                            log_line(&editor_log, format!("ext: {name}"));
+                        }
+                    }
+                    (2, 0) => {
+                        diag_on = !diag_on;
+                        log_line(
+                            &editor_log,
+                            format!("diagnostics {}", if diag_on { "on" } else { "off" }),
+                        );
+                    }
+                    (3, 0) => {
+                        for line in SHORTCUT_TABLE {
+                            log_line(&editor_log, line.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                open_menu = None;
+                menu_ate_click = true;
+            } else if open_menu.is_some() {
+                // 点其它处（视口/其它 UI/下拉面板衬边）：只收菜单。
+                open_menu = None;
+                menu_ate_click = true;
+            }
+        }
+        // Esc 收菜单（Godot 口径的第三条收起路径；无菜单时 Esc 照旧走
+        // 既有路径 —— 改名草稿回滚不受影响）。
+        if snap.pressed.contains(&Key::Escape) && open_menu.is_some() {
+            open_menu = None;
+        }
+        // S19.1：menu_ate_click = 本次按下已被菜单路径消费（开合/执行/
+        // 收起）—— 编辑点击路径整体让路（Godot：点外部关菜单不产生编辑
+        // 动作）。
+        if click_edge
+            && !menu_ate_click
+            && title_click.is_none()
+            && tool_sel_on
+            && !play.playing
+        {
             // hit 在脚本中做；宿主侧直接查树（与 hit 同一几何：盒原点
             // 经 SceneTree::sprite_hit_origin 单点助手 —— S16.5 收敛，
             // pivot 平移后的锚点角，脚本/宿主不再各持一份）。
@@ -2261,8 +2605,14 @@ fn main() {
                     //（输入框/按钮的交互让给 UiVm 同款纪律）。
                     tl_bg, hud_tl, tl_pos, tl_scale, tl_alpha, tl_x_in, tl_y_in,
                     tl_ms_in, tl_ease, tl_mode, tl_apply,
+                    // S19.1 菜单条与下拉弹层（纵深防御 —— 菜单开着时点
+                    // 击在更早的菜单路径里已消费；菜单收着时压菜单条也
+                    // 不清选中不框选）。播放组按钮随迁仍护（菜单条内，
+                    // Godot：点播放不清选中）。
+                    menu_bg, menu_pop_bg,
                 ]
                 .iter()
+                .chain(menu_item_plates.iter())
                 .any(|&n| press_in_control(tree, n, viewport, (mx, my)))
             };
             let hit_uid: Option<Uid> = {
@@ -2332,7 +2682,7 @@ fn main() {
                 drag_start = Some((mx, my));
                 sel.clear(); // 框选重置（Shift 保留已有选择）
             }
-        } else if mouse_left_held && !prev_click && !play.playing {
+        } else if click_edge && !menu_ate_click && !play.playing {
             // 标题点击 = 翻对应组折叠位（会话态）；本次按下就此消费 ——
             // 不清选中、不框选、不给精灵命中（护盾口径与面板点击一致）。
             // SEL off：纯观察 —— 点击不选中不拖拽不框选（工具栏按钮
@@ -2700,6 +3050,13 @@ fn main() {
         // 恒定宽、状态栏贴底、相机置中 —— 世界坐标 == 视图坐标恒等
         // 映射，HUD/sel_box/命中全部免换算。换绑草稿在 tree 借用外做
         //（ui_vm_mut 与 tree_mut 不共存），见块后的 rebind_name。
+        // S19.1 菜单投影读数（&self/原子读面 —— 与下方 tree_mut 借用
+        // 错开，帧头一次取足）：音频开合态 / 扩展计数 / 扩展故障计数 /
+        // 设备欠载计数（诊断段与菜单项现态后缀的数据面）。
+        let audio_on = rt.audio_open();
+        let ext_count = rt.extension_count();
+        let ext_faults = rt.extension_faults();
+        let underruns = nes_audio::underruns();
         let mut rebind_name: Option<String> = None;
         {
             let tree = rt.tree_mut();
@@ -2726,40 +3083,38 @@ fn main() {
             let gy1 = viewport.1 - STATUS_BAND - DOCK_H - TIMELINE_H;
             let vx0 = gx0 + RULER_W;
             // S12-7：标尺整体下移让出视口工具栏（工具带 24px 在标尺之
-            // 上 —— Godot 2D 视口顶部工具条的堆叠顺序）。
-            let ruler_y = TOP_BAND + TOOLBAR_H;
+            // 上 —— Godot 2D 视口顶部工具条的堆叠顺序）。S19.1：菜单栏
+            // （MENU_H=20）置顶占住窗口顶带 —— 工具带与标尺再整体下移
+            // 一行（ruler_y = MENU_H + TOP_BAND + TOOLBAR_H，原
+            // TOP_BAND + TOOLBAR_H；面板顶同步 MENU_H + TOP_BAND）。
+            let ruler_y = MENU_H + TOP_BAND + TOOLBAR_H;
             let vy0 = ruler_y + RULER_W;
             let vx1 = gx1;
             let vy1 = gy1;
 
             // 视口工具栏布线（S12-7）：panel 槽铺底 + 底缘 1px border
-            // 分隔线 + 三个开关按钮 + PLAY/STOP/RESET 运行三键（S12-9
-            // —— PLAY 运行中带 * 后缀，同 * = ON 的会话态口径；STOP/
-            // RESET 无 ON 态，恒显素文本）。gx0 恒定（面板恒宽），沿
-            // 投影纪律每帧重写；按钮文本后缀 * = ON —— 开关态是编辑器
-            // 会话态，每帧重写进文本投影（投影无状态口径）。
+            // 分隔线 + 三个开关按钮（S19.1 起播放组迁出 —— 见下方 play
+            // 组循环；SEL/SNAP/GRID 文本后缀 * = ON —— 开关态是编辑器
+            // 会话态，每帧重写进文本投影，投影无状态口径）。
             let _ = tree.set_prop(tool_bg, PROP_CONTROL_OFFSET,
-                Value::Vec2(nes_scene::Vec2::new(gx0, TOP_BAND)));
+                Value::Vec2(nes_scene::Vec2::new(gx0, MENU_H + TOP_BAND)));
             let _ = tree.set_prop(tool_bg, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(gx1 - gx0, TOOLBAR_H)));
             let _ = tree.set_prop(tool_sep, PROP_CONTROL_OFFSET,
-                Value::Vec2(nes_scene::Vec2::new(gx0, TOP_BAND + TOOLBAR_H - 1.0)));
+                Value::Vec2(nes_scene::Vec2::new(gx0, MENU_H + TOP_BAND + TOOLBAR_H - 1.0)));
             let _ = tree.set_prop(tool_sep, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(gx1 - gx0, 1.0)));
             let tool_btns = [
                 (tool_sel, tool_sel_on, "SEL"),
                 (tool_snap, tool_snap_on, "SNAP"),
                 (tool_grid, tool_grid_on, "GRID"),
-                (tool_play, play.playing, "PLAY"),
-                (tool_stop, false, "STOP"),
-                (tool_reset, false, "RESET"),
             ];
             for (i, (b, on, name)) in tool_btns.iter().enumerate() {
                 let bx = gx0 + SPACE_S + i as f32 * TOOLBAR_BTN_STEP;
                 let _ = tree.set_prop(*b, PROP_CONTROL_OFFSET,
                     Value::Vec2(nes_scene::Vec2::new(
                         bx,
-                        TOP_BAND + 2.0,
+                        MENU_H + TOP_BAND + 2.0,
                     )));
                 let _ = tree.set_prop(*b, "text",
                     Value::Str(if *on { format!("{name}*") } else { (*name).to_string() }));
@@ -2767,7 +3122,29 @@ fn main() {
                 // 下方，纹理透出按钮透明底；投影无状态，每帧重写口径）。
                 if let Some(&p) = tool_plates.get(i) {
                     let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
-                        Value::Vec2(nes_scene::Vec2::new(bx, TOP_BAND + 2.0)));
+                        Value::Vec2(nes_scene::Vec2::new(bx, MENU_H + TOP_BAND + 2.0)));
+                }
+            }
+            // S19.1 播放组布线：PLAY/STOP/RESET 右缘锚定在菜单栏内（y=0
+            // 满高 20px —— 按钮高 TOOLBAR_BTN_H == MENU_H），x 每帧按客
+            // 户区右缘重算（Godot 播放按钮位）。PLAY 运行中带 * 后缀
+            //（既有口径）；STOP/RESET 无 ON 态恒显素文本。底板池
+            // tool_plates[3..6] 随按钮同步布线（迁位不换控件）。
+            let play_btns = [
+                (tool_play, play.playing, "PLAY"),
+                (tool_stop, false, "STOP"),
+                (tool_reset, false, "RESET"),
+            ];
+            for (k, (b, on, name)) in play_btns.iter().enumerate() {
+                let bx = viewport.0 - SPACE_S - TOOLBAR_BTN_W
+                    - (play_btns.len() - 1 - k) as f32 * TOOLBAR_BTN_STEP;
+                let _ = tree.set_prop(*b, PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(bx, 0.0)));
+                let _ = tree.set_prop(*b, "text",
+                    Value::Str(if *on { format!("{name}*") } else { (*name).to_string() }));
+                if let Some(&p) = tool_plates.get(3 + k) {
+                    let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(bx, 0.0)));
                 }
             }
             // 左栏两段布线（S12-8，Godot 左栏 Scene + res:// 两段）：
@@ -2776,12 +3153,16 @@ fn main() {
             // 分割比例由 F9 档位推导（fs_focus 会话态 —— 比例本身不进
             // 树，只落在每帧重写的 offset/size 上，焦点段占大头）。
             // 最小窗口下段高钳 0（列表/条带照画零矩形，提取层口径）。
-            let avail_h = (viewport.1 - TOP_BAND - STATUS_BAND - DOCK_H - TIMELINE_H).max(0.0);
+            // S19.1：顶带 = MENU_H + TOP_BAND（菜单栏 + 标题带）。
+            let avail_h = (viewport.1 - MENU_H - TOP_BAND - STATUS_BAND - DOCK_H - TIMELINE_H)
+                .max(0.0);
             let top_frac = if fs_focus { FS_SPLIT_ALT } else { FS_SPLIT_TOP };
             let scene_h = ((avail_h - FS_SEP_H) * top_frac).max(0.0);
             let fs_h = (avail_h - FS_SEP_H - scene_h).max(0.0);
-            let sep_y = TOP_BAND + scene_h;
+            let sep_y = MENU_H + TOP_BAND + scene_h;
             let fs_y = sep_y + FS_SEP_H;
+            let _ = tree.set_prop(hud_tree, PROP_CONTROL_OFFSET,
+                Value::Vec2(nes_scene::Vec2::new(MARGIN, MENU_H + TOP_BAND)));
             let _ = tree.set_prop(hud_tree, PROP_CONTROL_SIZE,
                 Value::Vec2(nes_scene::Vec2::new(LEFT_PANEL_W, scene_h)));
             let _ = tree.set_prop(fs_sep, PROP_CONTROL_OFFSET,
@@ -2808,12 +3189,19 @@ fn main() {
                 .map(|i| i as i64)
                 .unwrap_or(-1);
             let _ = tree.set_prop(fs_tree, "selected", Value::I64(fs_sel_row));
-            // 右检查器面板底：x = cw-198（宽 190 + 右缘 8），y = 8..时间轴上缘
-            //（S18.1 起 dock 之上再让出时间轴带）。
+            // 右检查器面板底：x = cw-198（宽 190 + 右缘 8），y = 菜单栏
+            // 下 MARGIN..时间轴上缘（S18.1 起 dock 之上让出时间轴带；
+            // S19.1 起顶部再让出菜单栏一行）。
             let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_OFFSET,
-                Value::Vec2(nes_scene::Vec2::new(viewport.0 - INSPECTOR_W - 2.0 * MARGIN, MARGIN)));
+                Value::Vec2(nes_scene::Vec2::new(
+                    viewport.0 - INSPECTOR_W - 2.0 * MARGIN,
+                    MARGIN + MENU_H,
+                )));
             let _ = tree.set_prop(hud_ins_bg, PROP_CONTROL_SIZE,
-                Value::Vec2(nes_scene::Vec2::new(INSPECTOR_W, viewport.1 - MARGIN - STATUS_BAND - DOCK_H - TIMELINE_H)));
+                Value::Vec2(nes_scene::Vec2::new(
+                    INSPECTOR_W,
+                    viewport.1 - MARGIN - MENU_H - STATUS_BAND - DOCK_H - TIMELINE_H,
+                )));
             // 状态栏贴底：y = ch-20。
             tree.set_local(hud_st, Transform2D::from_pos(MARGIN, viewport.1 - 20.0));
 
@@ -3095,6 +3483,80 @@ fn main() {
                     Value::Vec2(nes_scene::Vec2::new(pw, TOOLBAR_BTN_H)));
             }
 
+            // S19.1 菜单栏/下拉弹层投影：菜单条尺寸/分隔线每帧重写；顶
+            // 层项色槽翻开合态（打开项 accent 色 —— 会话态投影）。下拉
+            // 面板 = 九宫格小面板 + 项底板/文本池（悬停项 fill_slot 翻
+            // selected 槽 —— 按钮 hover 通道的宿主版：命中用本帧鼠标
+            // 位、几何用本帧投影矩形）。项矩形记入 menu_item_rows（下
+            // 一帧帧首命中 —— 一帧滞后与既有 UI 命中同口径，title_rows
+            // 先例）。弹层 z=90：瞬时 UI 盖过场景对象（Godot popup 口
+            // 径 —— 装配注的显式例外），仍压不过选中框 z=100。
+            let _ = tree.set_prop(menu_bg, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(viewport.0, MENU_H)));
+            let _ = tree.set_prop(menu_sep, PROP_CONTROL_SIZE,
+                Value::Vec2(nes_scene::Vec2::new(viewport.0, 1.0)));
+            for (i, &l) in menu_labels.iter().enumerate() {
+                let _ = tree.set_prop(l, "color_slot", Value::Str(if open_menu == Some(i) {
+                    SLOT_ACCENT_NAME
+                } else {
+                    SLOT_TEXT_NAME
+                }
+                .into()));
+            }
+            menu_item_rows.clear();
+            let pop_items: Vec<String> = match open_menu {
+                Some(m) => menu_items(m, audio_on, diag_on, ext_count),
+                None => Vec::new(),
+            };
+            if !pop_items.is_empty() {
+                let m = open_menu.unwrap_or(0);
+                let px = MENU_ITEM_X[m] - SPACE_S;
+                let ph = 2.0 * SPACE_S + pop_items.len() as f32 * INS_ROW_H;
+                let _ = tree.set_prop(menu_pop_bg, PROP_CONTROL_OFFSET,
+                    Value::Vec2(nes_scene::Vec2::new(px, MENU_H)));
+                let _ = tree.set_prop(menu_pop_bg, PROP_CONTROL_SIZE,
+                    Value::Vec2(nes_scene::Vec2::new(MENU_W, ph)));
+                let _ = tree.set_prop(menu_pop_bg, "visible", Value::Bool(true));
+                for (i, text) in pop_items.iter().enumerate() {
+                    let ry = MENU_H + SPACE_S + i as f32 * INS_ROW_H;
+                    let hover = mx >= px + 2.0
+                        && mx < px + MENU_W - 2.0
+                        && my >= ry
+                        && my < ry + INS_ROW_H;
+                    let plate = menu_item_plates[i];
+                    let _ = tree.set_prop(plate, PROP_CONTROL_OFFSET,
+                        Value::Vec2(nes_scene::Vec2::new(px + 2.0, ry)));
+                    let _ = tree.set_prop(plate, PROP_CONTROL_SIZE,
+                        Value::Vec2(nes_scene::Vec2::new(MENU_W - 4.0, INS_ROW_H)));
+                    let _ = tree.set_prop(plate, "fill_slot",
+                        Value::Str(if hover {
+                            SLOT_SELECTED_NAME.to_string()
+                        } else {
+                            String::new()
+                        }));
+                    let _ = tree.set_prop(plate, "visible", Value::Bool(true));
+                    let lab = menu_item_labels[i];
+                    tree.set_local(lab, Transform2D::from_pos(px + 8.0, ry + 2.0));
+                    let _ = tree.set_prop(lab, PROP_LABEL_TEXT, Value::Str(text.clone()));
+                    let _ = tree.set_prop(lab, "visible", Value::Bool(true));
+                    menu_item_rows.push((px + 2.0, ry, m, i));
+                }
+                // 池余量熄灭（投影无状态，每帧重写一遍口径）。
+                for i in pop_items.len()..MENU_ITEM_POOL {
+                    let _ = tree.set_prop(menu_item_plates[i], "visible", Value::Bool(false));
+                    let _ = tree.set_prop(menu_item_labels[i], "visible", Value::Bool(false));
+                    let _ = tree.set_prop(menu_item_labels[i], PROP_LABEL_TEXT, Value::Str(String::new()));
+                }
+            } else {
+                // 全收：弹层与池整体熄灭。
+                let _ = tree.set_prop(menu_pop_bg, "visible", Value::Bool(false));
+                for i in 0..MENU_ITEM_POOL {
+                    let _ = tree.set_prop(menu_item_plates[i], "visible", Value::Bool(false));
+                    let _ = tree.set_prop(menu_item_labels[i], "visible", Value::Bool(false));
+                    let _ = tree.set_prop(menu_item_labels[i], PROP_LABEL_TEXT, Value::Str(String::new()));
+                }
+            }
+
             // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
             // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
             // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与
@@ -3136,8 +3598,10 @@ fn main() {
             // S18 起 skips 加 theme_node：主题节点是皮肤数据不是可编辑
             // 对象，不进层级树行列表（同 grid/ruler/dock 纪律）。
             // S18.1 起 skips 再加 tldock：时间轴是观感/工具（补间可视化 +
-            // 创建控制），不是场景对象 —— 整子树不进层级树。
-            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock];
+            // 创建控制），不是场景对象 —— 整子树不进层级树。S19.1 起再
+            // 加 menubar：菜单栏与下拉弹层是壳层件（含播放组按钮 —— 按
+            // 钮不是场景对象），整子树不进层级树。
+            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar];
             walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, &skips);
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
@@ -3170,10 +3634,11 @@ fn main() {
                     let tf_open = group_stage & 1 == 0;
                     let sc_open = group_stage & 2 == 0;
                     // Transform 组标题（面板第 2 行，S12-11 起步进
-                    // INS_ROW_H）：前缀 "-" 展开 / "+" 折叠，text_dim 色
-                    //（装配期定槽，此处只翻文本）。
-                    title_rows.push((ins_x, 12.0 + INS_ROW_H, 0));
-                    tree.set_local(ins_tf_title, Transform2D::from_pos(ins_x, 12.0 + INS_ROW_H));
+                    // INS_ROW_H；S19.1 起顶部再让位菜单栏一行）：前缀
+                    // "-" 展开 / "+" 折叠，text_dim 色（装配期定槽，
+                    // 此处只翻文本）。
+                    title_rows.push((ins_x, 12.0 + MENU_H + INS_ROW_H, 0));
+                    tree.set_local(ins_tf_title, Transform2D::from_pos(ins_x, 12.0 + MENU_H + INS_ROW_H));
                     let _ = tree.set_prop(ins_tf_title, "visible", Value::Bool(true));
                     let _ = tree.set_prop(ins_tf_title, PROP_LABEL_TEXT,
                         Value::Str(if tf_open { "- Transform" } else { "+ Transform" }.into()));
@@ -3197,13 +3662,15 @@ fn main() {
                     let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
                     // 标题/信息 Label 每帧投影到右面板顶（x = cw-190，
                     // 随面板走 —— S12-6 修"标题被表面边缘裁剪"口径）。
-                    tree.set_local(hud_ins, Transform2D::from_pos(ins_x, 12.0));
+                    tree.set_local(hud_ins, Transform2D::from_pos(ins_x, 12.0 + MENU_H));
 
                     // 改名输入框 = Transform 组成员：折叠即隐藏；展开时
                     // 槽位紧跟组行（行高 INS_ROW_H —— 不再是装配期写死的
                     // 常量，S12-6 ①根修口径延续：每帧重写，窗口一变当帧
-                    // 跟上；S12-11 步进 20 见常量注）。
+                    // 跟上；S12-11 步进 20 见常量注；S19.1 基点再让位菜
+                    // 单栏一行）。
                     let input_y = 12.0
+                        + MENU_H
                         + 2.0 * INS_ROW_H
                         + if tf_open { 4.0 * INS_ROW_H } else { 0.0 }
                         + 4.0;
@@ -3251,7 +3718,7 @@ fn main() {
                 None => {
                     ins_text.push_str("\n(none)");
                     let _ = tree.set_prop(hud_ins, PROP_LABEL_TEXT, Value::Str(ins_text));
-                    tree.set_local(hud_ins, Transform2D::from_pos(ins_x, 12.0));
+                    tree.set_local(hud_ins, Transform2D::from_pos(ins_x, 12.0 + MENU_H));
                     // 无选中：分区/输入框全部隐藏（Godot 空面板直感）。
                     for n in [ins_tf_title, ins_sc_title, ins_script] {
                         let _ = tree.set_prop(n, "visible", Value::Bool(false));
@@ -3262,24 +3729,46 @@ fn main() {
 
             // 状态栏（S12-7：工具开关态 + F 键挂载流提示；SNAP 开关
             // ON 恒吸附、Ctrl 反转 —— tools 段 S/N/G 即三开关现态。
-            // S12-9：运行态提示 + 运行三键口径）。
-            let st = if play.playing {
+            // S12-9：运行态提示 + 运行三键口径）。S19.1：Debug 菜单开
+            // 诊断段时尾部追加运行时诊断读数（underruns=设备队列打干
+            // 计数、faults=扩展故障累计、ext=已装载扩展数 —— 读面可达，
+            // 已接线）；诊断段与操作提示互斥占位（状态栏宽度有限，替
+            // 换不拼接 —— 提示是静态帮助，诊断是现态读数）。
+            let diag_tail = move || {
                 format!(
+                    "| diag underruns:{} faults:{} ext:{}",
+                    underruns, ext_faults, ext_count
+                )
+            };
+            let st = if play.playing {
+                let base = format!(
                     "st> PLAYING (F5=restart Shift+F5=stop RESET btn reverts scene) tools:{}{}{}",
                     if tool_sel_on { "S" } else { "-" },
                     if tool_snap_on { "N" } else { "-" },
                     if tool_grid_on { "G" } else { "-" },
-                )
+                );
+                if diag_on {
+                    format!("{base} {}", diag_tail())
+                } else {
+                    base
+                }
             } else {
-                format!(
-                    "st> undo:{} redo:{} sel:{} tools:{}{}{} | Click=sel Drag=box Del=del F5=play F8=scan F6=cand Enter=mount U=unmount E=enable F7=groups F9=split Ctrl+Z/Y=undo",
+                let base = format!(
+                    "st> undo:{} redo:{} sel:{} tools:{}{}{}",
                     if log.can_undo() { "Y" } else { "-" },
                     if log.can_redo() { "Y" } else { "-" },
                     sel.len(),
                     if tool_sel_on { "S" } else { "-" },
                     if tool_snap_on { "N" } else { "-" },
                     if tool_grid_on { "G" } else { "-" },
-                )
+                );
+                if diag_on {
+                    format!("{base} {}", diag_tail())
+                } else {
+                    format!(
+                        "{base} | Click=sel Drag=box Del=del F5=play F8=scan F6=cand Enter=mount U=unmount E=enable F7=groups F9=split Ctrl+Z/Y=undo",
+                    )
+                }
             };
             let _ = tree.set_prop(hud_st, PROP_LABEL_TEXT, Value::Str(st));
 
@@ -3825,6 +4314,25 @@ fn main() {
             demo_tl_seen_done,
             "补间未见到站移除（ms=500 应在演示窗内自然完成）"
         );
+        // S19.1：菜单全链路 —— Debug 下拉出现（弹层 Control 可见面 +
+        // 项文本状态后缀）→ 外点只收菜单（Help 开着点视口空白后弹层
+        // 不可见）→ Shortcut Table 项 → Output 快捷键表行。
+        assert!(
+            demo_menu_open_seen,
+            "menu dropdown never became visible: {lines:?}"
+        );
+        assert!(
+            demo_menu_item0.contains("Show Diagnostics"),
+            "Debug dropdown item text wrong: {demo_menu_item0:?}"
+        );
+        assert!(
+            demo_menu_closed_seen,
+            "outside click did not collapse the dropdown"
+        );
+        assert!(
+            has("shortcut table (editor)") && has("F5=play/restart"),
+            "shortcut table rows missing: {lines:?}"
+        );
         // 树形态：挂载 Script 子节点留存（名字 = 脚本基名），registry_key
         // 已回空串（卸载），enabled = false（切换后未回改）。
         let tree = rt.tree_mut();
@@ -3838,8 +4346,20 @@ fn main() {
             "卸载 = registry_key 回空串"
         );
         assert_eq!(tree.prop(kids[0], "enabled"), Some(&Value::Bool(false)));
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY 冒烟断言通过");
+        // S19.1 收尾互证：菜单外点收起不产生编辑动作 —— obj1 仍是主选
+        // 中（若第一击漏进编辑路径，视口空白点击会清空 Selection）。
+        {
+            let prim = sel
+                .primary(tree)
+                .and_then(|p| tree.name(p).map(str::to_string));
+            assert_eq!(
+                prim.as_deref(),
+                Some("obj1"),
+                "menu outside-click must not change selection (got {prim:?})"
+            );
+        }
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路 冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
 }
