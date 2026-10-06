@@ -266,6 +266,40 @@
 //!（ns_* 属性每帧投影 → 提取层每帧 `nine_slice_of` 读 → SetNineSlice
 //! 每帧推 —— 全量快照口径，改属性即下一帧反映），零新代码。
 //!
+//! S19.6（**Scene 树真图标集**，蓝图 §3.3 收口）：S19.4 的文本前缀
+//! `[S] ` 等退役，类型可视化升级为**位图图标列** ——
+//! ① **图标集纹理** `assets/Textures/icons.bmp` 代码生成入库
+//!    （walk_sheet 同家法）：8 列 x 2 行、每格 12x12（画布 96x24）；
+//!    帧 0..6 = 七个类型图标（S 方块角色 / C 相机 / T 文本行 / B 按钮 /
+//!    X 输入框 / J 折角脚本纸 / H 调色板），帧 7 = 容器文件夹（备用），
+//!    第 2 行 8 格 = 中性色实心备用格。挖空纹理（alpha=0）—— 管线无
+//!    混合、alpha<0.5 丢弃，图标浮在行高亮带之上不挡底色；12x12 源格
+//!    经 SPRITE_PX=16 四边形最近邻拉伸上屏（4/3 非整数倍的像素加倍是
+//!    既有引擎常量下的既定取舍，图案不依赖 1px 细线）；
+//! ② **图标精灵池**：挂 "icons" 容器 —— walk skips 整子树不进层级树
+//!    （同 traj/grid 纪律）；**不进 hit 护盾也不进可选中面** —— 三处
+//!    Sprite2D 迭代面（Tab 循环/点击命中/框选）按 under_subtree 过滤
+//!    icons 子树，图标纯展示、点击穿透到行本身（行选择归 UiVm 行点击
+//!    路径）。池 40 枚 Sprite2D：texture=icons.bmp、sheet_cols=8 /
+//!    sheet_rows=2 + frame=类型帧号（S16.2 子矩形采样）、alpha=0.9
+//!    （管线无混合 —— 只折进 RGB 亮度）、visible=false 备用；z=7 =
+//!    场景行文本（hud_tree z 缺省 0）之上、轨迹点 6 同带、菜单弹层
+//!    90/选中框 100 之下；
+//! ③ **投影**：行格式 `{gap}{indent}{mark}{name}` —— 首段一个空格 =
+//!    固定图标列让位槽（列表行恒位图 16px 等宽路径，S12.11 冻结口径
+//!    —— set_ttf_default 只接管 Label/输入框/按钮，故 gap 宽度确定，
+//!    无需运行时实测）。图标定位**固定列**：x = 面板内容左缘 +2（不随
+//!    缩进漂移 —— VS Code 图标槽风格），y = 行顶 +2（行顶 = 列表顶 +
+//!    4 内衬 + i×18 − scroll，滚动偏移经 UiStates 共享面读当帧值 ——
+//!    图标与行同步平移）。可见窗裁剪照 TL 进度条先例（整枚滚出列表矩
+//!    形即熄灭 —— 宁可少画不画到窗外）；容器行（kind_icon_frame=None）
+//!    不点火；池超限截断数进 icons_cut（诊断段，nines_truncated 先例
+//!    —— 常态恒 0）；
+//! ④ **缩进补偿裁决**：接受空格近似 —— 列表行只有位图等宽一条渲染
+//!    路径（16px/格），逐层缩进宽度精确恒定，"比例字体宽度不一"的前
+//!    提在行文本上不成立；缩进引导线需要第二套条带池 + 每帧布线，P0
+//!    收益不抵成本（见 S19.6 文档 §2）。
+//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -665,25 +699,245 @@ const TRAJ_POOL: usize = 12;
 /// "场景对象盖过观感" 纪律本就低于精灵层，与轨迹点无交叠争议。
 const TRAJ_Z: i64 = 6;
 
-/// S19.4 类型前缀（蓝图 §3.3 + Q2 字符集）：行文本前缀段，等宽字体
-/// 极简图标观、`* ` 选中标记同款形态（3 字符 + 空格）。容器类无前缀
-/// = Q2 口径；Theme 在壳层 skips 里（皮肤节点不进列表）但映射照给
-/// —— 用户场景里的 Theme 节点经 walk 照实标记。真位图图标归 icon
-/// 集里程碑。
-fn kind_prefix(tag: Option<nes_scene::NodeKindTag>) -> &'static str {
+// ---- S19.6 Scene 树真图标集（蓝图 §3.3 收口：S19.4 文本前缀退役）----
+//
+// 类型前缀 `[S] ` 等（S19.4）升级为**位图图标列**：图标集纹理
+// icons.bmp 代码生成入库（walk_sheet 同家法）+ Sprite2D 池每帧按行序
+// 摆位（S16.2 子矩形采样选帧）。`kind_prefix` 由此退役 —— 行文本只留
+// `{gap}{indent}{mark}{name}`，类型信息改由图标列承载。
+
+/// 图标格边长（像素）：每格 12x12，画布 = 8 列 x 2 行 = 96x24。
+/// 取舍记此：引擎精灵四边形是 SPRITE_PX=16 冻结常量，12x12 源格经最近
+/// 邻采样拉伸到 16x16 上屏（4/3 非整数倍 —— 个别像素行/列会加倍；
+/// 图案按"拉伸后仍可辨"设计，不依赖 1px 细线）。
+const ICON_CELL: u32 = 12;
+/// 图标集列数（= 类型图标 7 + 容器 1）。
+const ICON_COLS: u32 = 8;
+/// 图标集行数（第 2 行整行 = 中性色备用格）。
+const ICON_ROWS: u32 = 2;
+/// 图标精灵池上限（照 GRID_POOL/TRAJ_POOL/TL_BARS 纪律：控件数恒定
+/// 有界，提取/渲染成本有界）。取值 = 演示场景行数（17）的 ~2.3 倍
+/// 余量；行数超出池的截断数进诊断段（icons_cut，nines_truncated 先例
+/// —— 常态恒 0，非 0 即"场景规模超出图标池"的可见信号）。左栏列表
+/// 可见行数在最小窗口下只有 ~4 行，池远大于可见窗 —— 上限吃的是
+/// "行总数"而非可见数。
+const ICON_POOL: usize = 40;
+/// 图标精灵 z_index（set_prop_raw 前向通道 —— Sprite2D 有 z schema 键
+/// 但装配期一次写定即可）。查证现有 z 阶取值后的裁决：**场景行文本**
+/// 是 hud_tree（ListView）的列表展开，z 缺省 0 —— 图标须在其**之上**；
+/// 轨迹点 6 同属"编辑器注记带"，菜单弹层 90 / 选中框 100 之下（永不盖
+/// 编辑器顶层覆盖件）。取 7 = 注记带内紧贴轨迹点之上。
+const ICON_Z: i64 = 7;
+/// 固定图标列：Scene 面板内容左缘（MARGIN）+ 2px。**不随缩进漂移**
+///（VS Code 图标槽风格 —— 像素级对齐最稳，列恒在 x=10..26）。
+const ICON_COL_INSET: f32 = 2.0;
+/// 行顶到图标顶：16px 精灵在 18px 行带（DOCK_ROW_H）内，任务规格
+/// +2px —— 顶空 2px 底贴行带底缘，与选中高亮带（top+1..top+17）基本
+/// 重叠，观感"图标坐在行带里"。
+const ICON_ROW_INSET: f32 = 2.0;
+/// ListView 行文本笔 x = 矩形左 + 4 内衬（渲染器冻结算式）、位图等宽
+/// advance = 16（font_metrics 实测值）。图标右缘 26 减笔位 12 = 14px
+/// 需让位，一个空格（16px advance）即够且余 2px —— 行文本首段固定垫
+/// 一个空格作图标槽让位（gap）。**列表行恒走位图路径**（S12.11 冻结
+/// 口径：ListState font==NIL 解析到 set_default_font 登记的位图字形表
+/// —— set_ttf_default 只接管 Label/输入框/按钮），16px 等宽在两种
+/// 字体模式下同值，gap 宽度确定无需运行时实测。
+const ICON_GAP: &str = " ";
+
+/// S19.6 类型 → 图标帧号（行主序：帧 0..6 = 七个类型图标，帧 7 = 容器
+/// 文件夹备用）。容器类（Node/Node2D/Control/ScrollView/ListView/Tabs）
+/// 无图标 = `None`（Q2 "无前缀 = 容器" 口径的图标版：容器行不点火，
+/// 图标槽留空 —— 文件夹帧留给 FileSystem dock 文件图标等后续里程碑）。
+/// Theme 在壳层 skips 里（皮肤节点不进列表）但映射照给 —— 用户场景里
+/// 的 Theme 节点经 walk 照实点亮。
+fn kind_icon_frame(tag: Option<nes_scene::NodeKindTag>) -> Option<i64> {
     use nes_scene::NodeKindTag as T;
     match tag {
-        Some(T::Sprite2D) => "[S] ",
-        Some(T::Camera2D) => "[C] ",
-        Some(T::Label) => "[T] ",
-        Some(T::Button) => "[B] ",
-        Some(T::TextInput) => "[X] ",
-        Some(T::Script) => "[J] ",
-        Some(T::Theme) => "[H] ",
-        // Node/Node2D/Control/ScrollView/ListView/Tabs = 容器无前缀
+        Some(T::Sprite2D) => Some(0),
+        Some(T::Camera2D) => Some(1),
+        Some(T::Label) => Some(2),
+        Some(T::Button) => Some(3),
+        Some(T::TextInput) => Some(4),
+        Some(T::Script) => Some(5),
+        Some(T::Theme) => Some(6),
+        // Node/Node2D/Control/ScrollView/ListView/Tabs = 容器无图标
         //（含 kind_tag 取不到的死节点 —— 理论不可达，walk 只访存活）。
-        _ => "",
+        _ => None,
     }
+}
+
+/// S19.6 图标集像素图案（12x12 ASCII art，行主序即帧 0..7；逐格 art
+/// 记录见文档 NES2.0_S19.6真图标集_v1.md §1 —— 与本表逐字节同源）。
+/// 字符表：`.` = 透明（挖空 —— 管线无混合，alpha<0.5 丢弃，行高亮带从
+/// 图标周围透出）、`#` = 亮灰主体 [208,212,218]、`o` = 暗灰
+/// [122,130,140]、`+` = accent 高亮 [74,158,255]（SLOT_ACCENT 同值）。
+const ICON_ART: [[&str; ICON_CELL as usize]; 8] = [
+    // 帧 0：Sprite2D —— 大方块角色（accent 眼点）+ 右下偏移小方块。
+    [
+        "............",
+        "..######....",
+        "..######....",
+        "..##++##....",
+        "..######....",
+        "..######....",
+        "..######....",
+        "..######....",
+        "............",
+        "....####....",
+        "....####....",
+        "....##++##..",
+    ],
+    // 帧 1：Camera2D —— 机身矩形 + 取景凸块 + 镜头圆环（accent 芯）。
+    [
+        "............",
+        "...######...",
+        ".##########.",
+        ".##oooooo##.",
+        ".#o......o#.",
+        ".#o..++..o#.",
+        ".#o..++..o#.",
+        ".#o......o#.",
+        ".##oooooo##.",
+        ".##########.",
+        "............",
+        "............",
+    ],
+    // 帧 2：Label —— 三条横线组（短线 = accent 高亮行）。
+    [
+        "............",
+        ".##########.",
+        ".##########.",
+        "............",
+        ".######.....",
+        ".######.....",
+        "............",
+        ".++++++.....",
+        ".++++++.....",
+        "............",
+        "............",
+        "............",
+    ],
+    // 帧 3：Button —— 圆角矩形描边 + 内嵌 accent 标签条。
+    [
+        "............",
+        "............",
+        "..########..",
+        ".#........#.",
+        ".#........#.",
+        ".#..++++..#.",
+        ".#..++++..#.",
+        ".#........#.",
+        ".#........#.",
+        "..########..",
+        "............",
+        "............",
+    ],
+    // 帧 4：TextInput —— 矩形描边 + 竖直 accent 光标线。
+    [
+        "............",
+        "............",
+        ".##########.",
+        ".#........#.",
+        ".#........#.",
+        ".#..+.....#.",
+        ".#..+.....#.",
+        ".#..+.....#.",
+        ".#........#.",
+        ".##########.",
+        "............",
+        "............",
+    ],
+    // 帧 5：Script —— 折角脚本纸（顶部右侧斜切折角）+ 两行 accent 代码。
+    [
+        "............",
+        ".#########..",
+        ".#......##..",
+        ".#.......#..",
+        ".#.++++..#..",
+        ".#.......#..",
+        ".#...++++.#.",
+        ".#.......#..",
+        ".#.......#..",
+        ".#.......#..",
+        ".#########..",
+        "............",
+    ],
+    // 帧 6：Theme —— 调色板圆环 + 三枚 accent 颜料井点。
+    [
+        "............",
+        "....####....",
+        "..##....##..",
+        ".#...++...#.",
+        ".#........#.",
+        "#....++....#",
+        "#..........#",
+        "#..........#",
+        ".#........#.",
+        ".#...++...#.",
+        "..##....##..",
+        "....####....",
+    ],
+    // 帧 7：容器（文件夹形，P0 备用 —— 容器行不点火，留给 FileSystem
+    // dock 文件图标）。
+    [
+        "............",
+        "............",
+        "...#####....",
+        "..#######...",
+        ".##########.",
+        ".#........#.",
+        ".#........#.",
+        ".#........#.",
+        ".#........#.",
+        ".#........#.",
+        ".##########.",
+        "............",
+    ],
+];
+
+/// 图标集帧色表：图案字符 -> RGBA（直 alpha；透明 = 挖空透出列表行）。
+fn icon_art_color(ch: char) -> [u8; 4] {
+    match ch {
+        '#' => [208, 212, 218, 255], // 亮灰主体
+        'o' => [122, 130, 140, 255], // 暗灰细节
+        '+' => [74, 158, 255, 255],  // accent 高亮（SLOT_ACCENT 同值）
+        _ => [0, 0, 0, 0],           // '.' 与未知字符 = 透明
+    }
+}
+
+/// 图标集纹理（S19.6，walk_sheet 同家法：代码生成、缺了再写、仓库只背
+/// 一份小文件）。8 列 x 2 行、每格 12x12（画布 96x24）：帧 0..7 = 上表
+/// 图案；第 2 行 8 格 = 中性色**实心**备用格（与帧区一眼可辨的惰性填充
+/// —— 误引用时呈暗灰方块而非垃圾图案）。
+fn icons_rgba() -> Vec<u8> {
+    let w = ICON_COLS * ICON_CELL;
+    let h = ICON_ROWS * ICON_CELL;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let mut put = |x: u32, y: u32, c: [u8; 4]| {
+        let i = ((y * w + x) * 4) as usize;
+        rgba[i..i + 4].copy_from_slice(&c);
+    };
+    for (frame, art) in ICON_ART.iter().enumerate() {
+        let cx = (frame as u32 % ICON_COLS) * ICON_CELL;
+        let cy = (frame as u32 / ICON_COLS) * ICON_CELL;
+        for (ry, row) in art.iter().enumerate() {
+            assert_eq!(row.chars().count() as u32, ICON_CELL, "图标图案行宽 {frame}/{ry}");
+            for (rx, ch) in row.chars().enumerate() {
+                put(cx + rx as u32, cy + ry as u32, icon_art_color(ch));
+            }
+        }
+    }
+    // 备用格（帧 8..15）：中性色实心填充（暗灰面板色系，惰性可辨）。
+    for frame in (ICON_ART.len() as u32)..(ICON_COLS * ICON_ROWS) {
+        let cx = (frame % ICON_COLS) * ICON_CELL;
+        let cy = (frame / ICON_COLS) * ICON_CELL;
+        for y in 0..ICON_CELL {
+            for x in 0..ICON_CELL {
+                put(cx + x, cy + y, [46, 50, 58, 255]);
+            }
+        }
+    }
+    rgba
 }
 
 // ---- S19.1 顶部菜单栏（蓝图 §4.1）----
@@ -865,6 +1119,26 @@ fn ime_caret_offset(
         };
     }
     x
+}
+
+/// `n` 是否落在 `container` 子树内（沿父链上溯，根为 None 终止）。
+/// S19.6 图标精灵的"点击穿透"助手：图标是 Sprite2D，会出现在三处
+/// Sprite2D 迭代面（Tab 循环 / 点击命中 / 框选）的候选里 —— 一律按
+/// 本助手过滤掉 icons 容器整棵子树，图标永不成为编辑对象（选中永远
+/// 只落在真实场景节点上；行的选择由 hud_tree 的 UiVm 行点击路径结算
+/// —— 两个路径互不干扰，护盾数组无需加图标）。
+fn under_subtree(
+    tree: &nes_scene::SceneTree,
+    mut n: nes_scene::NodeId,
+    container: nes_scene::NodeId,
+) -> bool {
+    loop {
+        match tree.parent(n) {
+            Some(p) if p == container => return true,
+            Some(p) => n = p,
+            None => return false,
+        }
+    }
 }
 
 /// 按压点（**视图空间**）是否落在控件矩形内 —— 与 UiVm 命中同一口径
@@ -1645,6 +1919,18 @@ fn main() {
         )
         .expect("写按钮皮肤");
     }
+    // S19.6 图标集纹理（Scene 树真图标列）：8x2 网格 12x12 格（96x24），
+    // 缺了再写（walk_sheet/panel_skin 同一家法 —— 代码生成无外部资产）。
+    let icons_bmp = tex.join("icons.bmp");
+    if !icons_bmp.exists() {
+        write_bmp_rgba(
+            &icons_bmp,
+            8 * 12,
+            2 * 12,
+            &icons_rgba(),
+        )
+        .expect("写图标集");
+    }
     // 演示声音资产（S13 第 2 期）：440Hz / 250ms，缺了再写（bmp 同口径）。
     let audio_dir = assets.join("Audio");
     std::fs::create_dir_all(&audio_dir).unwrap();
@@ -1668,6 +1954,8 @@ fn main() {
     // 九宫格 ns_tex 引用这两个键，见装配段 skin_panel/skin_button）。
     let panel_skin_id = rt.declare_texture("Textures/panel_skin.bmp").expect("声明面板皮肤");
     let button_skin_id = rt.declare_texture("Textures/button_skin.bmp").expect("声明按钮皮肤");
+    // S19.6 图标集声明（图标精灵池 texture 引用此键，见装配段 icons）。
+    let icons_id = rt.declare_texture("Textures/icons.bmp").expect("声明图标集");
     let _ = rt.declare_sound("Audio/beep.wav").expect("声明演示声音");
     // 演示视频资产（S15）：用户实测 AMV 不入库 —— 用户目录有就复制进
     // Media/（gitignore 覆盖）并声明；缺失即整段跳过（音乐同口径）。
@@ -1684,14 +1972,14 @@ fn main() {
     } else {
         false
     };
-    let expected_loaded = if video_present { 9 } else { 8 };
+    let expected_loaded = if video_present { 10 } else { 9 };
     let report = rt.bind_assets();
     assert_eq!(
         report.loaded.len(),
         expected_loaded,
-        "7 纹理（5 演示 + 2 皮肤，S18）+ 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
+        "8 纹理（5 演示 + 2 皮肤 + 1 图标集，S19.6）+ 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
     );
-    assert_eq!(rt.upload_pending_textures().expect("上传"), 7);
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 8);
     if video_present {
         assert_eq!(rt.video_count(), 1, "演示视频解析入表（首帧已上 GPU）");
     }
@@ -1737,7 +2025,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -2293,6 +2581,33 @@ fn main() {
             traj_dots.push(dot);
         }
 
+        // 场景树图标精灵池（S19.6）：挂 "icons" 容器 —— walk 整子树跳过
+        //（编辑器视图件不是场景对象，同 traj/grid 纪律）。**不进 hit 护盾
+        // 也不进可选中面**：图标是纯展示精灵，三处 Sprite2D 迭代面（Tab
+        // 循环 / 点击命中 / 框选）按容器过滤掉（见 under_subtree 助手），
+        // 点击穿透到行本身 —— 由 hud_tree 的 UiVm 行点击路径结算。每枚
+        // sprite = icons.bmp 的一个 12x12 格（sheet_cols=8/sheet_rows=2
+        // + frame = 类型帧号，S16.2 子矩形采样；SPRITE_PX=16 四边形拉伸
+        // 上屏，见 ICON_CELL 注），alpha=0.9（任务规格；管线无混合 ——
+        // tint alpha 只折进 RGB 亮度，不产生半透明）。visible=false 备用
+        //（每帧投影按行序布线）；z=7 垫在场景行文本（hud_tree z 缺省 0）
+        // 之上（ICON_Z 注：轨迹点 6 同带、菜单弹层 90 / 选中框 100 之下）。
+        // 装配期 position 置屏外 —— 池内备用精灵不可见也不参与渲染裁剪
+        // 判断（visible=false 已足够，位置只是防御初值）。
+        let icons = tree.add_node(root, "icons", NodeKind::Node);
+        let mut icon_sprites = Vec::with_capacity(ICON_POOL);
+        for _ in 0..ICON_POOL {
+            let ic = tree.add_node(icons, "icon", NodeKind::Sprite2D);
+            let _ = tree.set_prop(ic, PROP_TEXTURE, Value::Resource(icons_id.get() as u64));
+            let _ = tree.set_prop(ic, "sheet_cols", Value::I64(ICON_COLS as i64));
+            let _ = tree.set_prop(ic, "sheet_rows", Value::I64(ICON_ROWS as i64));
+            let _ = tree.set_prop(ic, "alpha", Value::F32(0.9));
+            let _ = tree.set_prop(ic, "visible", Value::Bool(false));
+            tree.set_prop_raw(ic, "z_index", Value::I64(ICON_Z));
+            tree.set_local(ic, Transform2D::from_pos(-1000.0, -1000.0));
+            icon_sprites.push(ic);
+        }
+
         // 左面板标题（S12-5 Godot 命名）：与右侧 Inspector 标题同款 Label。
         // 左面板 x 恒定（MARGIN）；y = 12 + MENU_H（S19.1：菜单栏置顶后
         // 标题随面板整体下移一行 —— 恒定位置，装配期一次写定即可）。
@@ -2351,7 +2666,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -2510,6 +2825,16 @@ fn main() {
     if !ttf_active {
         log_line(&editor_log, "font: bitmap fallback (no system font)".into());
     }
+    // S19.6 图标列投影的滚动读面：UiVm 状态表的 Rc 克隆（states_rc 是
+    // &self —— 与 ui_vm_mut 的借用错峰：帧内树投影读 scrolls 时不持
+    // UiVm 借用）。hud_tree 的滚动偏移是 UiVm 瞬态（宿主零写权，读当
+    // 帧值让图标与行同步平移）。
+    let ui_states = rt.ui_vm_mut().states_rc();
+    // S19.6 图标池截断计数（诊断段数据面，nines_truncated 先例 —— 常态
+    // 恒 0）：行总数超出 ICON_POOL 的截断行数，每帧投影覆写（初值仅为
+    // 定型需要 —— 投影块每帧先于诊断段执行，初值永不被读到）。
+    #[allow(unused_assignments)]
+    let mut icons_cut: usize = 0;
     // 用户实测音乐装载（S14，nes-media 适配层实测链路；缺失只静默跳过
     // —— 文件不在仓库，CI/他机安全；解码失败记一行不阻塞 —— 带病也能
     // 跑的既有口径）。music_tracks = 实际装载成功的 (混音器键, ASCII 标签)
@@ -2669,6 +2994,15 @@ fn main() {
     let mut demo_traj_dark_before = false;
     let mut demo_traj_seen_on = false;
     let mut demo_traj_seen_off = false;
+    // S19.6 图标列取证闩锁（同款滞容口径 —— 窗内逐帧观察一次闩住）：
+    // ① obj1 行图标（frame=0 Sprite 帧号 + visible=true + 固定列位置
+    //   (10, 行顶+2)）；② cam 行图标 frame=1（第二类映射对位）；③ 容器
+    // 行（root 行，窗内）图标 visible=false（Q2 "容器无图标" 口径）；
+    // ④ 整段 Scene 行文本（前缀移除断言的取证面）。
+    let mut demo_icon_obj1: Option<(i64, bool, f32, f32)> = None;
+    let mut demo_icon_cam_frame: Option<i64> = None;
+    let mut demo_icon_container_off = false;
+    let mut demo_scene_rows_icons = String::new();
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -2988,6 +3322,58 @@ fn main() {
                 demo_traj_seen_off = true;
             }
         }
+        // S19.6 图标列取证（滞容闩锁，50..=70 静稳窗 —— F9 尚未切档
+        //（fs_focus=false，Scene 列表全高 ~75.9px，窗内行 = 0..2）、
+        // spin 已卸载、obj1 恒主选中、hud_tree 滚动为 0、无注入碰左栏）。
+        // 行序摆池：行 i 的图标 = icon_sprites[i]，按行文本 ends_with
+        // 对位（不写死行下标 —— 行数随挂载/卸载漂移，按名字找行才是稳
+        // 定的取证面）。期望几何：固定列 x = MARGIN+2 = 10；obj1 在
+        // depth 1 → 行顶 = 60+4+2*18 = 100 → 图标 y = 102。可见窗裁剪
+        //（整枚出窗即熄灭）之下容器行取 root —— 窗内行的"未点火"才是
+        // 强取证（窗外的 hud_tree 行出窗也灭，区分不出原因）。
+        if demo && (50..=70).contains(&index) && demo_icon_obj1.is_none() {
+            let tree = rt.tree_mut();
+            let rows: Vec<String> = tree
+                .prop(hud_tree, "rows")
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+                .split('\n')
+                .map(str::to_string)
+                .collect();
+            if demo_scene_rows_icons.is_empty() && !rows.is_empty() {
+                demo_scene_rows_icons = rows.join("\n");
+            }
+            let off = |n| -> (f32, f32) {
+                let t = tree.local(n).unwrap_or_default().pos;
+                (t.x, t.y)
+            };
+            let vis = |n| tree.prop(n, "visible").and_then(Value::as_bool);
+            let frame_of = |n| -> Option<i64> {
+                match tree.prop(n, "frame") {
+                    Some(Value::I64(i)) => Some(*i),
+                    _ => None,
+                }
+            };
+            for (i, line) in rows.iter().enumerate() {
+                let Some(&ic) = icon_sprites.get(i) else {
+                    break;
+                };
+                if line.ends_with("obj1") {
+                    let (x, y) = off(ic);
+                    demo_icon_obj1 = Some((frame_of(ic).unwrap_or(-1), vis(ic) == Some(true), x, y));
+                } else if line.ends_with("cam") {
+                    demo_icon_cam_frame = frame_of(ic).filter(|_| vis(ic) == Some(true));
+                } else if line.ends_with("root") {
+                    // 容器行（根 Node 无图标映射）：投影不点火。
+                    if vis(ic) == Some(false) {
+                        demo_icon_container_off = true;
+                    }
+                }
+            }
+        }
         // S19.1 菜单取证（滞容闩锁，见上方声明注）：Debug/Help 开合窗
         // （~303..~327 与 ~335..~349 两段）内弹层可见即闩"曾可见"；
         // Debug 开着窗（~303..~317）内读第一项文本（"Show Diagnostics:
@@ -3083,6 +3469,9 @@ fn main() {
                 tree.preorder()
                     .into_iter()
                     .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
+                    // S19.6：图标池精灵不是编辑对象 —— Tab 循环跳过（同下
+                    // 方点击命中/框选两处，三面一致才叫"点击穿透"）。
+                    .filter(|&n| !under_subtree(tree, n, icons))
                     .filter_map(|n| tree.uid_of(n))
                     .collect()
             };
@@ -3264,6 +3653,9 @@ fn main() {
                     .into_iter()
                     .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
                     .filter(|&n| !matches!(tree.prop(n, "visible"), Some(Value::Bool(false))))
+                    // S19.6：图标精灵纯展示 —— 点击穿透到行本身（图标列正
+                    // 压在 Scene 面板行带上，不过滤会抢走行点击的选中）。
+                    .filter(|&n| !under_subtree(tree, n, icons))
                     .map(|n| {
                         let z = tree.prop(n, "z_index")
                             .and_then(|v| if let Value::I64(i) = v { Some(*i) } else { None })
@@ -3403,6 +3795,8 @@ fn main() {
                         .into_iter()
                         .filter(|&n| tree.kind_tag(n) == Some(nes_scene::NodeKindTag::Sprite2D))
                         .filter(|&n| !matches!(tree.prop(n, "visible"), Some(Value::Bool(false))))
+                        // S19.6：框选同款穿透 —— 图标不进选中面。
+                        .filter(|&n| !under_subtree(tree, n, icons))
                         .filter(|&n| {
                             // 框选探针 = 命中盒中心：与点击命中同一盒几何
                             //（S16.5 收敛 —— sprite_hit_origin + 半格 8px；
@@ -4343,23 +4737,31 @@ fn main() {
             }
 
             // Hierarchy View：树投影 → ListView 行（前序 + 缩进 + 选中
-            // 标记 * + S19.4 类型前缀，缩进用 ASCII 空格 —— 行文本经默认
-            // 字体等宽渲染）。行→节点映射平行重建（walk 顺序即行序）：
-            // 主选中行下标与行点击回调都按这份映射结算 —— 投影与交互同
-            // 源。存活节点必有 uid（add_node 即发、walk 只访问存活节点），
-            // 行与映射严格同长同序；无"悬垂行"可言（删除即整行消失）。
+            // 标记 *，缩进用 ASCII 空格 —— 行文本经默认字体等宽渲染）。
+            // 行→节点映射平行重建（walk 顺序即行序）：主选中行下标与行
+            // 点击回调都按这份映射结算 —— 投影与交互同源。存活节点必有
+            // uid（add_node 即发、walk 只访问存活节点），行与映射严格同
+            // 长同序；无"悬垂行"可言（删除即整行消失）。
             // S12-5：walk 跳过 "grid" 容器整棵子树；S12-6 沿用同一过滤
             // 先例加 "ruler"/"dock" —— 网格/标尺/Output dock 都是观感
             // 节点不是可编辑对象，不进行列表；过滤在 walk 单点做，行
             // 文本与行→uid 映射天然同源（同一次遍历产出，映射不会被
             // 观感节点污染）。
-            // S19.4：行格式扩成 `{indent}{* 或 空格}{prefix}{name}` ——
-            // 类型前缀（kind_prefix 单点映射，Q2 字符集）只插在前缀段，
-            // 缩进/选中标记/行→uid 映射三逻辑逐位不动（行点击按映射查
-            // uid，行文本只是视图）。
+            // S19.4 曾插文本类型前缀 `{indent}{mark}{prefix}{name}`；
+            // S19.6 前缀退役（位图图标列接管类型可视化）—— 行格式改为
+            // `{gap}{indent}{mark}{name}`：首段一个空格 = 固定图标列的
+            // 让位槽（ICON_GAP 注：列表行恒位图 16px 等宽，一格刚好让出
+            // 图标右缘 26 减笔位 12 的 14px + 2px 余量）；缩进/选中标记/
+            // 行→uid 映射三逻辑逐位不动（行点击按映射查 uid，行文本只
+            // 是视图）。walk 同时收集每行类型标签（与行严格同序 —— 图标
+            // 投影按它选帧，不加第二次遍历）。
             let mut lines: Vec<String> = Vec::new();
             let mut row_map: Vec<Uid> = Vec::new();
+            let mut row_tags: Vec<Option<nes_scene::NodeKindTag>> = Vec::new();
             let sel_uids: Vec<Uid> = sel.uids().to_vec();
+            // 行/映射/标签三份平行输出 —— 参数多一位（tags），照
+            // push_nine_slice 先例显式豁免 too_many_arguments。
+            #[allow(clippy::too_many_arguments)]
             fn walk(
                 tree: &nes_scene::SceneTree,
                 id: nes_scene::NodeId,
@@ -4367,28 +4769,29 @@ fn main() {
                 sel: &[Uid],
                 out: &mut Vec<String>,
                 map: &mut Vec<Uid>,
+                tags: &mut Vec<Option<nes_scene::NodeKindTag>>,
                 skips: &[nes_scene::NodeId],
             ) {
                 if skips.contains(&id) {
-                    return; // 观感容器（网格/标尺/dock/轨迹）：整子树不进层级树。
+                    return; // 观感容器（网格/标尺/dock/轨迹/图标池）：整子树不进层级树。
                 }
                 let name = tree.name(id).unwrap_or("?");
                 let uid = tree.uid_of(id);
                 let mark = uid.as_ref().map(|u| sel.contains(u)).unwrap_or(false);
                 let indent = "  ".repeat(depth);
-                let prefix = kind_prefix(tree.kind_tag(id));
                 out.push(format!(
                     "{}{}{}{}",
+                    ICON_GAP,
                     indent,
                     if mark { "* " } else { "  " },
-                    prefix,
                     name
                 ));
+                tags.push(tree.kind_tag(id));
                 if let Some(u) = uid {
                     map.push(u);
                 }
                 for &c in tree.children(id) {
-                    walk(tree, c, depth + 1, sel, out, map, skips);
+                    walk(tree, c, depth + 1, sel, out, map, tags, skips);
                 }
             }
             // S18 起 skips 加 theme_node：主题节点是皮肤数据不是可编辑
@@ -4398,14 +4801,65 @@ fn main() {
             // 加 menubar：菜单栏与下拉弹层是壳层件（含播放组按钮 —— 按
             // 钮不是场景对象），整子树不进层级树。S19.5 起再加 traj：
             // 补间轨迹点池是视口注记（编辑器会话可视化），不是场景对象。
-            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar, traj];
-            walk(tree, tree.root(), 0, &sel_uids, &mut lines, &mut row_map, &skips);
+            // S19.6 起再加 icons：场景树图标精灵池同上 —— 纯展示件。
+            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar, traj, icons];
+            walk(
+                tree,
+                tree.root(),
+                0,
+                &sel_uids,
+                &mut lines,
+                &mut row_map,
+                &mut row_tags,
+                &skips,
+            );
             // 行文本不带尾随 '\n'（场景层 rows_count 按分隔符计数会把
             // 尾随空行当成幻影行，行点击回调的行数上限随之失真）。
             let _ = tree.set_prop(hud_tree, "rows", Value::Str(lines.join("\n")));
             // 刷新共享映射（UiVm 行点击回调在帧内按它查 uid —— 借用
             // 只持续到本语句结束，帧内回调不会撞上宿主借用）。
             *row_map_shared.borrow_mut() = row_map.clone();
+
+            // S19.6 图标列投影：行序摆池 —— 第 i 行的图标 = 池中第 i 枚
+            // 精灵（行与映射同源同序，这里再加 tags 第三份同序面）。定位
+            // = **固定图标列**：x = 面板内容左缘 + 2（不随缩进漂移 ——
+            // VS Code 图标槽风格），y = 该行 ListView 行顶 + 2。行顶算式
+            // 与渲染器列表展开冻结算式同源：`列表顶 + 4 内衬 + i×row_h
+            // − scroll`（滚动是 UiVm 瞬态，经共享面读当帧值 —— 列表滚
+            // 动时图标与行同步平移）。可见窗裁剪照 TL 进度条先例：图标
+            // 整枚滚出列表矩形即熄灭（宁可少画不画到窗外 —— 精灵无
+            // ListView 裁剪可蹭）。容器行（kind_icon_frame = None）与池
+            // 超限行不点火；超限截断数进 icons_cut（诊断段显示，照
+            // nines_truncated 先例 —— 常态恒 0）。
+            let hud_th = match tree.prop(hud_tree, PROP_CONTROL_SIZE) {
+                Some(Value::Vec2(v)) => v.y,
+                _ => 0.0, // 投影每帧先写 size —— 缺省仅防御。
+            };
+            let hud_ty = MENU_H + TOP_BAND; // 列表顶（布局投影每帧写定的恒值）。
+            let scroll = ui_states
+                .borrow()
+                .scrolls
+                .get(&hud_tree)
+                .copied()
+                .unwrap_or(0.0);
+            let list_bottom = hud_ty + hud_th;
+            for (i, &ic) in icon_sprites.iter().enumerate() {
+                let frame = kind_icon_frame(row_tags.get(i).copied().flatten());
+                let row_top = hud_ty + 4.0 + i as f32 * DOCK_ROW_H - scroll;
+                let icon_y = row_top + ICON_ROW_INSET;
+                let in_window = icon_y >= hud_ty && icon_y + 16.0 <= list_bottom;
+                match frame.filter(|_| in_window) {
+                    Some(f) => {
+                        tree.set_local(ic, Transform2D::from_pos(MARGIN + ICON_COL_INSET, icon_y));
+                        let _ = tree.set_prop(ic, "frame", Value::I64(f));
+                        let _ = tree.set_prop(ic, "visible", Value::Bool(true));
+                    }
+                    None => {
+                        let _ = tree.set_prop(ic, "visible", Value::Bool(false));
+                    }
+                }
+            }
+            icons_cut = lines.len().saturating_sub(ICON_POOL);
 
             // 选中行下标投影：主选中 uid → 行映射查找（找不到 = -1，
             // 即 schema 的无选中缺省）。与 sel_box/z_index 同款纪律：
@@ -4568,8 +5022,8 @@ fn main() {
             // 换不拼接 —— 提示是静态帮助，诊断是现态读数）。
             let diag_tail = move || {
                 format!(
-                    "| diag underruns:{} faults:{} ext:{}",
-                    underruns, ext_faults, ext_count
+                    "| diag underruns:{} faults:{} ext:{} icons_cut:{}",
+                    underruns, ext_faults, ext_count, icons_cut
                 )
             };
             let st = if play.playing {
@@ -5227,10 +5681,13 @@ fn main() {
             "卸载 = registry_key 回空串"
         );
         assert_eq!(tree.prop(kids[0], "enabled"), Some(&Value::Bool(false)));
-        // S19.4：Scene 行类型前缀取证（walk 投影行文本 —— 每类前缀逐个
-        // 对位）+ 容器行无前缀 + traj 容器整子树不进层级树（观感纪律同
-        // grid/ruler/dock —— walk skips 生效面）。行点击交互走行→uid
-        // 映射不读文本，前缀只进视图（选中标记/缩进/映射逻辑零改动）。
+        // S19.6：Scene 行真图标取证 —— S19.4 的文本前缀 `[S] ` 等已退役
+        //（行文本不含任何前缀段、名字完好），类型可视化改由图标列承载：
+        // obj1 行图标点亮且 frame=0（Sprite 帧号）+ 固定列位置
+        // (10, 行顶+2)；cam 行图标 frame=1（第二类映射对位）；容器行
+        //（hud_tree，无图标映射）不点火；traj/icons 容器整子树不进层级
+        // 树（walk skips 生效面）。行点击交互走行→uid 映射不读文本，
+        // 图标精灵已被三处 Sprite2D 迭代面过滤（点击穿透到行）。
         let scene_rows = tree
             .prop(hud_tree, "rows")
             .and_then(|v| match v {
@@ -5238,24 +5695,38 @@ fn main() {
                 _ => None,
             })
             .unwrap_or_default();
-        assert!(scene_rows.contains("[S] obj1"), "Scene 行缺 Sprite2D 前缀：{scene_rows:?}");
-        assert!(scene_rows.contains("[C] cam"), "Scene 行缺 Camera2D 前缀：{scene_rows:?}");
-        assert!(scene_rows.contains("[J] spin"), "Scene 行缺 Script 前缀：{scene_rows:?}");
-        assert!(
-            scene_rows.contains("[X] name_input"),
-            "Scene 行缺 TextInput 前缀：{scene_rows:?}"
-        );
-        assert!(
-            scene_rows.contains("[T] hud_scene"),
-            "Scene 行缺 Label 前缀：{scene_rows:?}"
-        );
+        for mark in ["[S]", "[C]", "[T]", "[B]", "[X]", "[J]", "[H]"] {
+            assert!(
+                !scene_rows.contains(mark),
+                "Scene 行残留 {mark} 文本前缀（S19.6 应已退役）：{scene_rows:?}"
+            );
+        }
+        assert!(scene_rows.contains("obj1"), "Scene 行缺 obj1 名字：{scene_rows:?}");
         assert!(
             scene_rows.contains("    hud_tree"),
-            "容器行（ListView）不应带前缀（行文本 = 缩进+标记+名字）：{scene_rows:?}"
+            "容器行（ListView）行格式异常（应为 gap+缩进+标记+名字）：{scene_rows:?}"
         );
         assert!(
-            !scene_rows.contains("traj"),
-            "traj 容器漏进层级树（walk skips 失效）：{scene_rows:?}"
+            !scene_rows.contains("traj") && !scene_rows.contains("icons"),
+            "traj/icons 容器漏进层级树（walk skips 失效）：{scene_rows:?}"
+        );
+        let Some((obj1_frame, obj1_vis, obj1_ix, obj1_iy)) = demo_icon_obj1 else {
+            panic!("S19.6 未闩到 obj1 行图标取证：{lines:?}")
+        };
+        assert_eq!(obj1_frame, 0, "obj1 行图标 frame 应为 Sprite 帧号 0");
+        assert!(obj1_vis, "obj1 行图标未点亮");
+        assert!(
+            (obj1_ix - (8.0 + 2.0)).abs() < 0.5 && (obj1_iy - (60.0 + 4.0 + 2.0 * 18.0 + 2.0)).abs() < 0.5,
+            "obj1 行图标应钉在固定列 (10, 102)（实际 ({obj1_ix}, {obj1_iy}) —— 行顶算式 60+4+2*18）"
+        );
+        assert_eq!(
+            demo_icon_cam_frame,
+            Some(1),
+            "cam 行图标 frame 应为 Camera 帧号 1（未闩到 = 图标未点亮）"
+        );
+        assert!(
+            demo_icon_container_off,
+            "容器行（root，窗内）图标应熄灭（Q2 容器无图标口径）：{demo_scene_rows_icons:?}"
         );
         // S19.1 收尾互证：菜单外点收起不产生编辑动作 —— obj1 仍是主选
         // 中（若第一击漏进编辑路径，视口空白点击会清空 Selection）。
@@ -5269,8 +5740,8 @@ fn main() {
                 "menu outside-click must not change selection (got {prim:?})"
             );
         }
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.4 类型标记与 S19.5 轨迹三态冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.5 轨迹三态与 S19.6 真图标集冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
 }
