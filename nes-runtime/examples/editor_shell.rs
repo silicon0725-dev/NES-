@@ -366,35 +366,6 @@
 //!    条带/标尺刻度与数字/轨迹点/选中框）运行态 visible=false 退场，
 //!    STOP/RESET 重应用编辑视图后投影自然复燃（无残留）。
 //!
-//! S20.2（**舞台边界三件套**，用户观察"物体可拖出场景无限制/无提示"的
-//! 完整回应）：编辑器常量舞台矩形 [`STAGE`] = (0,0,768,432)（世界坐标；
-//! 与引擎基准设计分辨率同源 —— 装配开窗 OPEN_CLIENT 同值；未来场景化
-//! 配置归后续）。三件：
-//!
-//! ① **边界可视化（常显，编辑态）**：舞台矩形 1px accent 描框 —— 4 条
-//!    细 Control（照网格条带池的屏上几何换算：世界角 → world_to_screen
-//!    → 屏上条带，[`stage_border_rects`] 纯函数单点出几何），每条边线
-//!    在可视域内才点亮、沿长度被可视域裁剪（描框永不画到面板/菜单带
-//!    上）；编辑态显示、运行态隐藏（照 S20.1 gizmo 退场门）。
-//! ② **场景外变暗（编辑态）**：4 条深色实心条带覆盖"可视域 − 舞台矩
-//!    形"（[`stage_dim_rects`] 纯函数 —— 屏上几何由 world_to_screen(舞
-//!    台角) 与可视域裁剪计算，舞台离屏时条带覆盖整个可视域）；色 = 主
-//!    题 bg 加深档（查证 PALETTE 八槽位无 darker 槽 —— 用 bg×0.6 的预
-//!    计算常量 [`STAGE_DIM_RGB`] 生成纯色纹理，走 S18 九宫格皮肤通道
-//!    上屏）。**z 序**：变暗/描框用 z=8 —— 盖住精灵（0）/选中高亮（5）
-//!    /轨迹点（6）/图标列（7），被菜单弹层（90）/选中框（100）盖回；
-//!    条带几何被可视域裁剪，与负 z 面板带（-100..-60）零几何重叠。
-//!    运行态隐藏（同①门）。
-//! ③ **拖拽钳制（默认开，可关）**：`clamp_enabled` 会话态（默认
-//!    [`CLAMP_DEFAULT`] = true —— 用户直觉：拖出场景=不对）；生效点 =
-//!    gizmo 拖拽落笔处（写位路径单点）：`pos = clamp(pos, (STAGE.x0,
-//!    STAGE.y0), (STAGE.x0+STAGE.w-16, STAGE.y0+STAGE.h-16))`（16px 精
-//!    灵基准格 —— 节点 origin 钳在舞台内减一格，[`clamp_to_stage`] 纯
-//!    函数）。开关：工具栏 `CLAMP` 按钮（照 GRID* 模式，* = ON）+
-//!    Project 菜单镜像项（菜单化既有行为）。**只钳 gizmo 拖拽**：方向
-//!    键移动 / Inspector 数值输入不钳（精确输入是故意的 —— 文档裁决）；
-//!    CLAMP 关 = 自由拖拽（Godot 对齐：舞台边界只是参考线不是墙）。
-//!
 //! 运行：`cargo run --example editor_shell`
 
 use std::cell::RefCell;
@@ -524,13 +495,10 @@ mod editor_theme {
     /// 下拉项池上限（四菜单最长 Scene 3 项 + 1 备用 —— 控件数恒定有界，
     /// 照网格/标尺/进度条池纪律）。
     pub const MENU_ITEM_POOL: usize = 4;
-    /// 工具栏按钮尺寸与步进。S20.2 起步进 50（原 52）：编辑开关组从三
-    /// 键扩成四键（SEL/SNAP/GRID/CLAMP），最小窗 768 的工具带宽 374px
-    /// 下 4×48 + 3×2 + 左缝 4 = 202px，与右端缩放组（172px）恰好无重叠
-    /// —— 202 + 172 = 374 = 带宽（0 余量，组间以底板边缘为界）。
+    /// 工具栏按钮尺寸与步进。
     pub const TOOLBAR_BTN_W: f32 = 48.0;
     pub const TOOLBAR_BTN_H: f32 = 20.0;
-    pub const TOOLBAR_BTN_STEP: f32 = 50.0;
+    pub const TOOLBAR_BTN_STEP: f32 = 52.0;
 
     // ---- 行高三档（位图标题行 / 列表行 / 真字体行，S12-11 口径）----
     /// Inspector 真字体行步进。
@@ -719,14 +687,11 @@ fn load_user_music(
 /// 切换，既有断言行的窗口余量照旧保住。S15 起 29 行：视频接入再加
 /// 2 行（video on / video stopped）+ 1 行 F9 分割切换（Media/ 目录把
 /// spin.nes 挤出 fs 可见窗 —— 冒烟先切 files 档再加双击，见注入段），
-/// 余量口径不变。S19.1 起 48 行：菜单帮助表（Shortcut Table，S20.2 起
-/// 11 行）加菜单操作行（开合/诊断/清单，约 6 行）再进 —— 既有断言行
+/// 余量口径不变。S19.1 起 48 行：菜单帮助表（Shortcut Table，S20 起
+/// 10 行）加菜单操作行（开合/诊断/清单，约 6 行）再进 —— 既有断言行
 /// （约 30 行）与音乐/扩展行的窗口余量照旧保住。S20 再加保存行 1 行
-///（Ctrl+S 演示），余量同窗保住。S20.2 起 72 行：舞台段再加 ~13 行
-///（sel obj2 / 钳制与自由两次 move 落行 / tool clamp off / undo ×2 /
-/// 第二 PLAY 窗的 snapshot/audio/video/play/stop 系）—— 最早断言行
-///（"cand spin.nes"）的窗口余量照旧保住。
-const EDITOR_LOG_KEEP: usize = 72;
+///（Ctrl+S 演示），余量同窗保住。
+const EDITOR_LOG_KEEP: usize = 48;
 /// dock 行显示截宽（字符数）：Output dock 是 ListView 行（ListState
 /// **位图路径**，S12-11 壳层接入不改 —— 见模块头），等宽 advance=16
 /// 不随真字体装载变化，40 字 × 16px = 640px，最小窗 768 下 dock 内衬
@@ -1054,8 +1019,7 @@ const MENUS: [&str; 4] = ["Scene", "Project", "Debug", "Help"];
 
 /// Help > Shortcut Table 的 Output 输出（全 ASCII —— 冒烟按行断言）。
 /// 快捷键与既有实现逐一对应（见模块头操作注），菜单化不改键位。
-/// S20.2 加舞台行（钳制开关双入口 + 舞台常量）。
-const SHORTCUT_TABLE: [&str; 11] = [
+const SHORTCUT_TABLE: [&str; 10] = [
     "shortcut table (editor):",
     "F5=play/restart  Shift+F5=stop",
     "F6=candidate  F7=groups  F8=scan  F9=split",
@@ -1066,28 +1030,19 @@ const SHORTCUT_TABLE: [&str; 11] = [
     "Wheel=zoom to cursor  MidDrag=pan  Ctrl+S=save",
     "menu: click item / click elsewhere to close",
     "shortcuts unchanged by menu (visual entry only)",
-    "stage 768x432  drag clamp: CLAMP btn / Project",
 ];
 
-/// 下拉项文本表（每帧投影取用；音频/诊断/钳制三项带现态后缀 —— 显示
-/// 当前态是会话态投影，不进树）。P0 语义：
+/// 下拉项文本表（每帧投影取用；音频/诊断两项带现态后缀 —— 显示当前
+/// 态是会话态投影，不进树）。P0 语义：
 /// - Scene/New|Save：无既有能力，点击如实报 "not in beta"；
 /// - Scene/Load：切 F9 files 档（既有行为），提示用 FileSystem dock；
 /// - Project/Audio：open_audio 幂等开（无关闭 API —— On 态点击只报
 ///   一行，见执行处；如实）；
 /// - Project/Extensions：点击 Output 列已装载清单（宿主装载时收集）；
-/// - Project/Stage Clamp：舞台钳制开关镜像项（S20.2 —— 与工具栏 CLAMP
-///   同一会话态翻转，菜单化既有行为）；
 /// - Debug/Diagnostics：状态栏诊断段开关（underruns/extension_faults/
 ///   扩展数 —— 运行时读面可达，已接线）；
 /// - Help/Shortcut Table：Output 打印快捷键表（[`SHORTCUT_TABLE`]）。
-fn menu_items(
-    m: usize,
-    audio_on: bool,
-    diag_on: bool,
-    ext_count: usize,
-    clamp_on: bool,
-) -> Vec<String> {
+fn menu_items(m: usize, audio_on: bool, diag_on: bool, ext_count: usize) -> Vec<String> {
     match m {
         0 => vec![
             "New Scene".into(),
@@ -1097,7 +1052,6 @@ fn menu_items(
         1 => vec![
             format!("Audio: {}", if audio_on { "On" } else { "Off" }),
             format!("Extensions: {ext_count} loaded"),
-            format!("Stage Clamp: {}", if clamp_on { "On" } else { "Off" }),
         ],
         2 => vec![format!(
             "Show Diagnostics: {}",
@@ -1234,116 +1188,6 @@ const SCENE_SAVE_REL: &str = "Scenes/editor_shell.ron";
 /// 工具栏缩放百分比文本宽（"100%"/"800%" 位图回退 5 字 ×16 = 80px
 /// 预算按最宽取；真字体 14px 更窄 —— 截断预算按位图回退取界）。
 const ZOOM_LABEL_W: f32 = 64.0;
-
-// ---- S20.2 舞台边界三件套（会话态常量 + 舞台几何）----
-
-/// 舞台矩形（世界坐标，`(x0, y0, w, h)`）：编辑器常量 (0,0,768,432) ——
-/// 与引擎基准设计分辨率同源（装配开窗 [`OPEN_CLIENT`] 768×432 同值，
-/// 默认视图下舞台恰铺满窗口）。未来按场景/项目设置配置舞台尺寸归后续
-/// 里程碑（文档裁决：P0 单一常量，单一出口）。
-const STAGE: (f32, f32, f32, f32) = (0.0, 0.0, 768.0, 432.0);
-/// 精灵基准格边长（世界单位）：与引擎命中盒/SPRITE_PX=16 同源 —— 钳制
-/// 公式"节点 origin 钳在舞台内减一格"的一格。
-const STAGE_CELL: f32 = 16.0;
-/// 舞台描框条带池（顶/底/左/右 4 条 1px —— 控件数恒定有界，照
-/// GRID_POOL/TRAJ_POOL 纪律）。
-const STAGE_BORDER_POOL: usize = 4;
-/// 舞台变暗条带池（上/下/左/右 4 条 —— 同上）。
-const STAGE_DIM_POOL: usize = 4;
-/// 舞台注记 z_index（set_prop_raw 前向通道）：**变暗与描框同带 z=8**
-/// —— 查证现有 z 阶表后的裁决：精灵缺省 0、选中高亮 5、轨迹点 6、图
-/// 标列 7 **之上**（场景外变暗盖住一切场景内容，含轨迹/图标注记）；
-/// 菜单弹层 90 / 选中框 100 **之下**（永不盖编辑器顶层覆盖件）。负 z
-/// 面板带（网格 -100/标尺 -90/dock -80/工具栏 -70/fs -60）在 z 序上低
-/// 于本带，但条带几何被可视域裁剪（[`stage_border_rects`]/
-/// [`stage_dim_rects`] 只在可编辑区矩形内出几何），与面板带零几何重叠
-/// —— 面板不受影响，z 序表详见 S20.2 文档。
-const STAGE_ANNOT_Z: i64 = 8;
-/// 变暗色 = 主题 bg 加深档。**查证**：[`PALETTE`] 八槽位（bg/panel/
-/// border/text/text_dim/selected/accent/danger）无 darker 槽，且 nes-
-/// scene `THEME_SLOTS` 是封闭八槽位契约（不扩槽位）—— 故取 bg
-/// (20,22,26) × 0.6 的**预计算常量** (12,13,16)（四舍五入），代码生成
-/// 纯色纹理走 S18 九宫格皮肤通道上屏（`ns_modulate=false` 成品绝对色
-/// —— panel_skin 同一路）。
-const STAGE_DIM_RGB: [u8; 3] = [12, 13, 16];
-/// 拖拽钳制默认值：**开**（用户直觉：拖出场景=不对；CLAMP 关 = 自由
-/// 拖拽 —— Godot 对齐，舞台边界只是参考线不是墙）。会话态，不进树、
-/// 不进指纹（CLAMP 只影响 gizmo 落笔 —— 拖拽本身就是会话编辑）。
-const CLAMP_DEFAULT: bool = true;
-
-/// S20.2 gizmo 拖拽落笔的舞台钳制（纯函数，T-SB-01 单元测试面）：节点
-/// origin（16px 精灵基准格左上角）钳在舞台内减一格 ——
-/// `pos = clamp(pos, (STAGE.x0, STAGE.y0), (STAGE.x0+STAGE.w-STAGE_CELL,
-/// STAGE.y0+STAGE.h-STAGE_CELL))`。`enabled=false` 原值直通（自由拖拽
-/// —— Godot 对齐）。**只作用于 gizmo 拖拽落笔**：方向键移动/Inspector
-/// 数值输入不经过此函数（精确输入是故意的 —— 文档裁决）。
-fn clamp_to_stage(pos: (f32, f32), enabled: bool) -> (f32, f32) {
-    if !enabled {
-        return pos;
-    }
-    let (x0, y0, w, h) = STAGE;
-    (
-        pos.0.clamp(x0, x0 + w - STAGE_CELL),
-        pos.1.clamp(y0, y0 + h - STAGE_CELL),
-    )
-}
-
-/// 屏上条带矩形（Option = None 不可见）。
-type StripRect = Option<(f32, f32, f32, f32)>;
-
-/// S20.2 舞台描框屏上几何（纯函数，T-SB-02 单元测试面）：输入 = 舞台
-/// 对角世界角的屏幕位（world_to_screen 换算）+ 可视域矩形。返回顶/底/
-/// 左/右 4 条 1px 描框条带 —— 每条边线在可视域内才可见（不画到面板/
-/// 菜单带上），沿长度被可视域裁剪；1px 落在舞台内侧（底/右取 sy1-1/
-/// sx1-1 —— 描框标记舞台矩形本体）。
-fn stage_border_rects(
-    (sx0, sy0): (f32, f32),
-    (sx1, sy1): (f32, f32),
-    (vx0, vy0, vx1, vy1): (f32, f32, f32, f32),
-) -> [StripRect; 4] {
-    let ax0 = sx0.max(vx0);
-    let ax1 = sx1.min(vx1);
-    let ay0 = sy0.max(vy0);
-    let ay1 = sy1.min(vy1);
-    let top = (sy0 >= vy0 && sy0 < vy1 && ax1 > ax0).then_some((ax0, sy0, ax1 - ax0, 1.0));
-    let bottom =
-        (sy1 > vy0 && sy1 <= vy1 && ax1 > ax0).then_some((ax0, sy1 - 1.0, ax1 - ax0, 1.0));
-    let left = (sx0 >= vx0 && sx0 < vx1 && ay1 > ay0).then_some((sx0, ay0, 1.0, ay1 - ay0));
-    let right = (sx1 > vx0 && sx1 <= vx1 && ay1 > ay0).then_some((sx1 - 1.0, ay0, 1.0, ay1 - ay0));
-    [top, bottom, left, right]
-}
-
-/// S20.2 场景外变暗屏上几何（纯函数，T-SB-02 单元测试面）：4 条实心
-/// 条带覆盖"可视域 − 舞台矩形"——舞台角屏幕位先钳进可视域，再按上/下/
-/// 左/右四向补集出条带（左/右条带纵向只补到舞台纵向跨度 —— 上下条带
-/// 已盖住角落，几何不重叠）。**舞台离屏时条带覆盖整个可视域**（钳制把
-/// 舞台角压到可视域边缘，某一向补集 = 整域）；舞台全含可视域时四条全
-/// 隐（默认视图的干净常态）。
-fn stage_dim_rects(
-    (sx0, sy0): (f32, f32),
-    (sx1, sy1): (f32, f32),
-    (vx0, vy0, vx1, vy1): (f32, f32, f32, f32),
-) -> [StripRect; 4] {
-    let cx0 = sx0.clamp(vx0, vx1);
-    let cy0 = sy0.clamp(vy0, vy1);
-    let cx1 = sx1.clamp(vx0, vx1);
-    let cy1 = sy1.clamp(vy0, vy1);
-    let top = (cy0 - vy0 > 0.0).then_some((vx0, vy0, vx1 - vx0, cy0 - vy0));
-    let bottom = (vy1 - cy1 > 0.0).then_some((vx0, cy1, vx1 - vx0, vy1 - cy1));
-    let left = (cx0 - vx0 > 0.0 && cy1 > cy0).then_some((vx0, cy0, cx0 - vx0, cy1 - cy0));
-    let right = (vx1 - cx1 > 0.0 && cy1 > cy0).then_some((cx1, cy0, vx1 - cx1, cy1 - cy0));
-    [top, bottom, left, right]
-}
-
-/// 开关按钮文本（单点出口，T-SB-03 单元测试面）：`*` 后缀 = ON ——
-/// SEL/SNAP/GRID/CLAMP 工具栏开关同款口径（投影每帧按会话态重写）。
-fn toggle_text(name: &str, on: bool) -> String {
-    if on {
-        format!("{name}*")
-    } else {
-        name.to_string()
-    }
-}
 
 /// IME 光标 x 偏移（S12-11 第 2 期，**真字宽累加**）：草稿前 `caret`
 /// 个字符的逐字 advance 之和。算式与渲染器 `push_ttf_label` 的光标条
@@ -2498,21 +2342,6 @@ fn main() {
         )
         .expect("写图标集");
     }
-    // S20.2 舞台变暗纹理（"可视域 − 舞台"深色条带的色源）：16×16 纯色
-    //（主题 bg×0.6 预计算常量，见 STAGE_DIM_RGB 注 —— PALETTE 无
-    // darker 槽的裁决），缺了再写（icons/panel_skin 同一家法）。上屏走
-    // 九宫格通道 1px 边距（nine_slice_of "至少一条 > 0" 启用判据 ——
-    // 纯色纹理下 1px 边距与实心填充逐像素同观感）。
-    let stage_dim_bmp = tex.join("stage_dim.bmp");
-    if !stage_dim_bmp.exists() {
-        write_bmp_rgba(
-            &stage_dim_bmp,
-            16,
-            16,
-            &solid_rgba(STAGE_DIM_RGB[0], STAGE_DIM_RGB[1], STAGE_DIM_RGB[2]),
-        )
-        .expect("写舞台变暗纹理");
-    }
     // 演示声音资产（S13 第 2 期）：440Hz / 250ms，缺了再写（bmp 同口径）。
     let audio_dir = assets.join("Audio");
     std::fs::create_dir_all(&audio_dir).unwrap();
@@ -2538,8 +2367,6 @@ fn main() {
     let button_skin_id = rt.declare_texture("Textures/button_skin.bmp").expect("声明按钮皮肤");
     // S19.6 图标集声明（图标精灵池 texture 引用此键，见装配段 icons）。
     let icons_id = rt.declare_texture("Textures/icons.bmp").expect("声明图标集");
-    // S20.2 舞台变暗纹理声明（变暗条带 ns_tex 引用此键，见装配段 stage）。
-    let stage_dim_id = rt.declare_texture("Textures/stage_dim.bmp").expect("声明舞台变暗纹理");
     let _ = rt.declare_sound("Audio/beep.wav").expect("声明演示声音");
     // 演示视频资产（S15）：用户实测 AMV 不入库 —— 用户目录有就复制进
     // Media/（gitignore 覆盖）并声明；缺失即整段跳过（音乐同口径）。
@@ -2556,14 +2383,14 @@ fn main() {
     } else {
         false
     };
-    let expected_loaded = if video_present { 11 } else { 10 };
+    let expected_loaded = if video_present { 10 } else { 9 };
     let report = rt.bind_assets();
     assert_eq!(
         report.loaded.len(),
         expected_loaded,
-        "9 纹理（5 演示 + 2 皮肤 + 1 图标集 + 1 舞台变暗，S20.2）+ 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
+        "8 纹理（5 演示 + 2 皮肤 + 1 图标集，S19.6）+ 1 声音（S13）+ 1 视频（S15，在场时）：{report:?}"
     );
-    assert_eq!(rt.upload_pending_textures().expect("上传"), 9);
+    assert_eq!(rt.upload_pending_textures().expect("上传"), 8);
     if video_present {
         assert_eq!(rt.video_count(), 1, "演示视频解析入表（首帧已上 GPU）");
     }
@@ -2609,7 +2436,7 @@ fn main() {
     }
 
     // 编辑目标场景（自建 —— 编辑器也可以加载任意场景文件）。
-    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_clamp, tool_zoom_out, tool_zoom_in, zoom_label, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, stage, stage_borders, stage_dims, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
+    let (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_zoom_out, tool_zoom_in, zoom_label, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig) = {
         let tree = rt.tree_mut();
         let root = tree.root();
         // S18：主题节点（"主题即场景节点"，nes-scene/ui.rs 既有机制 ——
@@ -3031,9 +2858,8 @@ fn main() {
         let _ = tree.set_prop(tool_sep, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(380.0, 1.0)));
         let _ = tree.set_prop(tool_sep, "fill_slot", Value::Str(SLOT_BORDER_NAME.into()));
         tree.set_prop_raw(tool_sep, "z_index", Value::I64(-70));
-        // S18 换肤：按钮九宫格底板 × 9（编辑四键 + 播放组三键 + S20 缩放
-        // 两键 —— 与按钮一一配对；S20.2 编辑组从三键扩成四键，池随之
-        // +1，槽位分配：0..4 编辑 / 4..7 播放组 / 7..9 缩放）。egui
+        // S18 换肤：按钮九宫格底板 × 8（编辑三键 + 播放组三键 + S20 缩放
+        // 两键 —— 与按钮一一配对）。egui
         // `weak_bg_fill`/`bg_fill` 区分（DESIGN-NOTES §1.4）的壳层版：
         // 底板有底（按钮皮肤纹理，绝对色 bevel-up），按钮本体 fill 走
         // 透明（fill_slot 置空串 —— themed/button 槽解析对空名不覆盖，
@@ -3043,8 +2869,8 @@ fn main() {
         // = 强反馈。三态观感：正常 = 纹理 + border 槽框；悬停 = 纹理 +
         // accent 框；按下 = accent 填充 + accent 框。offset 装配期占位，
         // 每帧布局投影随按钮同步重写（见循环内 tool_btns/tool_plates）。
-        let mut tool_plates = Vec::with_capacity(9);
-        for i in 0..9 {
+        let mut tool_plates = Vec::with_capacity(8);
+        for i in 0..8 {
             let plate = tree.add_node(toolbar, "tool_plate", NodeKind::Control);
             let _ = tree.set_prop(plate, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
             let _ = tree.set_prop(plate, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(
@@ -3085,23 +2911,11 @@ fn main() {
         // S12-11：按钮字号 14（16px 真字体下 "RESET" 溢出 48px 按钮宽；见 UI_FONT_SIZE 注）。
         tree.set_prop_raw(tool_grid, "font_size", Value::I64(UI_FONT_SIZE));
         tree.set_prop_raw(tool_grid, "fill_slot", Value::Str(String::new()));
-        // S20.2 舞台钳制开关（照 GRID* 模式：文本后缀 * = ON；会话态
-        // clamp_enabled 默认开 —— 见 CLAMP_DEFAULT 注与装配段会话态）。
-        // 装配期 offset 占位同缩放两键，每帧布局投影按步进布线。
-        let tool_clamp = tree.add_node(toolbar, "tool_clamp", NodeKind::Button);
-        let _ = tree.set_prop(tool_clamp, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
-        let _ = tree.set_prop(tool_clamp, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-1000.0, -1000.0)));
-        let _ = tree.set_prop(tool_clamp, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(TOOLBAR_BTN_W, TOOLBAR_BTN_H)));
-        let _ = tree.set_prop(tool_clamp, "text", Value::Str("CLAMP".into()));
-        // 字号 14 + 透明底（与编辑三键逐位同源）。
-        tree.set_prop_raw(tool_clamp, "font_size", Value::I64(UI_FONT_SIZE));
-        tree.set_prop_raw(tool_clamp, "fill_slot", Value::Str(String::new()));
         // S20 工具栏缩放 UI（Godot 观感）：工具带右端 `[-] 100% [+]` ——
         // ± 以视口中心缩放一档（ZOOM_STEP 步进 clamp），百分比文本实时
-        // 显示（会话态投影，不进树）。与 SEL/SNAP/GRID/CLAMP 并存（左
-        // 四键右缩放组 —— 最小窗 768 下左组 202px + 右组 172px =
-        // 带宽 374px 恰好无重叠，步进 50 见 TOOLBAR_BTN_STEP 注）。
-        // 底板用 tool_plates 池第 8/9 槽。
+        // 显示（会话态投影，不进树）。与 SEL/SNAP/GRID 并存（左三键右
+        // 缩放组 —— 最小窗 768 下 156px + 172px < 带宽 374px 不重叠）。
+        // 底板用 tool_plates 池第 7/8 槽。
         let tool_zoom_out = tree.add_node(toolbar, "tool_zoom_out", NodeKind::Button);
         let _ = tree.set_prop(tool_zoom_out, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
         let _ = tree.set_prop(tool_zoom_out, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::new(-1000.0, -1000.0)));
@@ -3230,50 +3044,6 @@ fn main() {
             icon_sprites.push(ic);
         }
 
-        // S20.2 舞台边界注记池：挂 "stage" 容器 —— walk 整子树跳过（编
-        // 辑器注记不是场景对象，同 grid/traj/icons 纪律）；**不进 hit
-        // 护盾**（照 grid 先例 —— 注记不拦编辑点击：舞台外的精灵照常可
-        // 选可拖）。两组池：先建**变暗** 4 条（"可视域 − 舞台"深色实心，
-        // 色源 = stage_dim.bmp 纯色纹理走九宫格通道、1px 边距过启用判
-        // 据、ns_modulate=false 成品绝对色）、后建**描框** 4 条（1px
-        // accent）—— 同 z（STAGE_ANNOT_Z=8）下后序在上，共享边缘行由描
-        // 框胜出（界线保持 accent 色）。visible=false 备用（每帧投影按
-        // [`stage_border_rects`]/[`stage_dim_rects`] 布线，编辑态点亮、
-        // 运行态整池熄灭 —— 照 S20.1 gizmo 退场门）。
-        let stage = tree.add_node(root, "stage", NodeKind::Node);
-        let mk_stage_strip = |tree: &mut nes_scene::SceneTree, name: &str, dim: bool| {
-            let n = tree.add_node(stage, name, NodeKind::Control);
-            let _ = tree.set_prop(n, PROP_CONTROL_ANCHOR, Value::Vec2(nes_scene::Vec2::ZERO));
-            let _ = tree.set_prop(n, PROP_CONTROL_OFFSET, Value::Vec2(nes_scene::Vec2::ZERO));
-            let _ = tree.set_prop(n, PROP_CONTROL_SIZE, Value::Vec2(nes_scene::Vec2::new(1.0, 1.0)));
-            if dim {
-                // 变暗条带：九宫格纯色纹理（fill_slot 置空 = 透明底兜底
-                // —— 九宫格未启用时什么也不画，防御路径照按钮口径）。
-                let _ = tree.set_prop(n, "fill_slot", Value::Str(String::new()));
-                tree.set_prop_raw(n, PROP_NS_TEX, Value::Resource(stage_dim_id.get() as u64));
-                for p in [PROP_NS_L, PROP_NS_T, PROP_NS_R, PROP_NS_B] {
-                    tree.set_prop_raw(n, p, Value::I64(1));
-                }
-                tree.set_prop_raw(n, PROP_NS_MODULATE, Value::Bool(false));
-                tree.set_prop_raw(n, PROP_NS_TILING, Value::Bool(false));
-            } else {
-                // 描框条带：accent 槽 1px 细条（照网格条带 fill 通道）。
-                let _ = tree.set_prop(n, "fill_slot", Value::Str(SLOT_ACCENT_NAME.into()));
-            }
-            let _ = tree.set_prop(n, "visible", Value::Bool(false));
-            tree.set_prop_raw(n, "z_index", Value::I64(STAGE_ANNOT_Z));
-            n
-        };
-        // 变暗池在前（下）、描框池在后（上）—— 树序即同 z 绘制序。
-        let mut stage_dims = Vec::with_capacity(STAGE_DIM_POOL);
-        for _ in 0..STAGE_DIM_POOL {
-            stage_dims.push(mk_stage_strip(tree, "stage_dim", true));
-        }
-        let mut stage_borders = Vec::with_capacity(STAGE_BORDER_POOL);
-        for _ in 0..STAGE_BORDER_POOL {
-            stage_borders.push(mk_stage_strip(tree, "stage_border", false));
-        }
-
         // 左面板标题（S12-5 Godot 命名）：与右侧 Inspector 标题同款 Label。
         // 左面板 x 恒定（MARGIN）；y = 12 + MENU_H（S19.1：菜单栏置顶后
         // 标题随面板整体下移一行 —— 恒定位置，装配期一次写定即可）。
@@ -3332,7 +3102,7 @@ fn main() {
         let _ = tree.set_prop(ins_script, PROP_LABEL_TEXT, Value::Str(String::new()));
         let _ = tree.set_prop(ins_script, "font_size", Value::I64(UI_FONT_SIZE));
         tree.apply_pending();
-        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_clamp, tool_zoom_out, tool_zoom_in, zoom_label, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, stage, stage_borders, stage_dims, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
+        (grid, grid_bars, ruler, ruler_h, ruler_v, ruler_corner, ruler_ticks, ruler_labels, dock, dock_bg, dock_title, hud_dock, toolbar, tool_bg, tool_sep, theme_node, tool_plates, tool_sel, tool_snap, tool_grid, tool_zoom_out, tool_zoom_in, zoom_label, tool_play, tool_stop, tool_reset, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, ins_script, cam, obj1, obj2, obj3, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels, tab_output, tab_signals, tab_plate_out, tab_plate_sig)
     };
     let _ = (obj1, obj2, obj3);
 
@@ -3378,9 +3148,6 @@ fn main() {
     let mut tool_sel_on = true;
     let mut tool_snap_on = false;
     let mut tool_grid_on = true;
-    // S20.2 舞台钳制开关（会话态，默认开 —— CLAMP_DEFAULT 裁决见常量
-    // 注；只影响 gizmo 拖拽落笔，不进树、不进指纹）。
-    let mut clamp_enabled = CLAMP_DEFAULT;
     let mut title_rows: Vec<(f32, f32, usize)> = Vec::new();
     // 文件系统 dock 会话态（S12-8，不进树、不落盘）：选中行（None =
     // 无选中，投影 -1）、F9 两档分割的焦点段（false = Scene 占大头）、
@@ -3597,8 +3364,6 @@ fn main() {
             (tool_sel, "sel"),
             (tool_snap, "snap"),
             (tool_grid, "grid"),
-            // S20.2：舞台钳制开关（编辑态专属 —— 运行态静默忽略）。
-            (tool_clamp, "clamp"),
             // S20：工具栏缩放两键（编辑态专属 —— 运行态静默忽略）。
             (tool_zoom_out, "zoom_out"),
             (tool_zoom_in, "zoom_in"),
@@ -3707,21 +3472,6 @@ fn main() {
     let mut demo_grid_dark_play = false;
     let mut demo_selbox_hidden_play = false;
     let mut demo_grid_back_after_stop = false;
-    // S20.2 舞台边界三件套取证闩锁（滞容口径，窗见循环内注）：①S20 段
-    // 收尾帧（416 —— 410 注入流尾之后、426 舞台段平移之前）闩编辑相机
-    //（center/zoom —— 尾段平移/缩放会让 rig.cam 漂移，终局断言改读闩锁
-    // 值）；②CLAMP 开拖拽后 obj2 位 == 钳制值（精确端点）；③CLAMP 关
-    // 拖拽后 obj2 位远超舞台（自由值）；④CLAMP 按钮文本翻面（CLAMP* →
-    // CLAMP）；⑤舞台描框/变暗条带树读面（编辑态 ≥1 描框 + ≥1 变暗点
-    // 亮；PLAY 窗内整池熄灭 —— 同 gizmo 退场门）。
-    let mut demo_cam_center: Option<(f32, f32)> = None;
-    let mut demo_cam_zoom: Option<f32> = None;
-    let mut demo_stage_clamped: Option<(f32, f32)> = None;
-    let mut demo_stage_free: Option<(f32, f32)> = None;
-    let mut demo_clamp_text_on = String::new();
-    let mut demo_clamp_text_off = String::new();
-    let mut demo_stage_strip_edit = false;
-    let mut demo_stage_strip_play = false;
 
     // 自适应口径（S12-4 ①）：视口 = 窗口真实客户区，每帧实测。最小化
     // /遮蔽帧客户区可暂为 (0,0)（表面也不可重配）—— 沿用上次有效值，
@@ -3779,21 +3529,6 @@ fn main() {
                     notches,
                     list_top + 4.0 + spin_row * FS_ROW_H - notches * FS_ROW_H + FS_ROW_H * 0.5,
                 )
-            };
-            // S20.2 舞台钳制取证的目标屏位（当帧 rig.cam 现算 —— 相机随
-            // S20 段滚轮/平移与本段 12 格滚轮+平移漂移，写死坐标不稳；
-            // fs_nav 同款现算口径）。两点各取 obj2 命中盒中心（世界 pos
-            // +(8,8)）的屏位再取整 —— 取整误差 ≤0.5px，屏盒 ≥16px 必含。
-            // sb_click 在舞台段平移完成（443）后消费；sb_click2 在 obj2
-            // 钳到舞台右下界（752,416）后消费（458 起）。
-            let vc_demo = (viewport.0 / 2.0, viewport.1 / 2.0);
-            let sb_click = {
-                let (sx, sy) = rig.cam.world_to_screen(388.0, 138.0, vc_demo);
-                (sx.round(), sy.round())
-            };
-            let sb_click2 = {
-                let (sx, sy) = rig.cam.world_to_screen(760.0, 424.0, vc_demo);
-                (sx.round(), sy.round())
             };
             // 同键连发必须隔一次 key_up：折叠器对已按住的键不重复闩锁
             // （自动重发幂等，T-In-C01 口径）—— 第二次 F7 down 前先抬键。
@@ -3926,7 +3661,7 @@ fn main() {
                 344 => inject_input(InputEvent::MouseMove { x: 300.0, y: 34.0 }),
                 346 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
                 348 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
-                // S19.3 页签切换取证（既有链路收尾后、S20 相机段之前的窗）：
+                // S19.3 页签切换取证（420 帧窗尾部，既有链路全部收尾后）：
                 // 点 SIGNALS 页签（dock 标题行，768x432：dock_y = 432-24-96
                 // = 312，SIGNALS tab (124..188, 312..330) 取中 (156,321)）→
                 // 行面闩锁 → 点回 OUTPUT（OUTPUT tab (72..120) 取中
@@ -3954,78 +3689,6 @@ fn main() {
                 406 => inject_input(InputEvent::Key { key: Key::S, down: true }),
                 408 => inject_input(InputEvent::Key { key: Key::S, down: false }),
                 410 => inject_input(InputEvent::Key { key: Key::LCtrl, down: false }),
-                // S20.2 舞台边界三件套取证（相机现值已在 416 闩锁，尾段
-                // 相机自由漂移不影响既有 S20 断言）。①12 格滚轮缩小 +
-                // 一次平移：把"舞台右下角 + obj2"同时摆进 102px 高的可
-                // 编辑带（几何推导见 S20.2 文档 §demo —— 写死坐标跨相机
-                // 状态不稳，终点由 sb_click 现算兜底）；②CLAMP 默认开：
-                // 点选 obj2 → 再点即 gizmo → 拖到窗外右下远点
-                // (1500,3000)（注入坐标可出窗 —— 纯队列通道无裁剪；取
-                // 右下向使钳制落点 = 已入带的舞台右下角）→ 落笔钳在
-                // (752,416)；③点工具栏 CLAMP（左四键第 4 键，最小窗下
-                // 中心 (366,72)）→ 再拖 → 原值落笔（自由）；④Ctrl+Z×2
-                // 还原 obj2（两次拖拽事务各退一步）、Tab×2 回选 obj1
-                //（终局选择断言面复位）；⑤再开一窗 PLAY（无挂载脚本）
-                // 取证条带运行态退场后 STOP。
-                426 => inject_input(InputEvent::MouseMove { x: 404.0, y: 150.0 }),
-                427 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                428 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                429 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                430 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                431 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                432 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                433 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                434 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                435 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                436 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                437 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                438 => inject_input(InputEvent::Wheel { x: 0.0, y: -1.0 }),
-                // 平移 (−30,−24) 屏像素：center += (30,24)/zoom —— 舞台
-                // 底/左边线进可编辑带、obj2 与钳制点 (752,416) 同框。
-                440 => inject_input(InputEvent::MouseMove { x: 404.0, y: 150.0 }),
-                441 => inject_input(InputEvent::MouseButton { button: MouseButton::Middle, down: true }),
-                442 => inject_input(InputEvent::MouseMove { x: 374.0, y: 126.0 }),
-                443 => inject_input(InputEvent::MouseButton { button: MouseButton::Middle, down: false }),
-                // CLAMP 开（默认）拖拽链：点选 obj2 → 点住 obj2 → 拖到
-                // 窗外右下远点 (1500,3000)（注入坐标可出窗 —— 纯队列通
-                // 道无裁剪；取右下向使钳制落点 = 舞台右下界 (752,416)
-                // —— 该角已随平移摆进可编辑带，第二拖的点击可达）。
-                445 => inject_input(InputEvent::MouseMove { x: sb_click.0, y: sb_click.1 }),
-                446 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
-                447 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
-                449 => inject_input(InputEvent::MouseMove { x: sb_click.0, y: sb_click.1 }),
-                450 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
-                451 => inject_input(InputEvent::MouseMove { x: 1500.0, y: 3000.0 }),
-                452 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
-                // 工具栏 CLAMP 关（左四键第 4 键中心 (366,72)）。
-                454 => inject_input(InputEvent::MouseMove { x: 366.0, y: 72.0 }),
-                455 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
-                456 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
-                // CLAMP 关拖拽链：点住 obj2（已在 (752,416)）→ 拖出窗。
-                458 => inject_input(InputEvent::MouseMove { x: sb_click2.0, y: sb_click2.1 }),
-                459 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: true }),
-                460 => inject_input(InputEvent::MouseMove { x: 1500.0, y: 3000.0 }),
-                461 => inject_input(InputEvent::MouseButton { button: MouseButton::Left, down: false }),
-                // Ctrl+Z ×2：两次拖拽各退一步 → obj2 回 (380,130)。
-                463 => inject_input(InputEvent::Key { key: Key::LCtrl, down: true }),
-                464 => inject_input(InputEvent::Key { key: Key::Z, down: true }),
-                465 => inject_input(InputEvent::Key { key: Key::Z, down: false }),
-                466 => inject_input(InputEvent::Key { key: Key::Z, down: true }),
-                467 => inject_input(InputEvent::Key { key: Key::Z, down: false }),
-                468 => inject_input(InputEvent::Key { key: Key::LCtrl, down: false }),
-                // Tab ×2：obj2 → obj3 → obj1（终局主选中复位）。
-                470 => inject_input(InputEvent::Key { key: Key::Tab, down: true }),
-                471 => inject_input(InputEvent::Key { key: Key::Tab, down: false }),
-                473 => inject_input(InputEvent::Key { key: Key::Tab, down: true }),
-                474 => inject_input(InputEvent::Key { key: Key::Tab, down: false }),
-                // 第二个 PLAY 窗（spin 已卸载 = 0 脚本空转）：取证舞台
-                // 条带运行态退场，STOP 后自然复燃（无断言依赖）。
-                480 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
-                481 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
-                492 => inject_input(InputEvent::Key { key: Key::LShift, down: true }),
-                493 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: true }),
-                494 => inject_input(InputEvent::Key { key: Key::Other(VK_F5), down: false }),
-                495 => inject_input(InputEvent::Key { key: Key::LShift, down: false }),
                 _ => {}
             }
         }
@@ -4343,75 +4006,6 @@ fn main() {
                 demo_grid_back_after_stop = true;
             }
         }
-        // S20.2 取证闩锁（窗口口径见上方声明注）：相机在 416 单帧闩锁
-        //（纯会话态读数无注入抖动 —— 410 流尾后相机静止、426 舞台段才
-        // 再动）。
-        if demo && index == 416 {
-            demo_cam_center = Some(rig.cam.center);
-            demo_cam_zoom = Some(rig.cam.zoom);
-        }
-        // CLAMP 开拖拽（452 提交）后 obj2 位 == 钳制端点 (752,416)：
-        // 窗 454..=458（459 起第二拖的 gizmo preview 接管写位）。
-        if demo && (454..=458).contains(&index) && demo_stage_clamped.is_none() {
-            let tree = rt.tree_mut();
-            if let Some(id) = tree.find_by_name("obj2") {
-                let p = tree.local(id).unwrap_or_default().pos;
-                // 期望值 = 钳制公式的右下界端点（同帧循环落笔同一函数）。
-                let (cx, cy) = clamp_to_stage((f32::INFINITY, f32::INFINITY), true);
-                if (p.x - cx).abs() < 0.5 && (p.y - cy).abs() < 0.5 {
-                    demo_stage_clamped = Some((p.x, p.y));
-                }
-            }
-        }
-        // CLAMP 关拖拽（461 提交）后 obj2 位远超舞台（右下向自由值）：
-        // ≥460 逐帧观察，自由值与 preview 同值（鼠标停在远点）。先闩先
-        // 赢 —— undo（465+）还原后不再满足"远超"条件，闩锁不受扰。
-        if demo && index >= 460 && demo_stage_free.is_none() {
-            let tree = rt.tree_mut();
-            if let Some(id) = tree.find_by_name("obj2") {
-                let p = tree.local(id).unwrap_or_default().pos;
-                if p.x > STAGE.0 + STAGE.2 + 50.0 && p.y > STAGE.1 + STAGE.3 + 50.0 {
-                    demo_stage_free = Some((p.x, p.y));
-                }
-            }
-        }
-        // CLAMP 按钮文本翻面（toggle_text 单点出口的投影面）：开态窗
-        // 440..=456（456 抬沿、456 帧后落账才翻转）；关态 ≥458。
-        if demo && (440..=456).contains(&index) && demo_clamp_text_on.is_empty() {
-            if let Some(Value::Str(s)) = rt.tree_mut().prop(tool_clamp, "text") {
-                if s == "CLAMP*" {
-                    demo_clamp_text_on = s.clone();
-                }
-            }
-        }
-        if demo && index >= 458 && demo_clamp_text_off.is_empty() {
-            if let Some(Value::Str(s)) = rt.tree_mut().prop(tool_clamp, "text") {
-                if s == "CLAMP" {
-                    demo_clamp_text_off = s.clone();
-                }
-            }
-        }
-        // 舞台条带树读面（T-SB-02 冒烟闩锁）：编辑窗（445 舞台段相机就
-        // 位 ..=478 第二 PLAY 之前）至少 1 描框 + 1 变暗点亮；PLAY 窗
-        //（482..=491）整池熄灭 —— 同 gizmo 退场门的运行态语义。
-        if demo && (445..=478).contains(&index) && !demo_stage_strip_edit {
-            let tree = rt.tree_mut();
-            let lit = |n: nes_scene::NodeId| {
-                matches!(tree.prop(n, "visible"), Some(Value::Bool(true)))
-            };
-            if stage_borders.iter().any(|&b| lit(b)) && stage_dims.iter().any(|&d| lit(d)) {
-                demo_stage_strip_edit = true;
-            }
-        }
-        if demo && (482..=491).contains(&index) && !demo_stage_strip_play {
-            let tree = rt.tree_mut();
-            let lit = |n: nes_scene::NodeId| {
-                matches!(tree.prop(n, "visible"), Some(Value::Bool(true)))
-            };
-            if stage_borders.iter().all(|&b| !lit(b)) && stage_dims.iter().all(|&d| !lit(d)) {
-                demo_stage_strip_play = true;
-            }
-        }
         // 点击选择（hit 命中 + Selection）：左键单选 / Shift+左键多选。
         // 运行态（S12-9）：编辑交互整体让路 —— Tab 循环也一样。
         if !play.playing && tab_now && !prev_tab {
@@ -4578,19 +4172,6 @@ fn main() {
                             log_line(&editor_log, format!("ext: {name}"));
                         }
                     }
-                    (1, 2) => {
-                        // S20.2 舞台钳制镜像项：与工具栏 CLAMP 同一会话
-                        // 态翻转、同一落行（菜单化既有行为 —— 菜单只是
-                        // 快捷键/按钮的可视化入口，不改语义）。
-                        clamp_enabled = !clamp_enabled;
-                        log_line(
-                            &editor_log,
-                            format!(
-                                "tool clamp {}",
-                                if clamp_enabled { "on" } else { "off" }
-                            ),
-                        );
-                    }
                     (2, 0) => {
                         diag_on = !diag_on;
                         log_line(
@@ -4638,8 +4219,7 @@ fn main() {
                     let tree = rt.tree_mut();
                     [
                         name_input, hud_tree, hud_dock, ruler_h, ruler_v, ruler_corner,
-                        tool_sel, tool_snap, tool_grid, tool_clamp, tool_play, tool_stop,
-                        tool_reset,
+                        tool_sel, tool_snap, tool_grid, tool_play, tool_stop, tool_reset,
                         // S20：工具栏缩放两键压上不清选中不框选（底板与按
                         // 钮同矩形，护按钮即护底板）。
                         tool_zoom_out, tool_zoom_in,
@@ -4778,11 +4358,6 @@ fn main() {
                 } else {
                     (tx, ty)
                 };
-                // S20.2 舞台钳制（CLAMP 开，默认）：gizmo 拖拽落笔单点
-                // —— origin 钳在舞台内减一格（clamp_to_stage 注）。
-                // preview 直写的就是钳后值，松开提交从树回读同一值 ——
-                // 写位路径只有这一处，提交面天然一致。
-                let (tx, ty) = clamp_to_stage((tx, ty), clamp_enabled);
                 let tree = rt.tree_mut();
                 if let Some(id) = tree.find_by_uid(uid) {
                     tree.set_local(id, Transform2D::from_pos(tx, ty));
@@ -5213,10 +4788,6 @@ fn main() {
                 (tool_sel, tool_sel_on, "SEL"),
                 (tool_snap, tool_snap_on, "SNAP"),
                 (tool_grid, tool_grid_on, "GRID"),
-                // S20.2：舞台钳制开关（第 4 键；文本 * = ON 走 toggle_text
-                // 单点出口）。底板池 0..4 槽随编辑四键（原三键 +1，播放组
-                // /缩放组槽位相应后移，见下）。
-                (tool_clamp, clamp_enabled, "CLAMP"),
             ];
             for (i, (b, on, name)) in tool_btns.iter().enumerate() {
                 let bx = gx0 + SPACE_S + i as f32 * TOOLBAR_BTN_STEP;
@@ -5225,7 +4796,8 @@ fn main() {
                         bx,
                         MENU_H + TOP_BAND + 2.0,
                     )));
-                let _ = tree.set_prop(*b, "text", Value::Str(toggle_text(name, *on)));
+                let _ = tree.set_prop(*b, "text",
+                    Value::Str(if *on { format!("{name}*") } else { (*name).to_string() }));
                 // S18：底板随按钮同步布线（同位同尺寸 —— 底板在按钮正
                 // 下方，纹理透出按钮透明底；投影无状态，每帧重写口径）。
                 if let Some(&p) = tool_plates.get(i) {
@@ -5250,8 +4822,7 @@ fn main() {
                     Value::Vec2(nes_scene::Vec2::new(bx, 0.0)));
                 let _ = tree.set_prop(*b, "text",
                     Value::Str(if *on { format!("{name}*") } else { (*name).to_string() }));
-                // S20.2：底板池 4..7 槽随播放组（0..4 已让给编辑四键）。
-                if let Some(&p) = tool_plates.get(4 + k) {
+                if let Some(&p) = tool_plates.get(3 + k) {
                     let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
                         Value::Vec2(nes_scene::Vec2::new(bx, 0.0)));
                 }
@@ -5269,11 +4840,11 @@ fn main() {
                 Value::Vec2(nes_scene::Vec2::new(zx_in, tool_y)));
             let _ = tree.set_prop(tool_zoom_out, PROP_CONTROL_OFFSET,
                 Value::Vec2(nes_scene::Vec2::new(zx_out, tool_y)));
-            if let Some(&p) = tool_plates.get(7) {
+            if let Some(&p) = tool_plates.get(6) {
                 let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
                     Value::Vec2(nes_scene::Vec2::new(zx_out, tool_y)));
             }
-            if let Some(&p) = tool_plates.get(8) {
+            if let Some(&p) = tool_plates.get(7) {
                 let _ = tree.set_prop(p, PROP_CONTROL_OFFSET,
                     Value::Vec2(nes_scene::Vec2::new(zx_in, tool_y)));
             }
@@ -5538,52 +5109,6 @@ fn main() {
             // 余量置空文本（提取层判空不上屏）。
             for lab in &ruler_labels[lab_used..] {
                 let _ = tree.set_prop(*lab, PROP_LABEL_TEXT, Value::Str(String::new()));
-            }
-
-            // S20.2 舞台边界三件套投影（①描框 ②场景外变暗）：世界角 →
-            // world_to_screen → 屏上条带（照网格条带池的换算口径 ——
-            // Control 钉屏幕像素；几何单点出口 =
-            // [`stage_border_rects`]/[`stage_dim_rects`] 纯函数）。编辑
-            // 态点亮、运行态整池熄灭（照 S20.1 gizmo 退场门 —— 编辑器
-            // 注记不叠在游戏画面上，STOP 后下一帧投影自然复燃）。条带几
-            // 何被可视域裁剪，与负 z 面板带零几何重叠（STAGE_ANNOT_Z 注
-            // —— z 序表详见 S20.2 文档）。
-            let stage_on = !play.playing;
-            let (st_sx0, st_sy0) = view.world_to_screen(STAGE.0, STAGE.1, vc);
-            let (st_sx1, st_sy1) =
-                view.world_to_screen(STAGE.0 + STAGE.2, STAGE.1 + STAGE.3, vc);
-            let vp = (vx0, vy0, vx1, vy1);
-            for (i, &b) in stage_borders.iter().enumerate() {
-                match stage_border_rects((st_sx0, st_sy0), (st_sx1, st_sy1), vp)[i] {
-                    // 描框点亮（编辑态 + 该边线在可视域内）。
-                    Some((x, y, w, h)) if stage_on => {
-                        let _ = tree.set_prop(b, PROP_CONTROL_OFFSET,
-                            Value::Vec2(nes_scene::Vec2::new(x, y)));
-                        let _ = tree.set_prop(b, PROP_CONTROL_SIZE,
-                            Value::Vec2(nes_scene::Vec2::new(w, h)));
-                        let _ = tree.set_prop(b, "visible", Value::Bool(true));
-                    }
-                    _ => {
-                        // 不可见边线 / 运行态：熄灭（投影无状态口径）。
-                        let _ = tree.set_prop(b, "visible", Value::Bool(false));
-                    }
-                }
-            }
-            for (i, &d) in stage_dims.iter().enumerate() {
-                match stage_dim_rects((st_sx0, st_sy0), (st_sx1, st_sy1), vp)[i] {
-                    // 变暗点亮（编辑态 + 该向补集非空 —— 舞台全含可视域
-                    // 时四条全隐，默认视图的干净常态）。
-                    Some((x, y, w, h)) if stage_on => {
-                        let _ = tree.set_prop(d, PROP_CONTROL_OFFSET,
-                            Value::Vec2(nes_scene::Vec2::new(x, y)));
-                        let _ = tree.set_prop(d, PROP_CONTROL_SIZE,
-                            Value::Vec2(nes_scene::Vec2::new(w, h)));
-                        let _ = tree.set_prop(d, "visible", Value::Bool(true));
-                    }
-                    _ => {
-                        let _ = tree.set_prop(d, "visible", Value::Bool(false));
-                    }
-                }
             }
 
             // Output dock 布线（S12-6）：全宽 panel 铺底 + "Output"
@@ -5882,7 +5407,7 @@ fn main() {
             }
             menu_item_rows.clear();
             let pop_items: Vec<String> = match open_menu {
-                Some(m) => menu_items(m, audio_on, diag_on, ext_count, clamp_enabled),
+                Some(m) => menu_items(m, audio_on, diag_on, ext_count),
                 None => Vec::new(),
             };
             if !pop_items.is_empty() {
@@ -6000,8 +5525,7 @@ fn main() {
             // 钮不是场景对象），整子树不进层级树。S19.5 起再加 traj：
             // 补间轨迹点池是视口注记（编辑器会话可视化），不是场景对象。
             // S19.6 起再加 icons：场景树图标精灵池同上 —— 纯展示件。
-            // S20.2 起再加 stage：舞台描框/变暗条带池同上 —— 视口注记。
-            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar, traj, icons, stage];
+            let skips = [grid, ruler, dock, toolbar, fsdock, theme_node, tldock, menubar, traj, icons];
             walk(
                 tree,
                 tree.root(),
@@ -6229,11 +5753,10 @@ fn main() {
             };
             let st = if play.playing {
                 let base = format!(
-                    "st> PLAYING (F5=restart Shift+F5=stop RESET btn reverts scene) tools:{}{}{}{}",
+                    "st> PLAYING (F5=restart Shift+F5=stop RESET btn reverts scene) tools:{}{}{}",
                     if tool_sel_on { "S" } else { "-" },
                     if tool_snap_on { "N" } else { "-" },
                     if tool_grid_on { "G" } else { "-" },
-                    if clamp_enabled { "C" } else { "-" },
                 );
                 if diag_on {
                     format!("{base} {}", diag_tail())
@@ -6242,14 +5765,13 @@ fn main() {
                 }
             } else {
                 let base = format!(
-                    "st> undo:{} redo:{} sel:{} tools:{}{}{}{}",
+                    "st> undo:{} redo:{} sel:{} tools:{}{}{}",
                     if log.can_undo() { "Y" } else { "-" },
                     if log.can_redo() { "Y" } else { "-" },
                     sel.len(),
                     if tool_sel_on { "S" } else { "-" },
                     if tool_snap_on { "N" } else { "-" },
                     if tool_grid_on { "G" } else { "-" },
-                    if clamp_enabled { "C" } else { "-" },
                 );
                 if diag_on {
                     format!("{base} {}", diag_tail())
@@ -6666,12 +6188,6 @@ fn main() {
                             tool_snap_on = !tool_snap_on;
                             tool_snap_on
                         }
-                        // S20.2 舞台钳制开关（gizmo 落笔单点消费，见
-                        // clamp_to_stage —— 只钳拖拽，精确输入不钳）。
-                        "clamp" => {
-                            clamp_enabled = !clamp_enabled;
-                            clamp_enabled
-                        }
                         _ => {
                             tool_grid_on = !tool_grid_on;
                             tool_grid_on
@@ -6955,10 +6471,8 @@ fn main() {
             "容器行（ListView）行格式异常（应为 gap+缩进+标记+名字）：{scene_rows:?}"
         );
         assert!(
-            !scene_rows.contains("traj")
-                && !scene_rows.contains("icons")
-                && !scene_rows.contains("stage"),
-            "traj/icons/stage 容器漏进层级树（walk skips 失效）：{scene_rows:?}"
+            !scene_rows.contains("traj") && !scene_rows.contains("icons"),
+            "traj/icons 容器漏进层级树（walk skips 失效）：{scene_rows:?}"
         );
         let Some((obj1_frame, obj1_vis, obj1_ix, obj1_iy)) = demo_icon_obj1 else {
             panic!("S19.6 未闩到 obj1 行图标取证：{lines:?}")
@@ -6996,22 +6510,20 @@ fn main() {
         // 存 —— 写盘发生在还原 stash 之后（还原后采样 cam 位 == (384,216)
         // ≠ 编辑视图中心），保存后编辑视图重应用（cam 节点 zoom 属性 =
         // 编辑 zoom、场景文件已落盘）。编辑视图全程未污染场景数据面。
-        // S20.2：center/zoom 改读帧 416 闩锁（尾段舞台取证会让相机再漂
-        // 移 —— 闩锁值即 S20 段收尾值，语义不变）。
         assert_eq!(demo_zoom_label, "132%", "缩放后工具栏百分比文本错误：{demo_zoom_label:?}");
         assert!(
             demo_zoom_prop.is_some(),
             "cam 节点 zoom 属性未随滚轮更新（期望 ≈1.3225）：{demo_zoom_prop:?}"
         );
-        let cam_zoom = demo_cam_zoom.expect("S20 相机 zoom 未闩锁（帧 416）");
-        let cam_center = demo_cam_center.expect("S20 相机 center 未闩锁（帧 416）");
         assert!(
-            (cam_zoom - 1.3225).abs() < 0.01,
-            "编辑视图 zoom 应为 1.15²（实际 {cam_zoom}）"
+            (rig.cam.zoom - 1.3225).abs() < 0.01,
+            "编辑视图 zoom 应为 1.15²（实际 {}）",
+            rig.cam.zoom
         );
         assert!(
-            (cam_center.0 - 364.97).abs() < 0.5 && (cam_center.1 - 227.22).abs() < 0.5,
-            "缩放朝光标 + 中键平移后的 center 应为 (364.97, 227.22)±0.5（实际 {cam_center:?}）"
+            (rig.cam.center.0 - 364.97).abs() < 0.5 && (rig.cam.center.1 - 227.22).abs() < 0.5,
+            "缩放朝光标 + 中键平移后的 center 应为 (364.97, 227.22)±0.5（实际 {:?}）",
+            rig.cam.center
         );
         assert_eq!(
             demo_save_pos,
@@ -7044,34 +6556,6 @@ fn main() {
             demo_grid_back_after_stop,
             "STOP/RESET 后网格未复燃（恢复路径残留）"
         );
-        // S20.2 舞台边界三件套取证：①CLAMP 开（默认）拖拽落笔 == 钳制
-        // 右下界端点 (752,416)（精确 —— clamp 端点逐位）；②CLAMP 关拖
-        // 曳 == 自由值远超舞台（x/y 双双超出 50px 余量）；③工具栏按钮
-        // 文本翻面（CLAMP* → CLAMP —— toggle_text 单点出口的投影面）+
-        // 落行（tool clamp off —— 与 Project 菜单镜像项同格式）；④描框
-        // /变暗条带树读面（编辑态 ≥1+1 点亮 / PLAY 窗整池熄灭 —— 同
-        // gizmo 退场门的运行态语义）。
-        assert_eq!(
-            demo_stage_clamped,
-            Some(clamp_to_stage((f32::INFINITY, f32::INFINITY), true)),
-            "CLAMP 开拖拽落笔未钳到舞台右下界 (752,416)：{demo_stage_clamped:?}"
-        );
-        let free = demo_stage_free.expect("CLAMP 关拖拽未闩到自由落点");
-        assert!(
-            free.0 > STAGE.0 + STAGE.2 + 50.0 && free.1 > STAGE.1 + STAGE.3 + 50.0,
-            "CLAMP 关拖拽应为远超舞台的自由值（实际 {free:?}）"
-        );
-        assert_eq!(demo_clamp_text_on, "CLAMP*", "CLAMP 开态按钮文本错误");
-        assert_eq!(demo_clamp_text_off, "CLAMP", "CLAMP 关态按钮文本错误");
-        assert!(has("tool clamp off"), "CLAMP 关闭未落行：{lines:?}");
-        assert!(
-            demo_stage_strip_edit,
-            "编辑态舞台描框/变暗条带未点亮（树读面缺失）"
-        );
-        assert!(
-            demo_stage_strip_play,
-            "PLAY 窗内舞台条带未整池熄灭（gizmo 退场门未覆盖舞台件）"
-        );
         let saved_path = assets.join(SCENE_SAVE_REL);
         assert!(
             saved_path.is_file(),
@@ -7080,10 +6564,10 @@ fn main() {
         );
         let saved_text = std::fs::read_to_string(&saved_path).expect("读保存场景");
         assert!(saved_text.contains("cam"), "保存场景缺 cam 节点");
-        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.5 轨迹三态/S19.6 真图标集/S20 滚轮缩放朝光标+中键平移+受保护保存+运行态 UI 锚定（gizmo 退场/复燃）/S20.2 舞台三件套（CLAMP 开钳制+关自由+按钮翻面+描框变暗编辑态点亮/运行态退场）冒烟断言通过");
+        println!("[demo] 挂载/卸载/enabled/折叠/刷新/play/stop/reset/时间轴 APPLY/菜单链路/S19.2 三分区脚本列表与 Appearance 快照/S19.3 SIGNALS 页签/S19.5 轨迹三态/S19.6 真图标集/S20 滚轮缩放朝光标+中键平移+受保护保存+运行态 UI 锚定（gizmo 退场/复燃）冒烟断言通过");
     }
     println!("[完成] Editor Shell 退出");
-    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, stage, stage_borders, stage_dims, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
+    let _ = (grid, cam, hud_tree, hud_ins_bg, hud_ins, hud_st, sel_box, name_input, hud_scene, traj, traj_dots, icons, icon_sprites, tool_bg, tool_sep, theme_node, tool_plates, ins_tf_title, ins_ap_title, ins_appearance, ins_sc_title, fsdock, fs_bg, fs_title, fs_sep, fs_tree, tldock, tl_bg, tl_title, hud_tl, tl_bars, tl_new_label, tl_to_label, tl_ms_label, tl_plates, tl_pos, tl_scale, tl_alpha, tl_ease, tl_mode, tl_apply, tl_x_in, tl_y_in, tl_ms_in, menubar, menu_bg, menu_sep, menu_pop_bg, menu_labels, menu_item_plates, menu_item_labels);
 }
 
 // ---- S20 契约测试（editor headless 可测面）----
@@ -7399,146 +6883,5 @@ mod s20_viewport_tests {
             (rx - sx).abs() < 1e-3 && (ry - sy).abs() < 1e-3,
             "world -> screen roundtrip must land on slot: ({rx},{ry})"
         );
-    }
-}
-
-// ---- S20.2 舞台边界三件套契约测试（editor headless 可测面）----
-//
-// T-SB-01 钳制公式与开关语义（纯函数 + 树写面同款表达式）；T-SB-02 描
-// 框/变暗屏上几何（两极 + 半交补集）—— 编辑态可见/运行态隐藏的**树读
-// 面**归 NES_EDIT_DEMO 冒烟闩锁（投影块在 main 帧循环内，headless 不可
-// 达 —— 与 S20 活动视图断言的分工同口径）；T-SB-03 默认值 + 工具栏/
-// Project 菜单双入口的语义表。测试字面量全 ASCII。
-#[cfg(test)]
-mod s20_2_stage_tests {
-    use super::*;
-
-    /// T-SB-01：CLAMP 开 —— gizmo 拖拽到 (5000,-3000) 落笔 == 钳制后值
-    ///（x 钳到舞台右缘 752、y 钳到舞台上缘 0 —— 逐轴独立）；CLAMP 关
-    /// —— 原值。右下远点 (5000,5000) 钳到 (752,416)（右下界端点）。
-    #[test]
-    fn tsb01_clamp_on_clamps_drop_off_passthrough() {
-        let hi = (STAGE.0 + STAGE.2 - STAGE_CELL, STAGE.1 + STAGE.3 - STAGE_CELL);
-        assert_eq!(hi, (752.0, 416.0), "右下界端点 = (768-16, 432-16)");
-        assert_eq!(clamp_to_stage((5000.0, -3000.0), true), (752.0, 0.0));
-        assert_eq!(clamp_to_stage((5000.0, 5000.0), true), hi);
-        assert_eq!(clamp_to_stage((5000.0, -3000.0), false), (5000.0, -3000.0));
-        // 界内不动；单轴越界单轴钳；负象限钳到舞台原点。
-        assert_eq!(clamp_to_stage((100.0, 200.0), true), (100.0, 200.0));
-        assert_eq!(clamp_to_stage((760.0, 100.0), true), (752.0, 100.0));
-        assert_eq!(clamp_to_stage((-50.0, -0.5), true), (0.0, 0.0));
-    }
-
-    /// T-SB-01（树写面）：帧循环 gizmo 落笔同款表达式（clamp_to_stage →
-    /// set_local preview）写进 headless 树 —— CLAMP 开时节点 local pos
-    /// == 钳制值，关时 == 原值（提交面从树回读同一值，写位路径单点）。
-    #[test]
-    fn tsb01_gizmo_write_path_lands_clamped_pos_in_tree() {
-        let mut tree = nes_scene::SceneTree::new("root");
-        let n = tree.add_node(tree.root(), "obj", NodeKind::Sprite2D);
-        tree.apply_pending();
-        for (enabled, raw, expect) in [
-            (
-                true,
-                (5000.0f32, -3000.0f32),
-                (STAGE.0 + STAGE.2 - STAGE_CELL, STAGE.1),
-            ),
-            (
-                true,
-                (5000.0f32, 5000.0f32),
-                (STAGE.0 + STAGE.2 - STAGE_CELL, STAGE.1 + STAGE.3 - STAGE_CELL),
-            ),
-            (false, (5000.0f32, -3000.0f32), (5000.0f32, -3000.0f32)),
-        ] {
-            let (tx, ty) = clamp_to_stage(raw, enabled);
-            tree.set_local(n, Transform2D::from_pos(tx, ty));
-            let p = tree.local(n).unwrap_or_default().pos;
-            assert!(
-                (p.x - expect.0).abs() < 1e-4 && (p.y - expect.1).abs() < 1e-4,
-                "enabled={enabled}: drop should land {expect:?}, got ({},{})",
-                p.x, p.y
-            );
-        }
-    }
-
-    /// T-SB-02（描框）：边线在可视域内才可见、沿长度被可视域裁剪、离
-    /// 屏边隐藏。可视域取装配开窗下的真实值 (204,100)-(562,202)。
-    #[test]
-    fn tsb02_border_rects_track_stage_edges() {
-        let vp = (204.0f32, 100.0f32, 562.0f32, 202.0f32);
-        // 舞台全含可视域：四条边线全在域外 → 全隐（描框不画到面板带）。
-        let r = stage_border_rects((-100.0, -50.0), (900.0, 700.0), vp);
-        assert!(r.iter().all(|o| o.is_none()), "all edges out: {r:?}");
-        // 舞台矩形整体在可视域内：四边全亮、1px 落在舞台内侧。
-        let r = stage_border_rects((300.0, 120.0), (520.0, 180.0), vp);
-        assert_eq!(r[0], Some((300.0, 120.0, 220.0, 1.0)), "top");
-        assert_eq!(r[1], Some((300.0, 179.0, 220.0, 1.0)), "bottom");
-        assert_eq!(r[2], Some((300.0, 120.0, 1.0, 60.0)), "left");
-        assert_eq!(r[3], Some((519.0, 120.0, 1.0, 60.0)), "right");
-        // 右边线越出可视域：顶/底沿长度裁到 vx1，右边线隐藏。
-        let r = stage_border_rects((300.0, 120.0), (600.0, 180.0), vp);
-        assert_eq!(r[0], Some((300.0, 120.0, 262.0, 1.0)));
-        assert_eq!(r[1], Some((300.0, 179.0, 262.0, 1.0)));
-        assert!(r[3].is_none(), "right edge x=600 > vx1=562 must hide");
-        // 底边线恰在可视域下缘内：可见（sy1 <= vy1）；再低 1px 即隐藏。
-        let r = stage_border_rects((300.0, 120.0), (520.0, 202.0), vp);
-        assert_eq!(r[1], Some((300.0, 201.0, 220.0, 1.0)));
-        let r = stage_border_rects((300.0, 120.0), (520.0, 202.5), vp);
-        assert!(r[1].is_none());
-    }
-
-    /// T-SB-02（变暗）：舞台全含可视域 = 四条全隐（默认视图干净常态）；
-    /// 舞台离屏 = 补集条带覆盖整个可视域；半交 = "可视域 − 舞台"精确
-    /// 补集（四向几何不重叠）。
-    #[test]
-    fn tsb02_dim_rects_cover_viewport_minus_stage() {
-        let vp = (204.0f32, 100.0f32, 562.0f32, 202.0f32);
-        let full = (204.0f32, 100.0f32, 358.0f32, 102.0f32);
-        // 默认视图（舞台全含可视域）：全隐。
-        let r = stage_dim_rects((-100.0, -50.0), (900.0, 700.0), vp);
-        assert!(r.iter().all(|o| o.is_none()), "clean default: {r:?}");
-        // 舞台完全离屏（右下远处）：顶条带 = 整个可视域（其余向零集）。
-        let r = stage_dim_rects((600.0, 250.0), (900.0, 400.0), vp);
-        assert_eq!(r[0], Some(full), "off-stage top strip = full viewport");
-        assert!(r[1].is_none() && r[2].is_none() && r[3].is_none());
-        // 舞台完全离屏（左上远处）：底条带 = 整个可视域。
-        let r = stage_dim_rects((-500.0, -300.0), (-100.0, -50.0), vp);
-        assert_eq!(r[1], Some(full), "off-stage bottom strip = full viewport");
-        assert!(r[0].is_none() && r[2].is_none() && r[3].is_none());
-        // 半交：舞台矩形在可视域内 —— 四向补集精确、并集 == 可视域。
-        let r = stage_dim_rects((300.0, 150.0), (500.0, 190.0), vp);
-        assert_eq!(r[0], Some((204.0, 100.0, 358.0, 50.0)), "top");
-        assert_eq!(r[1], Some((204.0, 190.0, 358.0, 12.0)), "bottom");
-        assert_eq!(r[2], Some((204.0, 150.0, 96.0, 40.0)), "left");
-        assert_eq!(r[3], Some((500.0, 150.0, 62.0, 40.0)), "right");
-        // 面积守恒：四条面积和 == 可视域面积 − 舞台面积。
-        let area = |o: StripRect| o.map(|(x, y, w, h)| w * h).unwrap_or(0.0);
-        let covered: f32 = r.iter().map(|o| area(*o)).sum();
-        let vp_area = (vp.2 - vp.0) * (vp.3 - vp.1);
-        let stage_area = (500.0 - 300.0) * (190.0 - 150.0);
-        assert!(
-            (covered - (vp_area - stage_area)).abs() < 1e-3,
-            "dim union must equal viewport minus stage: {covered} vs {}",
-            vp_area - stage_area
-        );
-    }
-
-    /// T-SB-03：CLAMP 默认开 + 工具栏/Project 菜单双入口的语义表（按钮
-    /// * 后缀 = ON 走 toggle_text 单点出口；菜单镜像项文本随态翻面）。
-    #[test]
-    fn tsb03_clamp_defaults_on_and_dual_entry_semantics() {
-        assert!(CLAMP_DEFAULT, "舞台钳制默认开（用户直觉：拖出场景=不对）");
-        // 工具栏按钮文本（投影同款单点出口）。
-        assert_eq!(toggle_text("CLAMP", true), "CLAMP*");
-        assert_eq!(toggle_text("CLAMP", false), "CLAMP");
-        // Project 菜单镜像项（第 3 项）：开/关两态文本 + 既有项不动。
-        let on = menu_items(1, false, false, 0, true);
-        let off = menu_items(1, false, false, 0, false);
-        assert!(on.contains(&"Stage Clamp: On".to_string()), "{on:?}");
-        assert!(off.contains(&"Stage Clamp: Off".to_string()), "{off:?}");
-        assert!(on[..2] == off[..2], "既有 Project 项零变化");
-        assert_eq!(on.len(), 3, "Project 菜单 3 项 ≤ MENU_ITEM_POOL");
-        // 快捷键表含舞台行（Help 面的可发现性）。
-        assert!(SHORTCUT_TABLE.iter().any(|l| l.contains("drag clamp")),);
     }
 }
